@@ -63,6 +63,14 @@
     <ProjectReference Include="..\..\third_party\MewUI\extensions\MewUI.MewCharts\MewUI.MewCharts.csproj" GlobalPropertiesToRemove="PublishAot" />
   </ItemGroup>
 
+  <!-- Restore walks the reference graph with the command line's PublishAot=true (it ignores GlobalPropertiesToRemove),
+       so MewCharts' condition hides LiveChartsGenerators and the generator is never restored; the MewCharts build
+       above then needs it and fails on a fresh clone (NETSDK1004). Restore it on its own, without PublishAot, first. -->
+  <Target Name="MewStageRestoreChartsGenerator" BeforeTargets="Restore" Condition="'$(PublishAot)' == 'true'">
+    <MSBuild Projects="..\..\third_party\MewUI\extensions\MewUI.MewCharts\ThirdParty\LiveCharts2\generators\LiveChartsGenerators\LiveChartsGenerators.csproj"
+             Targets="Restore" Properties="PublishAot=false;RuntimeIdentifier=;MewStageGeneratorRestore=true" />
+  </Target>
+
   <!-- A publish folder is self-contained: the whole of assets/ (fonts, icons, the cooked shaders; the .hlsl sources
        and the manifest are small and travel too) is copied to <publish>/assets, which AssetPaths treats as the
        packaged root. A build copies nothing: dotnet run finds the repository's assets by walking up. -->

@@ -1,7 +1,6 @@
+using Aprillz.MewVG;
 using System.Numerics;
 using System.Runtime.CompilerServices;
-
-using Aprillz.MewVG;
 
 using static Aprillz.MewUI.Rendering.GradientBrushHelper;
 
@@ -150,8 +149,7 @@ internal static class NvgStrokeHelper
         // MewStage vendor patch allocation/0006: the flattened segments go into a reused per-thread list (no List per stroke).
         var segments = t_segments ??= new List<DashSegment>();
         FlattenPath(path, segments);
-        if (segments.Count == 0)
-            return;
+        if (segments.Count == 0) return;
 
         float thickness = (float)pen.Thickness;
         float dashOffset = (float)style.DashOffset * thickness;
@@ -165,8 +163,7 @@ internal static class NvgStrokeHelper
             pattern[i] = (float)dashes[i] * thickness;
             patternLen += pattern[i];
         }
-        if (patternLen <= 0)
-            return;
+        if (patternLen <= 0) return;
 
         // Apply pen style (cap, join, etc.)
         ApplyPenStyle(vg, pen);
@@ -239,8 +236,7 @@ internal static class NvgStrokeHelper
             float x0 = seg.X0, y0 = seg.Y0, x1 = seg.X1, y1 = seg.Y1;
             float segDx = x1 - x0, segDy = y1 - y0;
             float segLen = MathF.Sqrt(segDx * segDx + segDy * segDy);
-            if (segLen <= 0)
-                continue;
+            if (segLen <= 0) continue;
 
             float consumed = 0;
             while (consumed < segLen)
@@ -329,8 +325,7 @@ internal static class NvgStrokeHelper
         var key = (x, y, w, h, r);
         if (!cache.TryGetValue(key, out var path))
         {
-            if (cache.Count >= MaxCachedRoundedRects)
-                cache.Clear();
+            if (cache.Count >= MaxCachedRoundedRects) cache.Clear();
             path = PathGeometry.FromRoundedRect(new Rect(x, y, w, h), r);
             cache[key] = path;
         }
@@ -395,8 +390,7 @@ internal static class NvgStrokeHelper
                 {
                     float x = (float)cmd.X0, y = (float)cmd.Y0;
                     result.Add(new DashSegment(curX, curY, x, y, false));
-                    curX = x;
-                    curY = y;
+                    curX = x; curY = y;
                     break;
                 }
 
@@ -406,16 +400,14 @@ internal static class NvgStrokeHelper
                     float c2x = (float)cmd.X1, c2y = (float)cmd.Y1;
                     float ex = (float)cmd.X2, ey = (float)cmd.Y2;
                     FlattenBezier(result, curX, curY, c1x, c1y, c2x, c2y, ex, ey, 0);
-                    curX = ex;
-                    curY = ey;
+                    curX = ex; curY = ey;
                     break;
                 }
 
                 case PathCommandType.Close:
                     if (MathF.Abs(curX - moveX) > 0.001f || MathF.Abs(curY - moveY) > 0.001f)
                         result.Add(new DashSegment(curX, curY, moveX, moveY, false));
-                    curX = moveX;
-                    curY = moveY;
+                    curX = moveX; curY = moveY;
                     break;
             }
         }
@@ -461,11 +453,7 @@ internal static class NvgStrokeHelper
 
         public DashSegment(float x0, float y0, float x1, float y1, bool isMoveTo)
         {
-            X0 = x0;
-            Y0 = y0;
-            X1 = x1;
-            Y1 = y1;
-            IsMoveTo = isMoveTo;
+            X0 = x0; Y0 = y0; X1 = x1; Y1 = y1; IsMoveTo = isMoveTo;
         }
     }
 
@@ -475,8 +463,7 @@ internal static class NvgStrokeHelper
         double maxX = double.MinValue, maxY = double.MinValue;
         foreach (var cmd in path.Commands)
         {
-            if (cmd.Type == PathCommandType.Close)
-                continue;
+            if (cmd.Type == PathCommandType.Close) continue;
             Update(cmd.X0, cmd.Y0, ref minX, ref minY, ref maxX, ref maxY);
             if (cmd.Type == PathCommandType.BezierTo)
             {
@@ -484,20 +471,15 @@ internal static class NvgStrokeHelper
                 Update(cmd.X2, cmd.Y2, ref minX, ref minY, ref maxX, ref maxY);
             }
         }
-        if (minX > maxX)
-            return default;
+        if (minX > maxX) return default;
         return new Rect(minX, minY, maxX - minX, maxY - minY);
 
         static void Update(double x, double y, ref double minX, ref double minY, ref double maxX, ref double maxY)
         {
-            if (x < minX)
-                minX = x;
-            if (y < minY)
-                minY = y;
-            if (x > maxX)
-                maxX = x;
-            if (y > maxY)
-                maxY = y;
+            if (x < minX) minX = x;
+            if (y < minY) minY = y;
+            if (x > maxX) maxX = x;
+            if (y > maxY) maxY = y;
         }
     }
 

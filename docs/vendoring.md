@@ -69,6 +69,11 @@ matches, which is the signal that upstream moved the patched code. The applied p
     python third_party/tools/vendor.py --emit-svg-generated # rebuild MewUI.Svg/Generated (needs dotnet)
     python third_party/tools/vendor.py --self-test          # the patch applier's own tests
 
+`--check` compares bytes, so the vendored trees have to stay exactly as written. `.gitattributes` marks
+`third_party/MewUI/**` and `third_party/MewVG/**` as `-text`, which stops git from converting the upstream files that
+use CRLF, and `scripts/format_verify.py` excludes `third_party/` because `MewStage.Ui.Backend` compiles a few upstream
+bridge files as linked sources and `dotnet format` would reformat them.
+
 CI runs `--self-test` and `--check` on every push (the `vendor-lock` job). `MewStage.ThirdParty.Tests` holds one
 smoke test per vendored extension's entry point (MewDock, Svg, Geometry, MewCharts, Preview).
 

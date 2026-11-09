@@ -91,7 +91,10 @@ sit in the Demo project under a `PublishAot == true` condition:
   LiveCharts2's engine from source and drops LiveCharts2's source generator when `PublishAot` is true, which leaves
   the generated `MotionProperty` members without an implementation and the build fails. Keeping the publish property
   out of that one reference lets the library build as it does for a JIT run; the ILCompiler then compiles it like
-  every other assembly, and the Workbench's stats chart runs in the published binary.
+  every other assembly, and the Workbench's stats chart runs in the published binary. Restore doesn't honor
+  `GlobalPropertiesToRemove`, though: it walks the references with the command line's `PublishAot=true` and never
+  restores the generator. The Demo's `MewStageRestoreChartsGenerator` target restores it on its own, without
+  `PublishAot`, just before an AOT publish's restore, which is what makes the publish work on a fresh clone.
 - Two NuGet packages are not trim-annotated and the ILCompiler says so: `SharpGen.Runtime` (under Vortice) and
   `Silk.NET.Core`. Their per-assembly roll-ups (IL2104, IL3053) are silenced; the individual findings under Silk.NET
   (IL3000, IL3002: its path resolver reads `Assembly.Location` and the deps file, which a single-file app does not

@@ -14,3 +14,8 @@
 *.ico binary
 *.7z binary
 *.zip binary
+
+# Vendored upstream trees keep their exact bytes: vendor.py --check compares them byte for byte with the pinned
+# upstream archives, and some upstream files use CRLF.
+third_party/MewUI/** -text
+third_party/MewVG/** -text

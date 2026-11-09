@@ -732,8 +732,7 @@ internal sealed partial class MewVGWin32GraphicsContext : GraphicsContextBase, I
 
     public override void DrawLine(Point start, Point end, Pen pen)
     {
-        if (pen.Thickness <= 0)
-            return;
+        if (pen.Thickness <= 0) return;
         var bounds = new Rect(
             Math.Min(start.X, end.X), Math.Min(start.Y, end.Y),
             Math.Abs(end.X - start.X), Math.Abs(end.Y - start.Y));
@@ -755,8 +754,7 @@ internal sealed partial class MewVGWin32GraphicsContext : GraphicsContextBase, I
 
     public override void DrawRectangle(Rect rect, Pen pen)
     {
-        if (pen.Thickness <= 0)
-            return;
+        if (pen.Thickness <= 0) return;
 
         if (pen.StrokeStyle.IsDashed)
         {
@@ -776,8 +774,7 @@ internal sealed partial class MewVGWin32GraphicsContext : GraphicsContextBase, I
 
     public override void DrawRoundedRectangle(Rect rect, double radiusX, double radiusY, Pen pen)
     {
-        if (pen.Thickness <= 0)
-            return;
+        if (pen.Thickness <= 0) return;
         float radius = (float)Math.Max(0, Math.Min(radiusX, radiusY));
 
         if (pen.StrokeStyle.IsDashed)
@@ -796,8 +793,7 @@ internal sealed partial class MewVGWin32GraphicsContext : GraphicsContextBase, I
 
     public override void DrawEllipse(Rect bounds, Pen pen)
     {
-        if (pen.Thickness <= 0)
-            return;
+        if (pen.Thickness <= 0) return;
         float cx = (float)(bounds.X + bounds.Width * 0.5);
         float cy = (float)(bounds.Y + bounds.Height * 0.5);
         float rx = (float)(bounds.Width * 0.5);
@@ -820,8 +816,7 @@ internal sealed partial class MewVGWin32GraphicsContext : GraphicsContextBase, I
     public override void DrawPath(PathGeometry path, Pen pen)
     {
         RecordDrawPath();
-        if (path == null || pen.Thickness <= 0)
-            return;
+        if (path == null || pen.Thickness <= 0) return;
 
         if (pen.StrokeStyle.IsDashed)
         {
@@ -838,20 +833,17 @@ internal sealed partial class MewVGWin32GraphicsContext : GraphicsContextBase, I
 
     public override void FillRectangle(Rect rect, Brush brush)
     {
-        if (brush is SolidColorBrush solid)
-        { FillRectangle(rect, solid.Color); return; }
+        if (brush is SolidColorBrush solid) { FillRectangle(rect, solid.Color); return; }
         if (brush is ImageBrush imageBrush)
         {
             _vg.ShapeAntiAlias(false);
             _vg.BeginPath();
             _vg.Rect((float)rect.X, (float)rect.Y, (float)rect.Width, (float)rect.Height);
-            if (ApplyImageBrushPaint(imageBrush))
-                _vg.Fill();
+            if (ApplyImageBrushPaint(imageBrush)) _vg.Fill();
             _vg.ShapeAntiAlias(true);
             return;
         }
-        if (brush is not GradientBrush gradient)
-            return;
+        if (brush is not GradientBrush gradient) return;
 
         _vg.ShapeAntiAlias(false);
         _vg.BeginPath();
@@ -863,19 +855,16 @@ internal sealed partial class MewVGWin32GraphicsContext : GraphicsContextBase, I
 
     public override void FillRoundedRectangle(Rect rect, double radiusX, double radiusY, Brush brush)
     {
-        if (brush is SolidColorBrush solid)
-        { FillRoundedRectangle(rect, radiusX, radiusY, solid.Color); return; }
+        if (brush is SolidColorBrush solid) { FillRoundedRectangle(rect, radiusX, radiusY, solid.Color); return; }
         if (brush is ImageBrush imageBrush)
         {
             float radius = (float)Math.Max(0, Math.Min(radiusX, radiusY));
             _vg.BeginPath();
             _vg.RoundedRect((float)rect.X, (float)rect.Y, (float)rect.Width, (float)rect.Height, radius);
-            if (ApplyImageBrushPaint(imageBrush))
-                _vg.Fill();
+            if (ApplyImageBrushPaint(imageBrush)) _vg.Fill();
             return;
         }
-        if (brush is not GradientBrush gradient)
-            return;
+        if (brush is not GradientBrush gradient) return;
 
         float r = (float)Math.Max(0, Math.Min(radiusX, radiusY));
         _vg.BeginPath();
@@ -886,20 +875,17 @@ internal sealed partial class MewVGWin32GraphicsContext : GraphicsContextBase, I
 
     public override void FillEllipse(Rect bounds, Brush brush)
     {
-        if (brush is SolidColorBrush solid)
-        { FillEllipse(bounds, solid.Color); return; }
+        if (brush is SolidColorBrush solid) { FillEllipse(bounds, solid.Color); return; }
         if (brush is ImageBrush imageBrush)
         {
             float cx = (float)(bounds.X + bounds.Width * 0.5);
             float cy = (float)(bounds.Y + bounds.Height * 0.5);
             _vg.BeginPath();
             _vg.Ellipse(cx, cy, (float)(bounds.Width * 0.5), (float)(bounds.Height * 0.5));
-            if (ApplyImageBrushPaint(imageBrush))
-                _vg.Fill();
+            if (ApplyImageBrushPaint(imageBrush)) _vg.Fill();
             return;
         }
-        if (brush is not GradientBrush gradient)
-            return;
+        if (brush is not GradientBrush gradient) return;
 
         float ecx = (float)(bounds.X + bounds.Width * 0.5);
         float ecy = (float)(bounds.Y + bounds.Height * 0.5);
@@ -918,10 +904,8 @@ internal sealed partial class MewVGWin32GraphicsContext : GraphicsContextBase, I
         {
             RecordFillPath();
         }
-        if (path == null)
-            return;
-        if (brush is SolidColorBrush solid)
-        { FillPath(path, solid.Color, fillRule); return; }
+        if (path == null) return;
+        if (brush is SolidColorBrush solid) { FillPath(path, solid.Color, fillRule); return; }
         // Frozen geometry takes the same tessellation cache as a solid fill: the cache holds
         // geometry only, and FillFromCache draws it with whatever paint the state carries.
         bool frozen = TryGetFrozenFill(path, fillRule, out var cached, out var vgFillRule);
@@ -946,8 +930,7 @@ internal sealed partial class MewVGWin32GraphicsContext : GraphicsContextBase, I
             }
             return;
         }
-        if (brush is not GradientBrush gradient)
-            return;
+        if (brush is not GradientBrush gradient) return;
 
         if (!frozen)
         {
@@ -1024,8 +1007,7 @@ internal sealed partial class MewVGWin32GraphicsContext : GraphicsContextBase, I
     public override void DrawBoxShadow(Rect bounds, double cornerRadius, double blurRadius,
         Color shadowColor, double offsetX = 0, double offsetY = 0)
     {
-        if (blurRadius <= 0 || shadowColor.A == 0)
-            return;
+        if (blurRadius <= 0 || shadowColor.A == 0) return;
 
         float x = (float)(bounds.X + offsetX);
         float y = (float)(bounds.Y + offsetY);
@@ -1151,14 +1133,12 @@ internal sealed partial class MewVGWin32GraphicsContext : GraphicsContextBase, I
         // half-pixel feather. D2D applies the same coverage AA implicitly on its
         // bitmap draw; this matches that behaviour.
         bool isAxisAligned = _transform.M12 == 0f && _transform.M21 == 0f;
-        if (isAxisAligned)
-            _vg.ShapeAntiAlias(false);
+        if (isAxisAligned) _vg.ShapeAntiAlias(false);
         _vg.BeginPath();
         _vg.Rect((float)fillRect.X, (float)fillRect.Y, (float)fillRect.Width, (float)fillRect.Height);
         _vg.FillPaint(paint);
         _vg.Fill();
-        if (isAxisAligned)
-            _vg.ShapeAntiAlias(true);
+        if (isAxisAligned) _vg.ShapeAntiAlias(true);
     }
 
     private MewVGImageFlags GetImageFlags()
@@ -1227,14 +1207,12 @@ internal sealed partial class MewVGWin32GraphicsContext : GraphicsContextBase, I
     /// </summary>
     private void NvgStrokeWidth(float thickness)
     {
-        if (thickness <= 0)
-        { _vg.StrokeWidth(0); return; }
+        if (thickness <= 0) { _vg.StrokeWidth(0); return; }
         float sx = MathF.Sqrt(_transform.M11 * _transform.M11 + _transform.M12 * _transform.M12);
         float sy = MathF.Sqrt(_transform.M21 * _transform.M21 + _transform.M22 * _transform.M22);
         float avgScale = (sx + sy) * 0.5f;
         float totalScale = avgScale * (float)DpiScale;
-        if (totalScale < 0.001f)
-        { _vg.StrokeWidth(thickness); return; }
+        if (totalScale < 0.001f) { _vg.StrokeWidth(thickness); return; }
         float snappedPx = MathF.Max(1, MathF.Round(thickness * totalScale));
         _vg.StrokeWidth(snappedPx / totalScale);
     }

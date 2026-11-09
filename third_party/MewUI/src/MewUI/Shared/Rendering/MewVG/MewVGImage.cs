@@ -113,8 +113,7 @@ internal sealed class MewVGImage : IImage
                             break;
                         }
                     }
-                    if (!found)
-                        break;
+                    if (!found) break;
                 }
             }
         }
@@ -267,8 +266,7 @@ internal sealed class MewVGImage : IImage
     /// </summary>
     internal IReadOnlyList<(MewVGContext Vg, MewVGImageFlags Flags)> SnapshotPendingEntries()
     {
-        if (_images.Count == 0)
-            return Array.Empty<(MewVGContext, MewVGImageFlags)>();
+        if (_images.Count == 0) return Array.Empty<(MewVGContext, MewVGImageFlags)>();
         var result = new List<(MewVGContext, MewVGImageFlags)>(_images.Count);
         foreach (var key in _images.Keys)
         {
@@ -295,8 +293,7 @@ internal sealed class MewVGImage : IImage
 
     private void ReleaseEntry(MewVGContext vg, MewVGImageFlags flags, bool deleteImage)
     {
-        if (_disposed)
-            return;
+        if (_disposed) return;
 
         var key = new ImageKey(vg, flags);
         if (_images.TryGetValue(key, out var entry))
@@ -347,8 +344,7 @@ internal sealed class MewVGImage : IImage
     /// </summary>
     private void FinalizeRelease()
     {
-        if (_disposed)
-            return;
+        if (_disposed) return;
         _disposed = true;
 
         // Now that NVG has dropped its NoDelete bookkeeping for the wrapped textures,

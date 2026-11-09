@@ -17,6 +17,10 @@ import subprocess
 import sys
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
+# MewStage.Ui.Backend compiles a few upstream bridge files from third_party/ as linked sources. Formatting them would
+# rewrite vendored bytes and break `vendor.py --check`, so the vendored trees are never formatted. The path is
+# relative to ROOT, the working directory dotnet format runs in (an absolute path is ignored).
+EXCLUDE = ["--exclude", "third_party/"]
 
 
 def projects() -> list[pathlib.Path]:
@@ -48,8 +52,8 @@ def main() -> int:
     for csproj in projects():
         rel = csproj.relative_to(ROOT).as_posix()
         print(f"[format] {rel}")
-        rc = run(opts.dotnet, ["whitespace", str(csproj), *verify])
-        rc |= run(opts.dotnet, ["style", str(csproj), "--severity", "warn", *verify])
+        rc = run(opts.dotnet, ["whitespace", str(csproj), *EXCLUDE, *verify])
+        rc |= run(opts.dotnet, ["style", str(csproj), "--severity", "warn", *EXCLUDE, *verify])
         if rc != 0:
             failed.append(rel)
     if failed:
