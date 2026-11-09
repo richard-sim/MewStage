@@ -13,14 +13,14 @@ game and tool codebase and cleaned up to stand on its own. Everything here is MI
 
 ## Why this exists
 
-A UI framework that runs embedded has to give up three things it normally owns. The window belongs to someone else
+A UI framework that runs embedded gives up a few things it normally owns. The window belongs to someone else
 now, so the host has to tell it how big it is and when the mouse moved. Its drawing has to go through the
 application's GPU device, in the application's frame, with the application's synchronization. And there's no message
 loop anymore. The host has to pump the dispatcher and tick the animations itself, once per frame.
 
-MewUI's internals turn out to be built around five contracts that make this possible (a window backend, a graphics
+MewUI's internals turn out to be built around a handful of contracts that make this possible (a window backend, a graphics
 factory, a render surface, a text contract and a per-frame animation pulse). None of them is public API for a
-third-party backend, and MewStage implements all five over a real GPU device.
+third-party backend, and MewStage implements all of them over a real GPU device.
 
 Everything the UI draws ends up in one `ui` render-graph pass per frame, which composites every visible MewUI window
 from bottom to top. A game points that pass at the backbuffer after the world is drawn, and the HUD, pause menu and
@@ -28,10 +28,28 @@ dialog all land in that one pass over the game. An editor points it at a cleared
 the UI. Each viewport is an offscreen render target that MewUI samples as an image, with no copy. The vendored UI
 framework never sees which GPU API is underneath. The same code runs on DX12 and Vulkan, and publishes with NativeAOT.
 
-Getting here took patches to MewUI and MewVG, because an embedded host asks for things MewUI's own platform host never
-needs. Several hosts have to live in one process. A window has to lay out below scale 1, which is how a 1920 x 1080
-HUD fits a 1280 x 720 backbuffer. And a steady-state frame should allocate nothing on the managed heap. Each patch is
+MewUI and MewVG have needed some patching, since an embedded host asks for things MewUI's own platform host doesn't
+need, like several hosts living in one process, supporting window layout below scale 1 (so a 1920 x 1080
+HUD scales down to a 1280 x 720 backbuffer), and a steady-state frame should allocate nothing on the managed heap. Each patch is
 small and marked as mandatory or optional, and docs/vendoring.md explains every one.
+
+## What is here and what is not
+
+Treat this as a working demonstration. It can be the base an app is built on, or a reference while parts of it are
+swapped for existing libraries. Only `MewStage.Host` depends on SDL3, and another windowing layer can take its place.
+The UI backend compiles only against `IGraphicsDevice`, and an engine with its own renderer can implement that
+interface over it and keep the rest. The headless device in the tests is a small example of one.
+
+MewUI and MewVG are vendored at pinned commits with a recorded patch set, instead of coming from NuGet, because the
+backend compiles against their internals.
+
+Some things are missing. There is no macOS or Metal backend, only a stub that holds its place. There are no file
+dialogs, and text input method editors only get what SDL delivers. The Workbench sizes its viewport from the previous
+frame's layout, which shows the old image stretched for one frame during a resize. The in-window DevTools work on the
+embedded host in a Debug build, while the two that open their own windows need Kit mode.
+
+CI runs the lavapipe suites, the Xvfb Kit smoke and the Linux AOT publish on every push. DX12 on real hardware and
+the Windows AOT publish are checked by hand (docs/hand-test.md).
 
 ## The three modes
 
@@ -216,24 +234,6 @@ The demo covers the four things most apps add next:
   `AfterUi` (`src/MewStage.Demo/Workbench`).
 - Input works through `NavCommands`. Register their handlers on the window and bind buttons to the same commands, and
   a key, a gamepad button and a click all run one handler.
-
-## What is here and what is not
-
-Treat this as a working demonstration. It can be the base an app is built on, or a reference while parts of it are
-swapped for existing libraries. Only `MewStage.Host` depends on SDL3, and another windowing layer can take its place.
-The UI backend compiles only against `IGraphicsDevice`, and an engine with its own renderer can implement that
-interface over it and keep the rest. The headless device in the tests is a small example of one.
-
-MewUI and MewVG are vendored at pinned commits with a recorded patch set, instead of coming from NuGet, because the
-backend compiles against their internals.
-
-Some things are missing. There is no macOS or Metal backend, only a stub that holds its place. There are no file
-dialogs, and text input method editors only get what SDL delivers. The Workbench sizes its viewport from the previous
-frame's layout, which shows the old image stretched for one frame during a resize. The in-window DevTools work on the
-embedded host in a Debug build, while the two that open their own windows need Kit mode.
-
-CI runs the lavapipe suites, the Xvfb Kit smoke and the Linux AOT publish on every push. DX12 on real hardware and
-the Windows AOT publish are checked by hand (docs/hand-test.md).
 
 ## Layout
 
