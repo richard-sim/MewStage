@@ -64,11 +64,10 @@ internal static class LinuxFontResolver
             return File.Exists(family) ? family : null;
         }
 
-        // MewStage vendor patch text/0003: the registered face of this weight and style, not the family's last-registered file.
-        var resolved = FontRegistry.Resolve(family, weight, italic);
-        if (resolved != null && File.Exists(resolved.Value.FilePath))
+        var registered = FontRegistry.Resolve(family)?.SelectFace(weight, italic).FilePath;
+        if (registered != null && File.Exists(registered))
         {
-            return resolved.Value.FilePath;
+            return registered;
         }
 
         return FontconfigResolve(family, weight, italic, requireFamily: !_genericFamilies.Contains(family));
@@ -87,12 +86,11 @@ internal static class LinuxFontResolver
             return family;
         }
 
-        // Check FontRegistry (fonts registered via FontResources.Register): the face of this weight and style (MewStage vendor patch
-        // vendor patch 0011).
-        var resolved = FontRegistry.Resolve(family, weight, italic);
-        if (resolved != null && File.Exists(resolved.Value.FilePath))
+        // Check FontRegistry (fonts registered via FontResources.Register).
+        var registered = FontRegistry.Resolve(family)?.SelectFace(weight, italic).FilePath;
+        if (registered != null && File.Exists(registered))
         {
-            return resolved.Value.FilePath;
+            return registered;
         }
 
 

@@ -23,6 +23,18 @@ internal sealed class SceneCapture
     private Rect? _ambientClip;
     private SceneUpdate? _update;
 
+    // The frame the visit currently stands in; the root frame outside any scroll content.
+    private SceneFrame _frame = new(null);
+
+    // The frame the innermost clip scope was opened in: the clip moves with that frame, and a key holds it relative to it.
+    private SceneFrame _clipFrame = new(null);
+
+    // The clip of the scopes opened inside the current frame alone, in surface space; it moves with the frame.
+    private Rect? _frameClip;
+
+    /// <summary>What a visit returns for a subtree: where it shows, and where it reaches before the clips outside its frame cut it.</summary>
+    private readonly record struct SubtreeExtent(Rect Visible, Rect Reach);
+
     /// <summary>
     /// Updates <paramref name="scene"/> from <paramref name="root"/> and paints the result into
     /// <paramref name="context"/>. A null dirty set records every visual.
@@ -95,11 +107,10 @@ internal sealed class SceneCapture
     private readonly List<UIElement> _withoutNodes = [];
 
     /// <summary>
-    /// A control may draw visuals of its own inside its own drawing instead of declaring them (the
-    /// headers of a tab control, the segments of a segmented control). Such a visual has no node, so a
-    /// change of it is a change of the recording that holds its pixels: the nearest visual above it that
-    /// has a node. A visual that is merely new gets its node in this pass; its parent then records
-    /// again for nothing, finds the same drawing and repaints nothing.
+    /// A visual under a bitmap-cached ancestor has no node of its own, so a change of it is a change of
+    /// the recording that holds its pixels: the nearest visual above it that has a node. A visual that is
+    /// merely new gets its node in this pass; its parent then records again for nothing, finds the same
+    /// drawing and repaints nothing.
     /// </summary>
     private void PromoteChangesOfVisualsWithoutNodes(RenderScene scene, RenderDirtyRegistry registry)
     {
@@ -145,6 +156,9 @@ internal sealed class SceneCapture
         update.Begin(scene);
         update.StageRoot(root);
         _ambientClip = null;
+        _frame = scene.RootFrame;
+        _clipFrame = scene.RootFrame;
+        _frameClip = null;
         _surfaceBox = RetainedGeometry.TransformRect(root.Bounds, context.GetTransform());
         update.StageLayerRoots(layerRoots);
 
@@ -178,7 +192,7 @@ internal sealed class SceneCapture
     }
 
     /// <summary>Records or replays one visual and returns its surface-space subtree extent.</summary>
-    private Rect CaptureVisual(
+    private SubtreeExtent CaptureVisual(
         RenderScene scene,
         SceneUpdate update,
         UIElement element,
@@ -193,13 +207,16 @@ internal sealed class SceneCapture
         bool attachmentChanged = node.ParentElement != null && !ReferenceEquals(node.ParentElement, parent);
 
         // Read before anything under the visual is looked at, so a change made while the pass is
-        // under way shows as a newer version next time instead of being taken for seen.
+        // under way shows as a newer version next time instead of being taken for seen. Where the visual
+        // stands and what clips it are held relative to the frames that carry them, so a whole-pixel move
+        // of a frame changes neither.
+        var frame = _frame;
         var key = new CaptureKey(
             true,
             element.SubtreeContentVersion,
-            element.Bounds,
+            Relative(element.Bounds, frame.PendingLocalOrigin),
             transform,
-            _ambientClip,
+            _ambientClip is Rect ambient ? Relative(ambient, _clipFrame.PendingSurfaceOrigin) : null,
             recorder.DpiScale);
 
         // Every change under a visual bumps its subtree version on the way to the surface, and every
@@ -210,9 +227,47 @@ internal sealed class SceneCapture
             !attachmentChanged &&
             ReferenceEquals(node.ParentElement, parent) &&
             node.Captured.IsValid &&
-            node.Captured == key)
+            node.Captured == key &&
+            ReferenceEquals(node.Frame, frame) &&
+            !frame.ForcesVisit)
         {
-            return node.SurfaceSubtreeBounds;
+            // A node that was clipped away is asked every time whether it shows now, since a frame that
+            // moved away and back leaves it where it was staged and still hidden.
+            var surfaceShift = frame.PendingSurfaceOrigin - node.CapturedFrameSurfaceOrigin;
+            if (!node.ClippedAwayAtVisit && IsZero(surfaceShift))
+            {
+                return new SubtreeExtent(node.SurfaceSubtreeBounds, node.SurfaceSubtreeReach);
+            }
+
+            // The frame moved since the node was staged. What goes out of view is marked hidden, what stays
+            // in view is carried along, and what was hidden and comes into view is visited below: it has no
+            // place on the surface yet, and its changes stopped at it while it was hidden.
+            var reach = node.SurfaceSubtreeReach.Offset(surfaceShift);
+            if (Visible(reach).IsEmpty)
+            {
+                if (!node.ClippedAwayAtVisit && IsClippedAway(element, transform, default))
+                {
+                    update.StageHidden(node);
+                }
+
+                return new SubtreeExtent(default, reach);
+            }
+
+            // A recording that cannot be replayed moved has to be taken again where the visual stands now.
+            if (!node.ClippedAwayAtVisit && !node.HasUnplaceableSlot)
+            {
+                return CarrySubtree(
+                    scene,
+                    update,
+                    node,
+                    recorder,
+                    dirty,
+                    transform,
+                    key,
+                    surfaceShift,
+                    frame.PendingLocalOrigin - node.CapturedFrameLocalOrigin,
+                    frame.PendingLocalOrigin - node.PlanFrameLocalOrigin);
+            }
         }
 
         scene.Statistics.CapturedNodeCount++;
@@ -225,25 +280,19 @@ internal sealed class SceneCapture
         if (!isVisible)
         {
             update.StageComposition(node, CompositionPlan.Empty, state, stateBakedIntoContent: false);
-            update.StageBounds(node, default, default, Origin(element), captured: key);
+            update.StageBounds(node, default, default, default, Origin(element), clippedAway: false, key, frame);
             return default;
         }
 
         // A cached element serves its pixels from its own bitmap inside its render path, so the scene
         // records that path as a whole instead of splitting it into slots.
-        if (!element.SupportsDeclaredComposition || element.HasBitmapCache)
+        if (element.HasBitmapCache)
         {
             return CaptureCompatibilitySubtree(
                 scene, update, element, node, recorder, dirty, attachmentChanged, transform);
         }
 
         var plan = BuildPlan(update, element, node, attachmentChanged);
-        if (plan.IsUnsupported)
-        {
-            return CaptureCompatibilitySubtree(
-                scene, update, element, node, recorder, dirty, attachmentChanged, transform);
-        }
-
         update.StageComposition(node, plan, state, stateBakedIntoContent: false);
 
         // A pass that only brings the scene up to date draws nothing, so it opens no scope on the
@@ -264,6 +313,7 @@ internal sealed class SceneCapture
 
         var ownBounds = default(BoundsAccumulator);
         var subtreeBounds = default(BoundsAccumulator);
+        var subtreeReach = default(BoundsAccumulator);
 
         try
         {
@@ -279,7 +329,8 @@ internal sealed class SceneCapture
                 plan.Entries.Length,
                 transform,
                 ref ownBounds,
-                ref subtreeBounds);
+                ref subtreeBounds,
+                ref subtreeReach);
         }
         finally
         {
@@ -299,26 +350,345 @@ internal sealed class SceneCapture
             node,
             ownBounds.Result,
             subtreeBounds.Result,
+            subtreeReach.Result,
             Origin(element),
             IsClippedAway(element, transform, subtreeBounds.Result),
-            key);
-        return subtreeBounds.Result;
+            key,
+            frame);
+        return new SubtreeExtent(subtreeBounds.Result, subtreeReach.Result);
     }
 
     /// <summary>
-    /// Asks the visual for its composition every pass. A declaration that has not changed returns the
-    /// plan the node already holds, so nothing is allocated and no dirty region is reported; that is what
-    /// lets a visual whose children or geometry did change be noticed without a separate signal.
+    /// Stages a node its frame carried along without looking into it: its place is staged shifted, its
+    /// slots' extents with it, and its children are reached so that whatever comes into view under it is
+    /// visited. Its plan is kept as built, so its clips and transforms read under <paramref name="planShift"/>.
+    /// </summary>
+    private SubtreeExtent CarrySubtree(
+        RenderScene scene,
+        SceneUpdate update,
+        VisualNode node,
+        RenderDataRecorder recorder,
+        DirtyView dirty,
+        Matrix3x2 transform,
+        CaptureKey key,
+        Vector surfaceShift,
+        Vector localShift,
+        Vector planShift)
+    {
+        scene.Statistics.CarriedNodeCount++;
+
+        var ownBounds = default(BoundsAccumulator);
+        var subtreeBounds = default(BoundsAccumulator);
+        var subtreeReach = default(BoundsAccumulator);
+        CarryEntries(
+            scene,
+            update,
+            node,
+            recorder,
+            dirty,
+            0,
+            node.Plan.Entries.Length,
+            transform,
+            surfaceShift,
+            planShift,
+            ref ownBounds,
+            ref subtreeBounds,
+            ref subtreeReach);
+
+        subtreeBounds.Add(ownBounds.Result);
+        update.StageBounds(
+            node,
+            ownBounds.Result,
+            subtreeBounds.Result,
+            subtreeReach.Result,
+            node.PlacedOrigin + localShift,
+            IsClippedAway(node.Element, transform, subtreeBounds.Result),
+            key,
+            _frame,
+            planStaged: false);
+        return new SubtreeExtent(subtreeBounds.Result, subtreeReach.Result);
+    }
+
+    private void CarryEntries(
+        RenderScene scene,
+        SceneUpdate update,
+        VisualNode node,
+        RenderDataRecorder recorder,
+        DirtyView dirty,
+        int startIndex,
+        int count,
+        Matrix3x2 transform,
+        Vector surfaceShift,
+        Vector planShift,
+        ref BoundsAccumulator ownBounds,
+        ref BoundsAccumulator subtreeBounds,
+        ref BoundsAccumulator subtreeReach)
+    {
+        var entries = node.Plan.Entries;
+        int entryIndex = startIndex;
+        int endIndex = startIndex + count;
+
+        while (entryIndex < endIndex)
+        {
+            var entry = entries[entryIndex];
+            switch (entry.Kind)
+            {
+                case CompositionEntryKind.Content:
+                    int slotIndex = entry.SlotIndex;
+                    var data = node.GetSlot(slotIndex);
+                    Rect slotReach;
+                    if (data != null)
+                    {
+                        slotReach = data.SurfaceReach.Offset(surfaceShift);
+                    }
+                    else if (node.NonRecordableReason != null)
+                    {
+                        slotReach = RetainedGeometry.TransformRect(node.Element.Bounds.Inflate(LIVE_INK_MARGIN, LIVE_INK_MARGIN), transform);
+                    }
+                    else
+                    {
+                        slotReach = default;
+                    }
+
+                    var slotExtent = data != null && data.EscapesAmbientClip ? slotReach : Visible(slotReach);
+                    if (data != null)
+                    {
+                        update.StageSlotExtent(node, slotIndex, slotExtent, slotReach, staysInsideTheVisual: false);
+                    }
+
+                    ownBounds.Add(slotExtent);
+                    subtreeReach.Add(FrameVisible(slotReach, data));
+                    entryIndex++;
+                    break;
+
+                case CompositionEntryKind.Child:
+                    var child = CaptureVisual(scene, update, entry.Child!, recorder, dirty, node.Element, transform);
+                    subtreeBounds.Add(child.Visible);
+                    subtreeReach.Add(child.Reach);
+                    entryIndex++;
+                    break;
+
+                case CompositionEntryKind.Frame:
+                    // A frame under a carried node was not staged this pass, so it stands where it stood
+                    // relative to the frame that carries it.
+                    var innerFrame = update.FindNode(entries[entryIndex + 1].Child!)?.RootedFrame;
+                    var outerFrame = _frame;
+                    var outerFrameClip = _frameClip;
+                    if (innerFrame != null && ReferenceEquals(innerFrame.Parent, outerFrame))
+                    {
+                        _frame = innerFrame;
+                        _frameClip = null;
+                    }
+
+                    try
+                    {
+                        CarryEntries(
+                            scene,
+                            update,
+                            node,
+                            recorder,
+                            dirty,
+                            entryIndex + 1,
+                            entry.ScopeLength,
+                            transform,
+                            surfaceShift,
+                            planShift,
+                            ref ownBounds,
+                            ref subtreeBounds,
+                            ref subtreeReach);
+                    }
+                    finally
+                    {
+                        _frame = outerFrame;
+                        _frameClip = outerFrameClip;
+                    }
+
+                    entryIndex += entry.ScopeLength + 1;
+                    break;
+
+                default:
+                    var outerClip = _ambientClip;
+                    var outerClipFrame = _clipFrame;
+                    var outerScopeFrameClip = _frameClip;
+                    try
+                    {
+                        if (entry.Kind is CompositionEntryKind.ClipRect or CompositionEntryKind.ClipRoundedRect)
+                        {
+                            EnterClip(RetainedGeometry.TransformRect(entry.Rect.Offset(planShift), transform));
+                        }
+
+                        var scopeTransform = entry.Kind == CompositionEntryKind.Transform
+                            ? RetainedGeometry.Shifted(entry.Matrix, planShift) * transform
+                            : transform;
+                        CarryEntries(
+                            scene,
+                            update,
+                            node,
+                            recorder,
+                            dirty,
+                            entryIndex + 1,
+                            entry.ScopeLength,
+                            scopeTransform,
+                            surfaceShift,
+                            planShift,
+                            ref ownBounds,
+                            ref subtreeBounds,
+                            ref subtreeReach);
+                    }
+                    finally
+                    {
+                        _ambientClip = outerClip;
+                        _clipFrame = outerClipFrame;
+                        _frameClip = outerScopeFrameClip;
+                    }
+
+                    entryIndex += entry.ScopeLength + 1;
+                    break;
+            }
+        }
+    }
+
+    /// <summary>Narrows the ambient clip by a scope's clip, noting that the scope was opened in the current frame.</summary>
+    private void EnterClip(Rect scopeClip)
+    {
+        _ambientClip = _ambientClip is Rect outer ? outer.Intersect(scopeClip) : scopeClip;
+        _clipFrame = _frame;
+        _frameClip = _frameClip is Rect inner ? inner.Intersect(scopeClip) : scopeClip;
+    }
+
+    /// <summary>
+    /// Captures the one child a frame scope encloses as the root of its frame. A frame the scene already
+    /// holds that moved by whole pixels is moved rather than visited: its origin is staged, where its subtree
+    /// showed and where it shows now are dirty, and the nodes under it are carried or visited as they stand.
+    /// </summary>
+    private void CaptureFrame(
+        RenderScene scene,
+        SceneUpdate update,
+        VisualNode node,
+        CompositionPlan plan,
+        RenderDataRecorder recorder,
+        DirtyView dirty,
+        bool attachmentChanged,
+        int scopeIndex,
+        Matrix3x2 transform,
+        ref BoundsAccumulator ownBounds,
+        ref BoundsAccumulator subtreeBounds,
+        ref BoundsAccumulator subtreeReach)
+    {
+        var entries = plan.Entries;
+        if (entries[scopeIndex].ScopeLength != 1 || entries[scopeIndex + 1].Kind != CompositionEntryKind.Child)
+        {
+            throw new InvalidOperationException("A frame scope encloses exactly one child.");
+        }
+
+        var rootElement = entries[scopeIndex + 1].Child!;
+        var rootNode = update.GetOrCreateNode(rootElement);
+        var outerFrame = _frame;
+        var frame = rootNode.RootedFrame;
+        bool created = frame == null || !ReferenceEquals(frame.Parent, outerFrame);
+        if (created)
+        {
+            frame = new SceneFrame(outerFrame);
+        }
+
+        var localOrigin = rootElement.Bounds.TopLeft;
+        var surfaceOrigin = RetainedGeometry.TransformPoint(localOrigin, transform);
+        bool forcesVisit = false;
+        if (!created)
+        {
+            var move = (localOrigin - outerFrame.PendingLocalOrigin) - frame!.LocalOriginInParent;
+            if (!IsZero(move))
+            {
+                if (IsWholeDevicePixels(move.X * recorder.DpiScale) && IsWholeDevicePixels(move.Y * recorder.DpiScale))
+                {
+                    scene.Statistics.FrameMoveCount++;
+
+                    // Where the subtree showed and where it shows now are both stale. No node under the
+                    // frame answers for them, since the ones that only moved are not written again.
+                    update.StageDirty(rootNode.ShiftedSurfaceSubtreeBounds);
+                    update.StageDirty(Visible(rootNode.SurfaceSubtreeReach.Offset(surfaceOrigin - rootNode.CapturedFrameSurfaceOrigin)));
+                }
+                else
+                {
+                    // Moved by a fraction of a pixel, no recording under the frame draws where it stands now.
+                    forcesVisit = true;
+                }
+            }
+        }
+
+        frame!.Stage(localOrigin, surfaceOrigin, forcesVisit);
+        update.StageFrame(rootNode, frame);
+
+        var outerFrameClip = _frameClip;
+        _frame = frame;
+        _frameClip = null;
+        try
+        {
+            CaptureEntries(
+                scene,
+                update,
+                node,
+                plan,
+                recorder,
+                dirty,
+                attachmentChanged,
+                scopeIndex + 1,
+                1,
+                transform,
+                ref ownBounds,
+                ref subtreeBounds,
+                ref subtreeReach);
+        }
+        finally
+        {
+            _frame = outerFrame;
+            _frameClip = outerFrameClip;
+        }
+    }
+
+    private static Rect Relative(Rect rect, Point origin)
+        => new(rect.X - origin.X, rect.Y - origin.Y, rect.Width, rect.Height);
+
+    private static bool IsZero(Vector vector) => vector.X == 0 && vector.Y == 0;
+
+    // The reach of a recording that resets the clip around it: wherever the frame goes, it may ink in view.
+    private static readonly Rect _everywhere = new(-1e9, -1e9, 2e9, 2e9);
+
+    /// <summary>
+    /// The part of a reach that the clips opened inside the current frame let through. Those clips move with
+    /// the frame, so the result stays right across a frame move; the clips outside it do not cut it.
+    /// </summary>
+    private Rect FrameVisible(Rect reach, RenderData? data)
+    {
+        if (data != null && data.EscapesAmbientClip)
+        {
+            return _everywhere;
+        }
+
+        if (_frameClip is not Rect clip || reach.IsEmpty)
+        {
+            return reach;
+        }
+
+        var visible = reach.Intersect(clip);
+        return visible.Width > 0 && visible.Height > 0 ? visible : default;
+    }
+
+    /// <summary>
+    /// Reads the visual's composition from its children, clips and transform every pass. A composition
+    /// that has not changed returns the plan the node already holds, so nothing is allocated and no dirty
+    /// region is reported; that is what lets a visual whose children or geometry did change be noticed
+    /// without a separate signal.
     /// </summary>
     private CompositionPlan BuildPlan(SceneUpdate update, UIElement element, VisualNode node, bool attachmentChanged)
     {
-        element.WriteComposition(_planBuilder);
+        element.WritePlan(_planBuilder);
         var plan = _planBuilder.Build(attachmentChanged ? null : node.Plan);
         update.StageConsumption(element, RenderDirtyKind.Composition | RenderDirtyKind.State | RenderDirtyKind.Placement);
         return plan;
     }
 
-    private Rect CaptureCompatibilitySubtree(
+    private SubtreeExtent CaptureCompatibilitySubtree(
         RenderScene scene,
         SceneUpdate update,
         UIElement element,
@@ -338,7 +708,12 @@ internal sealed class SceneCapture
             element,
             RenderDirtyKind.Composition | RenderDirtyKind.State | RenderDirtyKind.Placement);
 
-        if (NeedsCompatibilityRecording(node, element, dirty, attachmentChanged, transform))
+        // A frame that carried the visual by whole pixels leaves the recording where the visual stands.
+        var frame = _frame;
+        var carried = ReferenceEquals(node.Frame, frame) && !frame.ForcesVisit
+            ? frame.PendingLocalOrigin - node.CapturedFrameLocalOrigin
+            : default;
+        if (NeedsCompatibilityRecording(node, element, dirty, attachmentChanged, transform, carried))
         {
             RecordSlot(scene, update, node, OWN_CONTENT_SLOT, recorder, compatibilitySubtree: true);
             update.StageConsumption(element, RenderDirtyKind.Content | RenderDirtyKind.Resource | RenderDirtyKind.Layout);
@@ -350,12 +725,21 @@ internal sealed class SceneCapture
 
         var bounds = default(BoundsAccumulator);
         var subtreeReach = RetainedGeometry.TransformRect(SlotBounds(update, node, OWN_CONTENT_SLOT), transform);
-        var subtreeExtent = Visible(subtreeReach);
+        var subtreeExtent = SlotVisible(update, node, OWN_CONTENT_SLOT, subtreeReach);
         update.StageSlotExtent(node, OWN_CONTENT_SLOT, subtreeExtent, subtreeReach, StaysInsideTheVisual(subtreeExtent, element, transform));
         StageChangeWithinSlot(update, node, OWN_CONTENT_SLOT, transform);
         bounds.Add(subtreeExtent);
-        update.StageBounds(node, bounds.Result, bounds.Result, Origin(element), IsClippedAway(element, transform, bounds.Result));
-        return bounds.Result;
+        var frameReach = FrameVisible(subtreeReach, update.TryGetStagedSlot(node, OWN_CONTENT_SLOT, out var staged) ? staged : node.GetSlot(OWN_CONTENT_SLOT));
+        update.StageBounds(
+            node,
+            bounds.Result,
+            bounds.Result,
+            frameReach,
+            Origin(element),
+            IsClippedAway(element, transform, bounds.Result),
+            captured: default,
+            frame);
+        return new SubtreeExtent(bounds.Result, frameReach);
     }
 
     private void CaptureEntries(
@@ -370,7 +754,8 @@ internal sealed class SceneCapture
         int count,
         Matrix3x2 transform,
         ref BoundsAccumulator ownBounds,
-        ref BoundsAccumulator subtreeBounds)
+        ref BoundsAccumulator subtreeBounds,
+        ref BoundsAccumulator subtreeReach)
     {
         var entries = plan.Entries;
         var context = recorder.Inner;
@@ -394,31 +779,51 @@ internal sealed class SceneCapture
                     }
 
                     var slotReach = RetainedGeometry.TransformRect(SlotBounds(update, node, slotIndex), transform);
-                    var slotExtent = Visible(slotReach);
+                    var slotExtent = SlotVisible(update, node, slotIndex, slotReach);
                     update.StageSlotExtent(node, slotIndex, slotExtent, slotReach, StaysInsideTheVisual(slotExtent, node.Element, transform));
                     StageChangeWithinSlot(update, node, slotIndex, transform);
                     ownBounds.Add(slotExtent);
+                    subtreeReach.Add(FrameVisible(slotReach, update.TryGetStagedSlot(node, slotIndex, out var stagedSlot) ? stagedSlot : node.GetSlot(slotIndex)));
                     entryIndex++;
                     break;
 
                 case CompositionEntryKind.Child:
-                    var childBounds = CaptureVisual(
+                    var child = CaptureVisual(
                         scene, update, entry.Child!, recorder, dirty, node.Element, transform);
-                    subtreeBounds.Add(childBounds);
+                    subtreeBounds.Add(child.Visible);
+                    subtreeReach.Add(child.Reach);
                     entryIndex++;
+                    break;
+
+                case CompositionEntryKind.Frame:
+                    CaptureFrame(
+                        scene,
+                        update,
+                        node,
+                        plan,
+                        recorder,
+                        dirty,
+                        attachmentChanged,
+                        entryIndex,
+                        transform,
+                        ref ownBounds,
+                        ref subtreeBounds,
+                        ref subtreeReach);
+                    entryIndex += entry.ScopeLength + 1;
                     break;
 
                 default:
                     context.Save();
                     var outerClip = _ambientClip;
+                    var outerClipFrame = _clipFrame;
+                    var outerFrameClip = _frameClip;
                     try
                     {
                         ApplyScope(context, in entry);
                         if (entry.Kind is CompositionEntryKind.ClipRect or CompositionEntryKind.ClipRoundedRect)
                         {
                             // What lies past the clip never reaches the surface, so it is neither ink nor dirty.
-                            var scopeClip = RetainedGeometry.TransformRect(entry.Rect, transform);
-                            _ambientClip = outerClip is Rect outer ? outer.Intersect(scopeClip) : scopeClip;
+                            EnterClip(RetainedGeometry.TransformRect(entry.Rect, transform));
                         }
 
                         var scopeTransform = entry.Kind == CompositionEntryKind.Transform
@@ -436,11 +841,14 @@ internal sealed class SceneCapture
                             entry.ScopeLength,
                             scopeTransform,
                             ref ownBounds,
-                            ref subtreeBounds);
+                            ref subtreeBounds,
+                            ref subtreeReach);
                     }
                     finally
                     {
                         _ambientClip = outerClip;
+                        _clipFrame = outerClipFrame;
+                        _frameClip = outerFrameClip;
                         context.Restore();
                     }
 
@@ -490,9 +898,17 @@ internal sealed class SceneCapture
                 break;
             case CompositionEntryKind.Transform:
                 context.SetTransform(entry.Matrix * context.GetTransform());
+                if (entry.DisablesTextPixelSnap)
+                {
+                    context.TextPixelSnap = false;
+                }
+
+                break;
+            case CompositionEntryKind.Alpha:
+                context.GlobalAlpha *= (float)entry.Alpha;
                 break;
             default:
-                throw new InvalidOperationException($"The composition entry {entry.Kind} is not a scope.");
+                throw new InvalidOperationException($"The composition entry {entry.Kind} is not a drawing scope.");
         }
     }
 
@@ -528,14 +944,16 @@ internal sealed class SceneCapture
 
     /// <summary>
     /// A compatibility subtree owns its descendants' drawing, so any repaint under it invalidates it.
-    /// Its drawing is not known to be independent of where it stands, so a move records it again too.
+    /// Its drawing is not known to be independent of where it stands, so a move of its own records it
+    /// again too; only a whole-pixel move of the frame that carries it (<paramref name="carried"/>) leaves it.
     /// </summary>
     private static bool NeedsCompatibilityRecording(
         VisualNode node,
         UIElement element,
         DirtyView dirty,
         bool attachmentChanged,
-        Matrix3x2 transform)
+        Matrix3x2 transform,
+        Vector carried)
     {
         var data = node.GetSlot(OWN_CONTENT_SLOT);
         return attachmentChanged ||
@@ -543,9 +961,16 @@ internal sealed class SceneCapture
             node.RecordedContentVersion != element.RenderContentVersion ||
             dirty.IsDirty(element, RenderDirtyKind.Content | RenderDirtyKind.Resource | RenderDirtyKind.Layout) ||
             node.RecordedSubtreeVersion != element.SubtreeContentVersion ||
-            data.RecordedBounds != element.Bounds ||
+            !StandsAt(data.RecordedBounds.Offset(carried), element.Bounds) ||
             !IsDrawnUnderTheSameTransform(data, transform);
     }
+
+    /// <summary>Whether two boxes are the same box, within what layout rounding leaves of a whole-pixel move.</summary>
+    private static bool StandsAt(Rect recorded, Rect current)
+        => Math.Abs(recorded.X - current.X) < PLACEMENT_EPSILON &&
+           Math.Abs(recorded.Y - current.Y) < PLACEMENT_EPSILON &&
+           recorded.Width == current.Width &&
+           recorded.Height == current.Height;
 
     /// <summary>
     /// Whether a recording still draws the visual correctly when
@@ -606,6 +1031,21 @@ internal sealed class SceneCapture
             var reached = RetainedGeometry.TransformRect(change, transform);
             update.StageSlotChange(node, slotIndex, Visible(reached.IsEmpty ? reached : reached.Inflate(CHANGED_CALL_MARGIN, CHANGED_CALL_MARGIN)));
         }
+    }
+
+    /// <summary>
+    /// The part of a slot's reach that reaches the surface. A recording that resets the clip around it inks
+    /// past that clip, so the clip does not cut it down.
+    /// </summary>
+    private Rect SlotVisible(SceneUpdate update, VisualNode node, int slotIndex, Rect reach)
+    {
+        var data = update.TryGetStagedSlot(node, slotIndex, out var staged) ? staged : node.GetSlot(slotIndex);
+        if (data != null && data.EscapesAmbientClip)
+        {
+            return reach;
+        }
+
+        return Visible(reach);
     }
 
     /// <summary>The part of an extent that the clips around it let reach the surface.</summary>
@@ -673,7 +1113,7 @@ internal sealed class SceneCapture
             }
             else
             {
-                node.Element.WriteOwnContent(recorder, slotIndex);
+                node.Element.RenderOwnSlot(recorder, slotIndex);
             }
         }
         finally

@@ -16,9 +16,12 @@
 //     opaque menu below composites correctly under a transparent dialog's scrim via premultiplied alpha; the shared
 //     stencil is safe because the stencil passes self-reset and NanoVG's clip stack is reset per window's BeginFrame.
 //
-//   * The MewUI main host contract: the host PULSES the animation clocks once per frame (AnimationManager.UpdateAt;
-//     MewUI no longer ticks animation inside render), keeps each window's graphics context across frames, and binds its
-//     graphics factory as the thread's.
+//   * The MewUI main host contract, as upstream's Browser and Headless hosts keep it: once per frame the host opens an
+//     animation PULSE (AnimationManager.BeginPulse at the frame's timestamp; MewUI does not tick animation inside
+//     render), pumps the thread's dispatcher (EmbeddedDispatcher: timers, posted work, the merged layout / render
+//     passes), and renders when a window asked for it or the pulse says the application renders as a whole
+//     (pulse.ShouldRender). It keeps each window's graphics context across frames and binds its graphics factory and
+//     its dispatcher as the thread's.
 //
 // A single window in the list is byte-identical to a single-window host: one BeginRendering, one flush.
 //
@@ -137,6 +140,7 @@ public sealed class EmbeddedUiHost : IDisposable
         _framesInFlight = framesInFlight < 1 ? 1 : framesInFlight;
         Factory = UiGraphicsFactory.Register(device, uiVs, uiPs, flipClipY, _framesInFlight);
         registerFonts?.Invoke(Factory.Fonts);
+        _dispatcher = EmbeddedDispatcher.Acquire();
         BindThread();
         ApplyEmbeddedHostDefaults();
         _uiExec = UiExecute;
@@ -158,6 +162,7 @@ public sealed class EmbeddedUiHost : IDisposable
         _uiPs = uiPs ?? throw new ArgumentNullException(nameof(uiPs));
         _flipClipY = flipClipY;
         _framesInFlight = framesInFlight < 1 ? 1 : framesInFlight;
+        _dispatcher = EmbeddedDispatcher.Acquire();
         BindThread();
         ApplyEmbeddedHostDefaults();
         _uiExec = UiExecute;
@@ -168,6 +173,13 @@ public sealed class EmbeddedUiHost : IDisposable
 
     // False for a host on another host's factory (the shared-factory constructor): Dispose leaves it alone.
     private readonly bool _ownsFactory;
+
+    // The thread's dispatcher (vendor patch multi-host/0003), shared with every other host on this thread.
+    private readonly EmbeddedDispatcher _dispatcher;
+
+    // The pulse's render settings (upstream's Application.RenderLoopSettings; no Application runs here). Left at the
+    // defaults: VSync on, not Continuous, so a pulse renders application-wide only for a clock with no element.
+    private readonly RenderLoopSettings _loopSettings = new();
 
     // ---- the retained renderer's pass clock ----
     // MewUI's retained renderer draws a visual LIVE (stops recording it) once its content changed in 30 passes in a
@@ -464,15 +476,17 @@ public sealed class EmbeddedUiHost : IDisposable
         window.SetClientSizeDip(_dipW, _dipH);
     }
 
-    /// <summary>The end of one host turn, which is what MewUI's dispatcher does after it drains (DispatcherQueue
-    /// .NotifyDrainCompleted): re-query CanExecute for every command-bound control of every window, so a button bound
-    /// to a command enables as soon as its screen registers the handler and follows the handler's CanExecute after
-    /// that. No ApplicationDispatcher is installed in the embedded host (invalidation routes directly via the
-    /// backend), so this is that pass. It visits only the registered command sources and allocates nothing. Throws if
-    /// called after Dispose.</summary>
+    /// <summary>One host turn of the thread's dispatcher: run the posted work and the due timers (DispatcherTimer ticks,
+    /// BeginInvoke work, the merged layout / render / command passes), then what MewUI's dispatcher does after it drains
+    /// (DispatcherQueue.NotifyDrainCompleted, which only runs under a running Application): re-query CanExecute for
+    /// every command-bound control of every window, so a button bound to a command enables as soon as its screen
+    /// registers the handler and follows the handler's CanExecute after that. With nothing queued it allocates
+    /// nothing. TickAndRender runs it every frame. Throws if called after Dispose.</summary>
     public void PumpDispatcher()
     {
         ObjectDisposedException.ThrowIf(_disposed, this);
+        BindThread();
+        _dispatcher.ProcessWorkItems();
         for (int i = 0; i < _windows.Count; i++)
         {
             _windows[i].EvaluateCommandStates();
@@ -489,35 +503,32 @@ public sealed class EmbeddedUiHost : IDisposable
     }
 
     /// <summary>Advance MewUI's animation clocks (transitions, animated controls) to <paramref name="timestamp"/>
-    /// (Stopwatch ticks). MewUI main no longer ticks animation inside render; the host pulses once per frame.
-    /// Tests pass a fixed timestamp to step a transition deterministically.</summary>
+    /// (Stopwatch ticks) outside a frame: one pulse, as TickAndRender opens every frame. Tests pass a fixed timestamp
+    /// to step a transition deterministically.</summary>
     public void PulseAnimations(long timestamp)
     {
         ObjectDisposedException.ThrowIf(_disposed, this);
-        AnimationManager.Instance.UpdateAt(timestamp);
+        using AnimationManager.AnimationPulse pulse = AnimationManager.Instance.BeginPulse(_loopSettings, timestamp);
     }
 
-    /// <summary>True when a running animation of THIS thread's UI needs frames (the host renders while it does).
-    /// The multi-host vendor patch: animation clocks are per UI thread, so a host pulses only its own thread's transitions.</summary>
+    /// <summary>True while a running animation clock of THIS thread's UI is unpaused. The multi-host vendor patch:
+    /// animation clocks are per UI thread, so a host pulses only its own thread's transitions. A readout: the render
+    /// decision is the pulse's (an animation whose element the render pass culled invalidates nothing, and its window
+    /// sleeps).</summary>
     public static bool AnimationsNeedFrames => AnimationManager.Instance.HasRenderDemand;
 
-    /// <summary>True when the host should re-record this frame (OnRequest: any window invalidated or an animation is
-    /// running; Continuous: always).</summary>
-    public bool ShouldRender(UiInvalidationMode mode)
+    // Whether this frame re-records the stack: the first frame and Continuous always; OnRequest when a window asked
+    // for a redraw, or when the pulse renders application-wide (upstream's pulse.ShouldRender, per window).
+    private bool ShouldRenderFrame(UiInvalidationMode mode, in AnimationManager.AnimationPulse pulse)
     {
         if (_firstFrame || mode == UiInvalidationMode.Continuous)
         {
             return true;
         }
 
-        if (AnimationsNeedFrames)
+        foreach (KeyValuePair<Window, EmbeddedWindowBackend> kv in _backends)
         {
-            return true;
-        }
-
-        foreach (EmbeddedWindowBackend b in _backends.Values)
-        {
-            if (b.InvalidationCount > 0)
+            if (pulse.ShouldRender(kv.Key, kv.Value.InvalidationCount > 0))
             {
                 return true;
             }
@@ -541,9 +552,13 @@ public sealed class EmbeddedUiHost : IDisposable
         }
 
         BindThread();
+        // The frame's clock for the dispatcher's timers, then the pulse (it ticks the clocks; their invalidations are
+        // posted), then the dispatcher (posted work, due timers, the merged layout / render passes): every request of
+        // this frame has reached its window's backend before the render decision.
+        _dispatcher.SetFrameTimestamp(animationTimestamp ?? 0);
+        using AnimationManager.AnimationPulse pulse = AnimationManager.Instance.BeginPulse(_loopSettings, animationTimestamp ?? Stopwatch.GetTimestamp());
         PumpDispatcher();
-        PulseAnimations(animationTimestamp ?? Stopwatch.GetTimestamp());
-        if (!ShouldRender(mode))
+        if (!ShouldRenderFrame(mode, pulse))
         {
             _sampled.Clear();
             return false;
@@ -577,9 +592,13 @@ public sealed class EmbeddedUiHost : IDisposable
         }
 
         BindThread();
+        // The frame's clock for the dispatcher's timers, then the pulse (it ticks the clocks; their invalidations are
+        // posted), then the dispatcher (posted work, due timers, the merged layout / render passes): every request of
+        // this frame has reached its window's backend before the render decision.
+        _dispatcher.SetFrameTimestamp(animationTimestamp ?? 0);
+        using AnimationManager.AnimationPulse pulse = AnimationManager.Instance.BeginPulse(_loopSettings, animationTimestamp ?? Stopwatch.GetTimestamp());
         PumpDispatcher();
-        PulseAnimations(animationTimestamp ?? Stopwatch.GetTimestamp());
-        if (!ShouldRender(mode))
+        if (!ShouldRenderFrame(mode, pulse))
         {
             _sampled.Clear();
             return false;
@@ -780,6 +799,7 @@ public sealed class EmbeddedUiHost : IDisposable
         if (!_disposed)
         {
             Application.ThreadGraphicsFactory = Factory;
+            Application.ThreadDispatcher = _dispatcher;
         }
     }
 
@@ -792,6 +812,7 @@ public sealed class EmbeddedUiHost : IDisposable
         }
 
         _disposed = true;
+        _dispatcher.Release();
         // A host on a shared factory leaves the thread's factory and the factory itself to their owner (still running).
         if (_ownsFactory && ReferenceEquals(Application.ThreadGraphicsFactory, Factory))
         {

@@ -85,14 +85,23 @@ internal static class FrameRenderer
             return;
         }
 
-        if (dirtyRect != null && !Intersects(node.SurfaceSubtreeBounds, dirtyRect.Value))
+        // A node under a frame that moved since it was staged stands shifted by that move; the frame moved
+        // whole, so only this one shift is read and nothing under it was written again. The plan may be
+        // older than the place, when the frame carried the node along, and reads under its own shift.
+        var subtreeBounds = node.ShiftedSurfaceSubtreeBounds;
+        var localShift = node.LocalShift;
+        var planShift = node.PlanLocalShift;
+
+        // A subtree the clips around it hide has no extent on the surface, so a whole frame leaves it out as a
+        // partial one does: a scroll replays the containers in the viewport, not the whole list behind it.
+        if (!HasExtent(subtreeBounds) || (dirtyRect != null && !subtreeBounds.IntersectsWith(dirtyRect.Value)))
         {
             return;
         }
 
         if (node.StateBakedIntoContent)
         {
-            ReplaySlot(scene, node, OWN_CONTENT_SLOT, context, isCompatibilitySubtree: true);
+            ReplaySlot(scene, node, OWN_CONTENT_SLOT, context, isCompatibilitySubtree: true, localShift);
             return;
         }
 
@@ -102,7 +111,7 @@ internal static class FrameRenderer
         var group = default(OpacityGroup);
         if (opacityScope)
         {
-            var reach = dirtyRect is Rect dirty ? node.SurfaceSubtreeBounds.Intersect(dirty) : node.SurfaceSubtreeBounds;
+            var reach = dirtyRect is Rect dirty ? subtreeBounds.Intersect(dirty) : subtreeBounds;
             group = OpacityGroup.Begin(context, scene.GroupFactory, node.State.Opacity, reach);
             context = group.Target;
             if (!ReferenceEquals(context, group.Outer))
@@ -119,7 +128,7 @@ internal static class FrameRenderer
 
         try
         {
-            ReplayEntries(scene, node, context, 0, node.Plan.Entries.Length, dirtyRect);
+            ReplayEntries(scene, node, context, 0, node.Plan.Entries.Length, dirtyRect, localShift, planShift);
         }
         finally
         {
@@ -141,7 +150,9 @@ internal static class FrameRenderer
         IGraphicsContext context,
         int startIndex,
         int count,
-        Rect? dirtyRect)
+        Rect? dirtyRect,
+        Vector localShift,
+        Vector planShift)
     {
         var entries = node.Plan.Entries;
         int entryIndex = startIndex;
@@ -153,7 +164,7 @@ internal static class FrameRenderer
             switch (entry.Kind)
             {
                 case CompositionEntryKind.Content:
-                    ReplaySlot(scene, node, entry.SlotIndex, context, isCompatibilitySubtree: false);
+                    ReplaySlot(scene, node, entry.SlotIndex, context, isCompatibilitySubtree: false, localShift);
                     entryIndex++;
                     break;
 
@@ -167,12 +178,18 @@ internal static class FrameRenderer
                     entryIndex++;
                     break;
 
+                case CompositionEntryKind.Frame:
+                    // The child under it reads its own frame; drawing applies nothing for the scope.
+                    ReplayEntries(scene, node, context, entryIndex + 1, entry.ScopeLength, dirtyRect, localShift, planShift);
+                    entryIndex += entry.ScopeLength + 1;
+                    break;
+
                 default:
                     context.Save();
                     try
                     {
-                        ApplyScope(context, in entry);
-                        ReplayEntries(scene, node, context, entryIndex + 1, entry.ScopeLength, dirtyRect);
+                        ApplyScope(context, in entry, planShift);
+                        ReplayEntries(scene, node, context, entryIndex + 1, entry.ScopeLength, dirtyRect, localShift, planShift);
                     }
                     finally
                     {
@@ -185,38 +202,47 @@ internal static class FrameRenderer
         }
     }
 
-    private static void ApplyScope(IGraphicsContext context, in CompositionEntry entry)
+    /// <summary>Applies a scope as the plan holds it, moved by <paramref name="planShift"/> when its node's frame moved since the plan was built.</summary>
+    private static void ApplyScope(IGraphicsContext context, in CompositionEntry entry, Vector planShift)
     {
         switch (entry.Kind)
         {
             case CompositionEntryKind.ClipRect:
-                context.SetClip(entry.Rect);
+                context.SetClip(VisualNode.Shifted(entry.Rect, planShift));
                 break;
             case CompositionEntryKind.ClipRoundedRect:
-                context.SetClipRoundedRect(entry.Rect, entry.RadiusX, entry.RadiusY);
+                context.SetClipRoundedRect(VisualNode.Shifted(entry.Rect, planShift), entry.RadiusX, entry.RadiusY);
                 break;
             case CompositionEntryKind.Transform:
-                context.SetTransform(entry.Matrix * context.GetTransform());
+                context.SetTransform(RetainedGeometry.Shifted(entry.Matrix, planShift) * context.GetTransform());
+                if (entry.DisablesTextPixelSnap)
+                {
+                    context.TextPixelSnap = false;
+                }
+
+                break;
+            case CompositionEntryKind.Alpha:
+                context.GlobalAlpha *= (float)entry.Alpha;
                 break;
             default:
                 throw new InvalidOperationException($"The composition entry {entry.Kind} is not a scope.");
         }
     }
 
-    private static bool Intersects(Rect bounds, Rect dirtyRect)
-        => bounds.Width > 0 && bounds.Height > 0 && bounds.IntersectsWith(dirtyRect);
+    private static bool HasExtent(Rect bounds) => bounds.Width > 0 && bounds.Height > 0;
 
     private static void ReplaySlot(
         RenderScene scene,
         VisualNode node,
         int slotIndex,
         IGraphicsContext context,
-        bool isCompatibilitySubtree)
+        bool isCompatibilitySubtree,
+        Vector localShift)
     {
         var data = node.GetSlot(slotIndex);
         if (data != null)
         {
-            SceneCapture.ReplayPlaced(data, context, node.PlacedOrigin);
+            SceneCapture.ReplayPlaced(data, context, node.PlacedOrigin + localShift);
             scene.Statistics.ContentReplayCount++;
             return;
         }
@@ -227,7 +253,7 @@ internal static class FrameRenderer
         }
         else
         {
-            node.Element.WriteOwnContent(context, slotIndex);
+            node.Element.RenderOwnSlot(context, slotIndex);
         }
 
         scene.Statistics.LiveFallbackCount++;

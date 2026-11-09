@@ -1,5 +1,3 @@
-using Aprillz.MewUI.Rendering;
-
 namespace Aprillz.MewUI.Controls;
 
 /// <summary>
@@ -45,8 +43,8 @@ public partial class Label : Control, IVisualTreeHost
     }
 
     /// <summary>
-    /// Gets or sets the target control that receives <see cref="UIElement.OnAccessKey"/> when
-    /// this label's access key is activated. If null, the access key bubbles up the parent chain.
+    /// Gets or sets the element that receives <see cref="UIElement.OnAccessKey"/> when this label's
+    /// access key is activated; null lets the access key bubble up the parent chain.
     /// </summary>
     public UIElement? Target
     {
@@ -73,8 +71,8 @@ public partial class Label : Control, IVisualTreeHost
     }
 
     /// <summary>
-    /// Gets or sets the text content. Use underscore prefix to define an access key
-    /// (e.g. "_Name" registers Alt+N). Use double underscore ("__") for a literal underscore.
+    /// Gets or sets the text; an underscore prefix marks the access key character (e.g. "_Name"
+    /// registers Alt+N) and a double underscore is a literal underscore.
     /// </summary>
     public string Text
     {
@@ -120,6 +118,11 @@ public partial class Label : Control, IVisualTreeHost
 
     protected override Size MeasureContent(Size availableSize)
     {
+        if (HasTemplateInstance)
+        {
+            return base.MeasureContent(availableSize);
+        }
+
         if (string.IsNullOrEmpty(Text))
         {
             return Padding.HorizontalThickness > 0 || Padding.VerticalThickness > 0
@@ -135,22 +138,25 @@ public partial class Label : Control, IVisualTreeHost
     protected override void ArrangeContent(Rect bounds)
     {
         base.ArrangeContent(bounds);
-        _accessText.Arrange(bounds.Deflate(Padding));
-    }
 
-    protected override void OnRender(IGraphicsContext context)
-    {
-        base.OnRender(context);
-
-        if (string.IsNullOrEmpty(Text))
+        if (HasTemplateInstance)
         {
             return;
         }
 
-        _accessText.Render(context);
+        _accessText.Arrange(bounds.Deflate(Padding));
     }
 
-    bool IVisualTreeHost.VisitChildren(Func<Element, bool> visitor) => visitor(_accessText);
+    bool IVisualTreeHost.VisitChildren(Func<Element, bool> visitor)
+    {
+        var templateRoot = TemplateVisualRoot;
+        if (templateRoot != null)
+        {
+            return visitor(templateRoot);
+        }
+
+        return visitor(_accessText);
+    }
 
     protected override void OnDispose()
     {

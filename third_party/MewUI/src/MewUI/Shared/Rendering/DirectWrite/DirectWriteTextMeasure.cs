@@ -90,7 +90,8 @@ internal static unsafe class DirectWriteTextMeasure
             return false;
         }
 
-        nint textFormat = AcquireTextFormat(factory, font, null, TextWrapping.NoWrap, out bool ownFormat);
+        // The natural line is what the pinned spacing is derived from, so this format is left unpinned.
+        nint textFormat = AcquireTextFormat(factory, font, null, TextWrapping.NoWrap, out bool ownFormat, fontLineSpacing: false);
         if (textFormat == 0)
         {
             return false;
@@ -109,6 +110,55 @@ internal static unsafe class DirectWriteTextMeasure
 
             baseline = line.baseline;
             height = line.height;
+            return baseline > 0;
+        }
+        finally
+        {
+            ComHelpers.Release(textLayout);
+            if (ownFormat)
+            {
+                ComHelpers.Release(textFormat);
+            }
+        }
+    }
+
+    /// <summary>
+    /// Baseline of the first line of <paramref name="text"/> laid out single-line and top-aligned, in
+    /// device-independent units from the top. A fallback glyph can lift it above the font's own baseline.
+    /// </summary>
+    internal static bool TryGetRunBaseline(nint factory, DirectWriteFont font, DWriteTextFormatCache? formatCache,
+        ReadOnlySpan<char> text, float pixelsPerDip, out double baseline)
+    {
+        baseline = 0;
+        if (text.IsEmpty || factory == 0)
+        {
+            return false;
+        }
+
+        nint textFormat = AcquireTextFormat(factory, font, formatCache, TextWrapping.NoWrap, out bool ownFormat);
+        if (textFormat == 0)
+        {
+            return false;
+        }
+
+        nint textLayout = 0;
+        try
+        {
+            int hr = DWriteVTable.CreateGdiCompatibleTextLayout(
+                (IDWriteFactory*)factory, text, textFormat, float.MaxValue, float.MaxValue, pixelsPerDip,
+                useGdiNatural: false, out textLayout);
+            if (hr < 0 || textLayout == 0)
+            {
+                return false;
+            }
+
+            ApplyCustomFontFallback(factory, textLayout, font);
+            if (DWriteVTable.GetFirstLineMetrics(textLayout, out var line) < 0)
+            {
+                return false;
+            }
+
+            baseline = line.baseline;
             return baseline > 0;
         }
         finally
@@ -289,7 +339,7 @@ internal static unsafe class DirectWriteTextMeasure
     /// <paramref name="ownFormat"/> reports.
     /// </summary>
     private static nint AcquireTextFormat(nint factory, DirectWriteFont font,
-        DWriteTextFormatCache? formatCache, TextWrapping wrapping, out bool ownFormat)
+        DWriteTextFormatCache? formatCache, TextWrapping wrapping, out bool ownFormat, bool fontLineSpacing = true)
     {
         ownFormat = false;
         if (formatCache is not null)
@@ -312,7 +362,25 @@ internal static unsafe class DirectWriteTextMeasure
 
         DWriteVTable.SetWordWrapping(textFormat,
             wrapping == TextWrapping.NoWrap ? DWRITE_WORD_WRAPPING.NO_WRAP : DWRITE_WORD_WRAPPING.WRAP);
+        if (fontLineSpacing)
+        {
+            ApplyFontLineSpacing(textFormat, font);
+        }
+
         ownFormat = true;
         return textFormat;
+    }
+
+    /// <summary>
+    /// Pins the format's line spacing to the font's own line height and baseline. Without it DirectWrite
+    /// sizes a line by the tallest font that drew a glyph in it, so one fallback glyph grows the line and
+    /// moves every glyph down; the FreeType and CoreText engines never do that.
+    /// </summary>
+    internal static void ApplyFontLineSpacing(nint textFormat, DirectWriteFont font)
+    {
+        if (textFormat != 0 && font.TryGetNaturalLineSpacing(out float lineHeight, out float baseline))
+        {
+            DWriteVTable.SetLineSpacing(textFormat, DWRITE_LINE_SPACING_METHOD.UNIFORM, lineHeight, baseline);
+        }
     }
 }

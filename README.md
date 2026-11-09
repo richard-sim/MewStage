@@ -19,7 +19,7 @@ application's GPU device, in the application's frame, with the application's syn
 loop anymore. The host has to pump the dispatcher and tick the animations itself, once per frame.
 
 MewUI's internals turn out to be built around a handful of contracts that make this possible (a window backend, a graphics
-factory, a render surface, a text contract and a per-frame animation pulse). None of them is public API for a
+factory, a render surface, a text contract, a per-frame animation pulse and a dispatcher). None of them is public API for a
 third-party backend, and MewStage implements all of them over a real GPU device.
 
 Everything the UI draws ends up in one `ui` render-graph pass per frame, which composites every visible MewUI window
@@ -138,8 +138,9 @@ rebuilt every frame.
 MewUI sees a fake window backend that reports a size, counts invalidations, and has a non-zero handle so layout runs.
 Its graphics factory sits on top of the application's device, and its render surface is a color texture with a
 stencil. Fonts go through FontStashSharp using each face's real metrics, which lets text measure exactly as it draws
-without touching the GPU. Each frame the host pulses MewUI's animation clocks, lays out any dirty windows, and adds one
-pass to the graph.
+without touching the GPU. Each frame the host pulses MewUI's animation clocks, pumps the dispatcher that runs MewUI's
+timers and deferred work (a blinking caret, a repeat button, a merged layout pass), lays out any dirty windows, and
+adds one pass to the graph.
 
 The pass writes its target, either clearing it or loading what the world drew. It also reads every viewport texture
 the application declared and creates one transient stencil, and the graph compiler adds the barriers. Inside the

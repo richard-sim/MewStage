@@ -29,7 +29,7 @@ local-override file build/MewUI.Local.props and the same hook in MewVG (the mewv
 1. Aprillz.MewUI  (MIT)  ->  third_party/MewUI/
 --------------------------------------------------------------------------------
 Upstream:  https://github.com/aprillz/MewUI
-Pin:       commit 8b9c9433fc9b1450d994b26bcef55a8d294bbd29 (main, 2026-10-16; version 0.22.1+)
+Pin:       commit 8c43abf304c297c0acbe8617eac820e2d0ecd1d7 (main, 2026-11-07; version 0.22.1+)
 License:   MIT (third_party/MewUI/LICENSE). Code upstream bundles is listed in
            third_party/MewUI/THIRD_PARTY_NOTICES.md (vendored unchanged).
 
@@ -39,7 +39,9 @@ Vendored projects (all built by MewStage.sln):
   src/MewUI                       the framework, including Shared/** (platform hosts and rendering backends;
                                   compiled only by the projects that link them, as upstream)
   src/MewUI.Analyzers             Roslyn analyzer + code fixes (fluent markup); IDE / build time only
-  src/MewUI.Generators            binding-path source generator (interceptors); wired by MewUI.Consumer.targets
+  src/MewUI.Generators            source generators: binding paths (interceptors; wired into the consumers by
+                                  MewUI.Consumer.targets) and the fluent extensions (same-name setters, On*
+                                  subscriptions) that MewUI, MewDock and MewCharts generate for their own types
   src/MewUI.Preview               IDE preview session host (Kit mode; JIT only)
   src/MewUI.Platform.Win32, .X11  standard platform hosts         } Kit mode (--standard) runs on them;
   src/MewUI.Backend.MewVG.Win32, .X11  MewVG (OpenGL) backends   } the embedded modes never use them
@@ -49,8 +51,9 @@ Vendored projects (all built by MewStage.sln):
   extensions/MewUI.MewCharts      charts: the LiveChartsCore engine (MIT) compiled into the extension's own
                                   assembly over a MewUI drawing context, as upstream builds it
 Not vendored: Backend.Direct2D / Gdi / MewVG.MacOS, Platform.MacOS / Browser, Backend.MewVG.Browser (the Browser
-pair is the reference design for MewStage's own backend), Markdown, MewvalonEdit, Skia, WebView2, samples, tests,
-tools.
+pair is the reference design for MewStage's own backend), Platform.Framebuffer / Backend.MewVG.Framebuffer,
+Headless (with Browser, the reference for the embedded host's dispatcher and pulse), Markdown, MewvalonEdit,
+Terminal, Skia, WebView2, samples, tests, tools, the docs site.
 
 Git submodules, vendored as their own pinned sources:
   extensions/MewUI.Svg/ThirdParty/SvgNet        https://github.com/svg-net/SVG
@@ -99,6 +102,12 @@ them). A MANDATORY category cannot be skipped. Each header says what and why; hu
   0002-per-thread-animation-manager.patch - AnimationManager is per UI thread (a clock keeps the manager it
       registered with), so one embedded host's per-frame pulse never ticks another host's transitions on the wrong
       thread. Single-UI-thread behaviour unchanged.
+  0003-per-thread-dispatcher.patch - Application.ThreadDispatcher (per thread) is the dispatcher Window and
+      DispatcherTimer use when no Application is running (Application.ResolveDispatcher). Without it an embedded
+      host had none, so DispatcherTimer never ticked (caret blink, RepeatButton auto-repeat, the ScrollViewer idle
+      timer, key-chord timeouts, toast expiry, long press) and BeginInvoke work never ran (deferred Tab focus into
+      list rows, the hover re-check after a scroll). The backend binds a managed dispatcher it pumps once per
+      frame. A running Application's dispatcher still wins: MewUI's own hosts are unchanged.
 
   allocation (optional; without it a steady-state UI frame allocates and the allocation gate tests fail)
   0001-replay-text-without-delegate.patch - RenderDataReplayer replays text by switching on the command kind
@@ -121,9 +130,6 @@ them). A MANDATORY category cannot be skipped. Each header says what and why; hu
       own advance, so a negative kerning pair does not cut the glyph on raster-box backends.
   0002-negative-half-leading.patch - a line box smaller than its text (CSS line-height below the font's) centres
       the text with negative half-leading, as CSS does; it was clamped at zero.
-  0003-font-registry-multi-face-families.patch - FontResources.Register keeps every face of a family (with the
-      weight and style its file declares) and the text backends choose among them; it kept the last file only, so
-      a standard platform host drew every weight and style of a multi-file family with one face (Kit mode, Lora).
 
   rendering (optional)
   0001-rect-stroke-antialias-off-axis.patch - MewVG's rectangle stroke turns antialiasing off only on the pixel

@@ -19,22 +19,9 @@ internal static class WorkbenchShell
         ArgumentNullException.ThrowIfNull(app);
         ArgumentNullException.ThrowIfNull(dock);
         WorkbenchViewModel vm = mode.ViewModel;
-
-        Menu fileMenu = new Menu().Item(WorkbenchMode.StartPageCommand).Separator().Item(WorkbenchMode.QuitCommand);
-        var viewMenu = new Menu();
-        viewMenu.Add(new MenuItem().Command(WorkbenchMode.ToggleViewport2Command).IsCheckable().BindIsChecked(vm.Viewport2Visible));
-        viewMenu.Add(new MenuItem().Command(WorkbenchMode.StatsWindowCommand).IsCheckable().BindIsChecked(vm.StatsDetached));
-        viewMenu.Separator().Item(WorkbenchMode.ResetLayoutCommand);
-        Menu helpMenu = new Menu().Item(WorkbenchMode.AboutCommand);
-        MenuBar menuBar = new MenuBar().Items(new MenuItem("_File").Menu(fileMenu), new MenuItem("_View").Menu(viewMenu), new MenuItem("_Help").Menu(helpMenu));
-
-        ToolBar toolBar = new ToolBar().Band(
-            new ToolBarGroup().Item(WorkbenchMode.StartPageCommand).Item(WorkbenchMode.QuitCommand),
-            new ToolBarGroup().Toggle(WorkbenchMode.ToggleViewport2Command).Toggle(WorkbenchMode.StatsWindowCommand).Item(WorkbenchMode.ResetLayoutCommand),
-            new ToolBarGroup().Item(Inspector.FrameCameraACommand).Item(WorkbenchMode.AboutCommand));
-
-        Border statusBar = new Border { Padding = new Thickness(10, 4, 10, 4), BorderThickness = 1, BorderBrush = Color.FromRgb(60, 64, 76) }
-            .Child(new TextBlock().FontSize(12).BindText(vm.Status));
+        MenuBar menuBar = BuildMenuBar(vm);
+        ToolBar toolBar = BuildToolBar();
+        Border statusBar = BuildStatusBar(vm);
 
         var root = new DockPanel { LastChildFill = true };
         root.Add(menuBar.DockTop());
@@ -57,5 +44,33 @@ internal static class WorkbenchShell
         window.InputMap.Map(WorkbenchMode.StatsWindowCommand, new KeyGesture(Key.S, ModifierKeys.Control | ModifierKeys.Shift));   // not Ctrl+Shift+T: MewUI's DevTools own that one
         window.InputMap.Map(new KeySequence(new KeyGesture(Key.Escape)), mode.CloseAbout, () => mode.IsAboutOpen);
         return window;
+    }
+
+    // The menus: File (start page, quit), View (the two toggles, reset layout), Help (about).
+    private static MenuBar BuildMenuBar(WorkbenchViewModel vm)
+    {
+        Menu fileMenu = new Menu().Item(WorkbenchMode.StartPageCommand).Separator().Item(WorkbenchMode.QuitCommand);
+        var viewMenu = new Menu();
+        viewMenu.Add(new MenuItem().Command(WorkbenchMode.ToggleViewport2Command).IsCheckable().BindIsChecked(vm.Viewport2Visible));
+        viewMenu.Add(new MenuItem().Command(WorkbenchMode.StatsWindowCommand).IsCheckable().BindIsChecked(vm.StatsDetached));
+        viewMenu.Separator().Item(WorkbenchMode.ResetLayoutCommand);
+        Menu helpMenu = new Menu().Item(WorkbenchMode.AboutCommand);
+        return new MenuBar().Items(new MenuItem("_File").SubMenu(fileMenu), new MenuItem("_View").SubMenu(viewMenu), new MenuItem("_Help").SubMenu(helpMenu));
+    }
+
+    // The toolbar: the menus' commands as icon buttons, in three groups.
+    private static ToolBar BuildToolBar()
+    {
+        return new ToolBar().Band(
+            new ToolBarGroup().Item(WorkbenchMode.StartPageCommand).Item(WorkbenchMode.QuitCommand),
+            new ToolBarGroup().Toggle(WorkbenchMode.ToggleViewport2Command).Toggle(WorkbenchMode.StatsWindowCommand).Item(WorkbenchMode.ResetLayoutCommand),
+            new ToolBarGroup().Item(Inspector.FrameCameraACommand).Item(WorkbenchMode.AboutCommand));
+    }
+
+    // The status bar: one line bound to the view model's status text.
+    private static Border BuildStatusBar(WorkbenchViewModel vm)
+    {
+        return new Border { Padding = new Thickness(10, 4, 10, 4), BorderThickness = 1, BorderBrush = Color.FromRgb(60, 64, 76) }
+            .Child(new TextBlock().FontSize(12).BindText(vm.Status));
     }
 }

@@ -16,6 +16,19 @@ public enum Stretch
 }
 
 /// <summary>
+/// Specifies whether stretching may enlarge content, shrink it, or both.
+/// </summary>
+public enum StretchDirection
+{
+    /// <summary>Content is only enlarged; content larger than the destination keeps its size.</summary>
+    UpOnly,
+    /// <summary>Content is only shrunk; content smaller than the destination keeps its size.</summary>
+    DownOnly,
+    /// <summary>Content is enlarged or shrunk as the stretch mode requires.</summary>
+    Both,
+}
+
+/// <summary>
 /// Specifies how <see cref="Rect"/> values used as an image view box are interpreted.
 /// </summary>
 public enum ImageViewBoxUnits
@@ -108,9 +121,11 @@ public enum FontWeight
 }
 
 /// <summary>
-/// Font style values. Oblique, the slanted upright a family may carry beside a true italic, is absent
-/// until a backend can tell it from Italic: two of the three draw it with the same flag today.
+/// Font style values.
 /// </summary>
+/// <remarks>
+/// Oblique, the slanted upright a family may carry beside a true italic, has no value of its own; a slanted face is requested as <see cref="Italic"/>.
+/// </remarks>
 public enum FontStyle
 {
     /// <summary>Upright.</summary>
@@ -120,7 +135,7 @@ public enum FontStyle
 }
 
 /// <summary>
-/// Orientation for layout panels.
+/// Specifies a horizontal or vertical orientation.
 /// </summary>
 public enum Orientation
 {
@@ -131,14 +146,19 @@ public enum Orientation
 }
 
 /// <summary>
-/// Text horizontal/vertical alignment options.
+/// Text alignment along an axis; <see cref="Top"/> and <see cref="Bottom"/> alias <see cref="Left"/> and <see cref="Right"/> for vertical use.
 /// </summary>
 public enum TextAlignment
 {
+    /// <summary>Align to the left (or top).</summary>
     Left,
+    /// <summary>Align to the center.</summary>
     Center,
+    /// <summary>Align to the right (or bottom).</summary>
     Right,
+    /// <summary>Align to the top; the same value as <see cref="Left"/>.</summary>
     Top = Left,
+    /// <summary>Align to the bottom; the same value as <see cref="Right"/>.</summary>
     Bottom = Right
 }
 
@@ -147,8 +167,11 @@ public enum TextAlignment
 /// </summary>
 public enum TextWrapping
 {
+    /// <summary>Text stays on one line and overflows.</summary>
     NoWrap,
+    /// <summary>Text breaks at word boundaries, and inside a word wider than the line.</summary>
     Wrap,
+    /// <summary>Text breaks at word boundaries only; a word wider than the line overflows.</summary>
     WrapWithOverflow
 }
 

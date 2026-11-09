@@ -6,8 +6,8 @@ its caption. Behaviour unchanged with the default. Component mewdock, -p1 from M
 
 --- a/DockingManager.cs
 +++ b/DockingManager.cs
-@@ -45,6 +45,12 @@
-     /// The header is kept while the pane moves between groups, so it should bind to the pane's properties.</summary>
+@@ -54,6 +54,12 @@
+     /// <remarks>The header is kept while the pane moves between groups, so it should bind to the pane's properties.</remarks>
      public Func<DockPane, UIElement?>? HeaderFactory { get; set; }
  
 +    /// <summary>Whether pinned / floating tool groups show the caption bar (title, options, pin, close). MewStage vendor
@@ -18,8 +18,8 @@ its caption. Behaviour unchanged with the default. Component mewdock, -p1 from M
 +
      internal DockModel? Model => _model;
  
-     public DockPane? ActivePane => _activePane;
-@@ -118,7 +124,7 @@
+     /// <summary>Gets the active pane (the selected pane of the focused group), or null when there is none.</summary>
+@@ -136,7 +142,7 @@
          _model = model;
          // Content of a tab the new layout still has (by id) stays with it; the rest is let go.
          PruneHosts();

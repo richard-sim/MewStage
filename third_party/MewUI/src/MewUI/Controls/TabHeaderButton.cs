@@ -20,11 +20,9 @@ internal sealed partial class TabHeaderButton : ContentControl
             MewPropertyOptions.AffectsRender | MewPropertyOptions.AffectsVisualState,
             static (self, _, _) => self.OnIsSelectedChanged());
 
-    /// <summary>
-    /// Gets or sets the tab index this header represents.
-    /// </summary>
     private void OnIsSelectedChanged() => RefreshVisualState();
 
+    /// <summary>Gets or sets the tab index this header represents.</summary>
     public int Index { get; set; }
 
     /// <summary>
@@ -76,6 +74,9 @@ internal sealed partial class TabHeaderButton : ContentControl
         RefreshVisualState();
     }
 
+    /// <summary>The TabControl this header belongs to; the header sits in its header row, not directly under it.</summary>
+    internal TabControl? OwnerTabControl => FindOwnerTabControl();
+
     private TabControl? FindOwnerTabControl()
     {
         for (Element? current = Parent; current != null; current = current.Parent)
@@ -103,6 +104,12 @@ internal sealed partial class TabHeaderButton : ContentControl
 
     protected override void OnRender(IGraphicsContext context)
     {
+        // A template owns the header's entire visuals; the placement-shaped chrome would double-render.
+        if (HasTemplateInstance)
+        {
+            return;
+        }
+
         var bg = GetValue(BackgroundProperty);
         var borderBrush = GetValue(BorderBrushProperty);
         double r = CornerRadius;
@@ -132,7 +139,7 @@ internal sealed partial class TabHeaderButton : ContentControl
     {
         base.ArrangeContent(bounds);
 
-        if (Content == null)
+        if (HasTemplateInstance || Content == null)
         {
             return;
         }

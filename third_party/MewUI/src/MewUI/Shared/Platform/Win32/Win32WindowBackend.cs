@@ -283,34 +283,37 @@ internal sealed class Win32WindowBackend : IWindowBackend
     {
         if (Handle == 0) return;
 
-        const int GWL_STYLE = -16;
-        const uint WS_MINIMIZEBOX = 0x00020000;
-        const uint SWP_NOSIZE = 0x0001;
-        const uint SWP_NOMOVE = 0x0002;
-        const uint SWP_NOZORDER = 0x0004;
-        const uint SWP_FRAMECHANGED = 0x0020;
-
-        uint style = (uint)User32.GetWindowLongPtr(Handle, GWL_STYLE).ToInt64();
-        style = value ? (style | WS_MINIMIZEBOX) : (style & ~WS_MINIMIZEBOX);
-        User32.SetWindowLongPtr(Handle, GWL_STYLE, (nint)style);
-        User32.SetWindowPos(Handle, 0, 0, 0, 0, 0, SWP_NOSIZE | SWP_NOMOVE | SWP_NOZORDER | SWP_FRAMECHANGED | SWP_NOACTIVATE_ON_REFRESH);
+        // GetWindowStyle reads Window.CanMinimize, so every later restyle keeps the button state too.
+        ReapplyOwnedStyle();
     }
 
     public void SetCanMaximize(bool value)
     {
         if (Handle == 0) return;
 
-        const int GWL_STYLE = -16;
-        const uint WS_MAXIMIZEBOX = 0x00010000;
-        const uint SWP_NOSIZE = 0x0001;
-        const uint SWP_NOMOVE = 0x0002;
-        const uint SWP_NOZORDER = 0x0004;
-        const uint SWP_FRAMECHANGED = 0x0020;
+        ReapplyOwnedStyle();
+    }
 
-        uint style = (uint)User32.GetWindowLongPtr(Handle, GWL_STYLE).ToInt64();
-        style = value ? (style | WS_MAXIMIZEBOX) : (style & ~WS_MAXIMIZEBOX);
-        User32.SetWindowLongPtr(Handle, GWL_STYLE, (nint)style);
-        User32.SetWindowPos(Handle, 0, 0, 0, 0, 0, SWP_NOSIZE | SWP_NOMOVE | SWP_NOZORDER | SWP_FRAMECHANGED | SWP_NOACTIVATE_ON_REFRESH);
+    public void SetCanClose(bool value)
+    {
+        if (Handle == 0) return;
+
+        ApplyCloseCommand();
+    }
+
+    private void ApplyCloseCommand()
+    {
+        const uint SC_CLOSE = 0xF060;
+        const uint MF_BYCOMMAND = 0x0000;
+        const uint MF_ENABLED = 0x0000;
+        const uint MF_GRAYED = 0x0001;
+
+        // The caption close button follows the system menu's Close item; Alt+F4 still closes, as in WPF and Avalonia.
+        nint systemMenu = User32.GetSystemMenu(Handle, false);
+        if (systemMenu != 0)
+        {
+            User32.EnableMenuItem(systemMenu, SC_CLOSE, MF_BYCOMMAND | (Window.CanClose ? MF_ENABLED : MF_GRAYED));
+        }
     }
 
     public void SetTopmost(bool value)
@@ -761,7 +764,13 @@ internal sealed class Win32WindowBackend : IWindowBackend
                 return User32.DefWindowProc(Handle, msg, wParam, lParam);
 
             case WindowMessages.WM_CREATE:
+                // Read the keyboard layout before the first key, while no dead key can be pending.
+                Win32KeyboardLayout.Prepare(User32.GetKeyboardLayout(0));
                 return 0;
+
+            case WindowMessages.WM_INPUTLANGCHANGE:
+                Win32KeyboardLayout.Prepare(lParam);
+                return User32.DefWindowProc(Handle, msg, wParam, lParam);
 
             case WindowMessages.WM_DESTROY:
                 HandleDestroy();
@@ -1542,6 +1551,14 @@ internal sealed class Win32WindowBackend : IWindowBackend
             if (!Window.WindowSize.IsResizable)
             {
                 style &= ~(WindowStyles.WS_THICKFRAME | WindowStyles.WS_MAXIMIZEBOX);
+            }
+            if (!Window.CanMinimize)
+            {
+                style &= ~WindowStyles.WS_MINIMIZEBOX;
+            }
+            if (!Window.CanMaximize)
+            {
+                style &= ~WindowStyles.WS_MAXIMIZEBOX;
             }
 
             return style;
@@ -2661,6 +2678,46 @@ internal sealed class Win32WindowBackend : IWindowBackend
         return modifiers;
     }
 
+    /// <summary>
+    /// Whether AltGr is reported as Ctrl+Alt, as Windows itself does. Off, a right Alt press that types a third-level
+    /// character reports neither, so typing @ on a German layout does not match a Ctrl+Alt+Q gesture.
+    /// </summary>
+    internal static bool AltGrReportsControlAlt { get; set; }
+
+    /// <summary>The modifiers of a press with Ctrl and Alt dropped when they are AltGr typing a third-level character.</summary>
+    internal static ModifierKeys FilterAltGrModifiers(ModifierKeys modifiers, bool rightAltDown, bool typesThirdLevel)
+    {
+        bool isAltGrCharacter = !AltGrReportsControlAlt && rightAltDown && typesThirdLevel;
+        return isAltGrCharacter ? modifiers & ~(ModifierKeys.Control | ModifierKeys.Alt) : modifiers;
+    }
+
+    /// <summary>The layout texts of a key in the thread's current keyboard layout, under the given modifiers.</summary>
+    private static Win32KeyboardLayout.Symbols LookupKeySymbols(int virtualKey, ModifierKeys modifiers)
+    {
+        var layout = Win32KeyboardLayout.Get(User32.GetKeyboardLayout(0));
+        if (layout == null)
+        {
+            return default;
+        }
+
+        bool capsLock = (User32.GetKeyState(VirtualKeys.VK_CAPITAL) & 0x0001) != 0;
+        bool controlAlt = modifiers.HasFlag(ModifierKeys.Control) && modifiers.HasFlag(ModifierKeys.Alt);
+        return layout.Lookup(virtualKey, modifiers.HasFlag(ModifierKeys.Shift), capsLock, controlAlt);
+    }
+
+    /// <summary>Key event arguments with the layout texts and the AltGr filter applied.</summary>
+    private static KeyEventArgs CreateKeyEventArgs(int platformKey, ModifierKeys modifiers, bool isRepeat)
+    {
+        var symbols = LookupKeySymbols(platformKey, modifiers);
+        bool rightAltDown = (User32.GetKeyState(VirtualKeys.VK_RMENU) & 0x8000) != 0;
+        var reported = FilterAltGrModifiers(modifiers, rightAltDown, symbols.TypesThirdLevel);
+        return new KeyEventArgs(MapKey(platformKey), platformKey, reported, isRepeat)
+        {
+            KeySymbol = symbols.KeySymbol,
+            BaseKeySymbol = symbols.BaseKeySymbol,
+        };
+    }
+
     private nint HandleKeyDown(uint msg, nint wParam, nint lParam)
     {
         _textInputSuppression.BeginKeyDown();
@@ -2677,7 +2734,7 @@ internal sealed class Win32WindowBackend : IWindowBackend
             return User32.DefWindowProc(Handle, msg, wParam, lParam);
         }
 
-        var args = new KeyEventArgs(MapKey(platformKey), platformKey, modifiers, isRepeat);
+        var args = CreateKeyEventArgs(platformKey, modifiers, isRepeat);
         Window.RaisePreviewKeyDown(args);
         if (args.Handled)
         {
@@ -2727,9 +2784,7 @@ internal sealed class Win32WindowBackend : IWindowBackend
     private nint HandleKeyUp(uint msg, nint wParam, nint lParam)
     {
         int platformKey = (int)wParam.ToInt64();
-        var modifiers = GetModifierKeys();
-
-        var args = new KeyEventArgs(MapKey(platformKey), platformKey, modifiers);
+        var args = CreateKeyEventArgs(platformKey, GetModifierKeys(), isRepeat: false);
         Window.RaisePreviewKeyUp(args);
         if (!args.Handled)
         {

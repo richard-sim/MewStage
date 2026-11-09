@@ -1,0 +1,66 @@
+MewStage vendor patch multi-host/0003 (third_party/NOTICE): a dispatcher for a host that runs no Application. Window
+and DispatcherTimer found their dispatcher only through a running Application, so under an embedded host every
+deferred job was dropped: DispatcherTimer never ticked (TextBox caret blink, RepeatButton auto-repeat, ScrollViewer
+idle timer, key-chord timeout, toast expiry, long press) and BeginInvoke work never ran (deferred Tab focus into
+ListBox / TreeView / GridView rows, the hover re-check after a scroll). An internal Application.ThreadDispatcher (per
+thread) is the fallback when no Application is running; the MewStage backend binds a ManagedUiDispatcher it pumps
+once per frame to each UI thread, the way upstream's Browser and Headless hosts pump theirs. A running Application's
+dispatcher still wins, so MewUI's own platform hosts behave exactly as before. Applies after multi-host/0001.
+
+--- a/Controls/Window.cs
++++ b/Controls/Window.cs
+@@ -1295,7 +1295,8 @@
+     /// </summary>
+     public IGraphicsFactory GraphicsFactory => Application.IsRunning ? Application.Current.GraphicsFactory : Application.DefaultGraphicsFactory;
+ 
+-    internal IDispatcher? ApplicationDispatcher => Application.IsRunning ? Application.Current.Dispatcher : null;
++    // MewStage vendor patch multi-host/0003: falls back to the dispatcher an embedded host bound to this thread.
++    internal IDispatcher? ApplicationDispatcher => Application.ResolveDispatcher();
+ 
+     #region Events
+ 
+--- a/Core/Application.cs
++++ b/Core/Application.cs
+@@ -341,6 +341,22 @@
+         set => t_threadGraphicsFactory = value;
+     }
+ 
++    // MewStage vendor patch multi-host/0003: an embedded host runs no Application, so Window and DispatcherTimer found no
++    // dispatcher and every deferred job was dropped (DispatcherTimer never ticked: caret blink, RepeatButton repeat,
++    // key-chord timeout; BeginInvoke work such as deferred Tab focus never ran). The host binds a dispatcher it pumps
++    // itself to its UI thread; a running Application's dispatcher still wins.
++    [ThreadStatic] private static IDispatcher? t_threadDispatcher;
++
++    /// <summary>The dispatcher this thread's UI uses when no Application is running (null = none bound).</summary>
++    internal static IDispatcher? ThreadDispatcher
++    {
++        get => t_threadDispatcher;
++        set => t_threadDispatcher = value;
++    }
++
++    /// <summary>The running Application's dispatcher, else the one bound to this thread (MewStage vendor patch multi-host/0003).</summary>
++    internal static IDispatcher? ResolveDispatcher() => IsRunning ? Current.Dispatcher : t_threadDispatcher;
++
+     // Tooling assemblies decorate the platform host through this seam, registered from their own
+     // composition entry point before the first host access. Registration can precede the platform
+     // Register() call in Main; the wrap is applied when the host is finally resolved.
+--- a/Core/DispatcherTimer.cs
++++ b/Core/DispatcherTimer.cs
+@@ -266,15 +266,8 @@
+         });
+     }
+ 
+-    private static IDispatcher? TryGetDispatcher()
+-    {
+-        if (!Application.IsRunning)
+-        {
+-            return null;
+-        }
+-
+-        return Application.Current.Dispatcher;
+-    }
++    // MewStage vendor patch multi-host/0003: falls back to the dispatcher an embedded host bound to this thread.
++    private static IDispatcher? TryGetDispatcher() => Application.ResolveDispatcher();
+ 
+     /// <summary>
+     /// Stops the timer.

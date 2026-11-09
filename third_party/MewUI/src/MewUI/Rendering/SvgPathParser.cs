@@ -4,7 +4,7 @@ namespace Aprillz.MewUI.Rendering;
 
 /// <summary>
 /// Parses SVG path data mini-language strings into <see cref="PathGeometry"/> commands.
-/// Supports: M/m, L/l, H/h, V/v, C/c, S/s, Q/q, T/t, A/a, Z/z.
+/// Supports: M/m, L/l, H/h, V/v, C/c, S/s, Q/q, T/t, A/a, Z/z, and a leading F0/F1 fill rule.
 /// </summary>
 internal static class SvgPathParser
 {
@@ -24,6 +24,11 @@ internal static class SvgPathParser
 
         // Current point for relative commands.
         double cx = 0, cy = 0;
+
+        if (TryReadFillRulePrefix(d, ref pos, out var fillRule))
+        {
+            geometry.FillRule = fillRule;
+        }
 
         while (pos < d.Length)
         {
@@ -201,6 +206,40 @@ internal static class SvgPathParser
     }
 
     private static void ResetSmooth(ref char prevCmd) => prevCmd = '\0';
+
+    /// <summary>
+    /// Reads a leading <c>F0</c> (even-odd) or <c>F1</c> (non-zero) fill rule, as in XAML path markup.
+    /// Leaves <paramref name="pos"/> unchanged when the data does not start with one.
+    /// </summary>
+    private static bool TryReadFillRulePrefix(ReadOnlySpan<char> data, ref int pos, out FillRule fillRule)
+    {
+        fillRule = FillRule.NonZero;
+        int cursor = pos;
+        while (cursor < data.Length && char.IsWhiteSpace(data[cursor]))
+        {
+            cursor++;
+        }
+
+        if (cursor >= data.Length || data[cursor] != 'F')
+        {
+            return false;
+        }
+
+        cursor++;
+        while (cursor < data.Length && char.IsWhiteSpace(data[cursor]))
+        {
+            cursor++;
+        }
+
+        if (cursor >= data.Length || (data[cursor] != '0' && data[cursor] != '1'))
+        {
+            return false;
+        }
+
+        fillRule = data[cursor] == '0' ? FillRule.EvenOdd : FillRule.NonZero;
+        pos = cursor + 1;
+        return true;
+    }
 
     private static bool IsCommand(char c)
         => c is 'M' or 'm' or 'L' or 'l' or 'H' or 'h' or 'V' or 'v'

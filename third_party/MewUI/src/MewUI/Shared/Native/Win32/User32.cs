@@ -96,6 +96,12 @@ internal static partial class User32
     public static nint SetWindowLongPtr(nint hWnd, int nIndex, nint dwNewLong)
         => nint.Size == 8 ? SetWindowLongPtrW(hWnd, nIndex, dwNewLong) : (nint)SetWindowLongW(hWnd, nIndex, (int)dwNewLong);
 
+    [LibraryImport(LibraryName)]
+    public static partial nint GetSystemMenu(nint hWnd, [MarshalAs(UnmanagedType.Bool)] bool bRevert);
+
+    [LibraryImport(LibraryName)]
+    public static partial int EnableMenuItem(nint hMenu, uint uIDEnableItem, uint uEnable);
+
     #endregion
 
     #region Layered Windows
@@ -361,6 +367,15 @@ internal static partial class User32
 
     [LibraryImport(LibraryName)]
     public static partial short GetAsyncKeyState(int vKey);
+
+    [LibraryImport(LibraryName)]
+    public static partial nint GetKeyboardLayout(uint idThread);
+
+    [LibraryImport(LibraryName, EntryPoint = "MapVirtualKeyExW")]
+    public static partial uint MapVirtualKeyEx(uint uCode, uint uMapType, nint dwhkl);
+
+    [LibraryImport(LibraryName)]
+    public static unsafe partial int ToUnicodeEx(uint wVirtKey, uint wScanCode, byte* lpKeyState, char* pwszBuff, int cchBuff, uint wFlags, nint dwhkl);
 
     #endregion
 

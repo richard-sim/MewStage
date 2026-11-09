@@ -34,9 +34,9 @@ order = [
 
 [sources.mewui]
 repo = "https://github.com/aprillz/MewUI"
-commit = "8b9c9433fc9b1450d994b26bcef55a8d294bbd29"          # main, 2026-10-16 ("0.22.1+")
-archive_sha256 = "3acf8f15768922d78c3238ab9aa308947b5982cb9280a764f0ce18d02e011e7d"
-content_sha256 = "d5867e8ddfc1402a5f8aca6011b563346423cf27b11d8a384564808bb2124395"
+commit = "8c43abf304c297c0acbe8617eac820e2d0ecd1d7"          # main, 2026-11-07 ("0.22.1+")
+archive_sha256 = "cbb3ed4fb464e851441f194697c24dbb0fa5863205d31f3daf4435ed344839db"
+content_sha256 = "2fda757c493d562093c79b41fedbfcc8b7066dd63547c3682f26efaeec107125"
 license = "MIT"
 
 [sources.mewvg]
@@ -79,7 +79,7 @@ description = "A window frame drawn to a surface whose scale is below 1 lays out
 
 [categories.multi-host]
 mandatory = true
-description = "Per-thread UI statics, graphics factory and animation manager: several hosts in one process (test suites, secondary windows)."
+description = "Per-thread UI statics, graphics factory, animation manager and dispatcher: several hosts in one process (test suites, secondary windows), each pumping its own deferred work."
 
 [categories.allocation]
 mandatory = false
@@ -87,7 +87,7 @@ description = "A steady-state UI frame allocates nothing. Skipping it makes the 
 
 [categories.text]
 mandatory = false
-description = "Letter spacing drawn per grapheme, negative half-leading, and a font registry that keeps every face of a family (Kit mode draws every weight of Lora)."
+description = "Letter spacing drawn per grapheme and a negative half-leading."
 
 [categories.rendering]
 mandatory = false
@@ -131,11 +131,11 @@ patches = [
   { file = "patches/mewui/text/0001-letter-spacing-draws-per-grapheme.patch", category = "text" },
   { file = "patches/mewui/text/0002-negative-half-leading.patch", category = "text" },
   { file = "patches/mewui/rendering/0001-rect-stroke-antialias-off-axis.patch", category = "rendering" },
-  { file = "patches/mewui/text/0003-font-registry-multi-face-families.patch", category = "text" },
   { file = "patches/mewui/allocation/0005-apply-template-without-per-call-closure.patch", category = "allocation" },
   { file = "patches/mewui/allocation/0006-dashed-stroke-without-per-draw-allocation.patch", category = "allocation" },
   { file = "patches/mewui/multi-host/0001-per-thread-ui-statics-and-graphics-factory.patch", category = "multi-host" },
   { file = "patches/mewui/multi-host/0002-per-thread-animation-manager.patch", category = "multi-host" },
+  { file = "patches/mewui/multi-host/0003-per-thread-dispatcher.patch", category = "multi-host" },
 ]
 
 [components.analyzers]

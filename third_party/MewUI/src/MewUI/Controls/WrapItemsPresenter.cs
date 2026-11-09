@@ -1,7 +1,5 @@
 namespace Aprillz.MewUI.Controls;
 
-using Aprillz.MewUI.Rendering;
-
 /// <summary>
 /// Virtualizing wrap-grid items presenter with fixed item width and height.
 /// Virtualizes by row - only visible rows are realized.
@@ -16,7 +14,7 @@ internal sealed class WrapItemsPresenter : Control, IItemsPresenter
     private double _itemRadius;
     private int _pendingScrollIntoViewIndex = -1;
 
-    // Cached render-time layout values (avoid closure allocation per OnRender)
+    // Cached layout values (avoid closure allocation per ArrangeContent)
     private double _renderOffsetY;
     private double _renderItemW;
     private double _renderItemH;
@@ -144,17 +142,6 @@ internal sealed class WrapItemsPresenter : Control, IItemsPresenter
             Math.Max(0, availableSize.Height));
     }
 
-    protected override void OnRender(IGraphicsContext context)
-    {
-        _itemsHost.RenderArranged(context);
-    }
-
-    internal override void WriteComposition(Rendering.Retained.CompositionPlanBuilder builder)
-    {
-        // No own content slot: OnRender draws only the realized containers.
-        _itemsHost.WriteArrangedComposition(builder);
-    }
-
     protected override void ArrangeContent(Rect bounds)
     {
         // Which cells are realized and where they stand is settled here, so each of them is a visual of
@@ -218,7 +205,7 @@ internal sealed class WrapItemsPresenter : Control, IItemsPresenter
         int firstIndex = firstRow * cols;
         int lastIndexExcl = Math.Min(count, lastRowExcl * cols);
 
-        // Store layout values in fields (avoid closure allocation per OnRender)
+        // Store layout values in fields (avoid closure allocation per ArrangeContent)
         _renderOffsetY = alignedOffsetY;
         _renderItemW = alignedItemW;
         _renderItemH = alignedItemH;
@@ -326,7 +313,7 @@ internal sealed class WrapItemsPresenter : Control, IItemsPresenter
         return true;
     }
 
-    // Must match the pixel-aligned height/width used in OnRender so hit-test, extent,
+    // Must match the pixel-aligned height/width used in ArrangeContent so hit-test, extent,
     // and ScrollIntoView stay consistent with the visual layout (esp. at 125% DPI).
     private double GetPixelAlignedItemHeight()
     {
@@ -358,13 +345,15 @@ internal sealed class WrapItemsPresenter : Control, IItemsPresenter
     private int ComputeColumns(double viewportWidth)
     {
         if (ItemWidth <= 0 || viewportWidth <= 0) return 1;
-        // Use rounding tolerance to avoid DPI-dependent column count differences.
-        // E.g. 400 DIP / 80 = 5.0 exactly, but pixel-snapped borders may reduce
-        // viewportWidth to 399.33, yielding 4.99 - which should still be 5 columns.
-        double raw = viewportWidth / ItemWidth;
-        int cols = (int)Math.Floor(raw);
-        if (raw - cols > 0.95) cols++;
-        return Math.Max(1, cols);
+
+        // Counted in whole device pixels from the same rounded item width the cells are laid out at, so a row
+        // neither passes the viewport nor leaves room for another cell. Rounding the viewport too keeps a
+        // fraction of a pixel lost to snapped borders from costing a column.
+        double dpiScale = GetDpi() / 96.0;
+        long itemPixels = (long)Math.Round(GetPixelAlignedItemWidth() * dpiScale);
+        long viewportPixels = (long)Math.Round(viewportWidth * dpiScale);
+        if (itemPixels <= 0) return 1;
+        return (int)Math.Max(1, viewportPixels / itemPixels);
     }
 
     private void RecomputeExtent()

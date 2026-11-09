@@ -11,8 +11,14 @@ public sealed class DispatcherTimer : IDisposable
     private bool _isEnabled;
     private bool _subscribedToDispatcherChanged;
 
+    /// <summary>
+    /// Creates a stopped timer with a one second interval.
+    /// </summary>
     public DispatcherTimer() { }
 
+    /// <summary>
+    /// Creates a stopped timer with the given interval.
+    /// </summary>
     public DispatcherTimer(TimeSpan interval)
     {
         Interval = interval;
@@ -68,7 +74,7 @@ public sealed class DispatcherTimer : IDisposable
     }
 
     /// <summary>
-    /// Starts the timer. If the application dispatcher is not yet available, the timer will start once it becomes available.
+    /// Starts the timer, deferring the first tick until the application dispatcher is available.
     /// </summary>
     public void Start()
     {
@@ -260,16 +266,12 @@ public sealed class DispatcherTimer : IDisposable
         });
     }
 
-    private static IDispatcher? TryGetDispatcher()
-    {
-        if (!Application.IsRunning)
-        {
-            return null;
-        }
+    // MewStage vendor patch multi-host/0003: falls back to the dispatcher an embedded host bound to this thread.
+    private static IDispatcher? TryGetDispatcher() => Application.ResolveDispatcher();
 
-        return Application.Current.Dispatcher;
-    }
-
+    /// <summary>
+    /// Stops the timer.
+    /// </summary>
     public void Dispose()
     {
         Stop();

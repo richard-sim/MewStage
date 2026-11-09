@@ -1,5 +1,4 @@
 using System.Numerics;
-using Aprillz.MewUI.Rendering;
 
 namespace Aprillz.MewUI.Controls;
 
@@ -92,46 +91,25 @@ public sealed class RotationDecorator : FrameworkElement, IVisualTreeHost
             desired.Height));
     }
 
-    protected override void RenderSubtree(IGraphicsContext context)
+    protected override bool TryGetChildTransform(out Matrix3x2 transform)
     {
-        if (Child == null)
-        {
-            return;
-        }
-
-        double centerX = Bounds.X + Bounds.Width / 2;
-        double centerY = Bounds.Y + Bounds.Height / 2;
-
-        context.Save();
-        context.Translate(centerX, centerY);
-        context.Rotate(Angle);
-        context.Translate(-centerX, -centerY);
-        Child.Render(context);
-        context.Restore();
+        transform = ChildRotation();
+        return true;
     }
 
-    internal override void WriteComposition(Rendering.Retained.CompositionPlanBuilder builder)
+    // A quarter turn carries whole pixels onto whole pixels, so glyphs stay aligned under it.
+    internal override bool KeepsTextPixelSnapUnderChildTransform(Matrix3x2 transform) => true;
+
+    private Matrix3x2 ChildRotation()
     {
-        builder.Content(0);
-
-        if (Child == null)
-        {
-            return;
-        }
-
         double centerX = Bounds.X + Bounds.Width / 2;
         double centerY = Bounds.Y + Bounds.Height / 2;
 
-        // Matches the Translate/Rotate/Translate sequence of the immediate path, where each call
-        // pre-multiplies the current transform.
-        var rotation =
+        // Rotation about the centre: translate it to the origin, turn, translate back.
+        return
             Matrix3x2.CreateTranslation((float)-centerX, (float)-centerY) *
             Matrix3x2.CreateRotation((float)Angle) *
             Matrix3x2.CreateTranslation((float)centerX, (float)centerY);
-
-        builder.PushTransform(rotation);
-        builder.Child(Child);
-        builder.Pop();
     }
 
     protected override UIElement? OnHitTest(Point point)

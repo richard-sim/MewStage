@@ -280,7 +280,8 @@ public static class DefaultStyles
     internal static Style CreateCalendarStyle()
         => CreateValidationControlBasedStyle(typeof(Calendar),
             Setter.Create(Control.CornerRadiusProperty, t => t.Metrics.ControlCornerRadius),
-            Setter.Create(Control.BorderThicknessProperty, t => t.Metrics.ControlBorderThickness));
+            Setter.Create(Control.BorderThicknessProperty, t => t.Metrics.ControlBorderThickness),
+            Setter.Create(Control.PaddingProperty, t => t.Metrics.ItemsContainerPadding));
 
     internal static Style CreateBorderStyle() =>
         new(typeof(Border))
@@ -520,6 +521,42 @@ public static class DefaultStyles
             ],
         };
 
+    internal static Style CreateThumbStyle() =>
+        new(typeof(Thumb))
+        {
+            Transitions = ColorTransitions,
+            Setters =
+            [
+                Setter.Create(Control.BackgroundProperty, t => t.Palette.AccentText),
+                Setter.Create(Control.BorderBrushProperty, t => t.Palette.ControlBorder),
+                Setter.Create(Control.CornerRadiusProperty, t => t.Metrics.ControlCornerRadius),
+                Setter.Create(Control.BorderThicknessProperty, t => t.Metrics.ControlBorderThickness),
+            ],
+            Triggers =
+            [
+                new StateTrigger
+                {
+                    Match = VisualStateFlags.Hot,
+                    Setters = [Setter.Create(Control.BorderBrushProperty, t => Color.Composite(t.Palette.ControlBorder, t.Palette.AccentBorderHotOverlay))],
+                },
+                new StateTrigger
+                {
+                    Match = VisualStateFlags.Pressed,
+                    Setters = [Setter.Create(Control.BorderBrushProperty, t => t.Palette.Accent)],
+                },
+                new StateTrigger
+                {
+                    Match = VisualStateFlags.None,
+                    Exclude = VisualStateFlags.Enabled,
+                    Setters =
+                    [
+                        Setter.Create(Control.BackgroundProperty, t => t.Palette.ButtonDisabledBackground),
+                        Setter.Create(Control.BorderBrushProperty, t => t.Palette.ControlBorder),
+                    ],
+                },
+            ],
+        };
+
     internal static Style CreateProgressBarStyle() =>
         new(typeof(ProgressBar))
         {
@@ -530,6 +567,16 @@ public static class DefaultStyles
                 Setter.Create(Control.BackgroundProperty, t => t.Palette.ControlBackground),
                 Setter.Create(Control.BorderBrushProperty, t => t.Palette.ControlBorder),
                 Setter.Create(Control.BorderThicknessProperty, t => t.Metrics.ControlBorderThickness),
+                Setter.Create(TextElement.ForegroundProperty, t => t.Palette.Accent),
+            ],
+            Triggers =
+            [
+                new StateTrigger
+                {
+                    Match = VisualStateFlags.None,
+                    Exclude = VisualStateFlags.Enabled,
+                    Setters = [Setter.Create(TextElement.ForegroundProperty, t => t.Palette.DisabledAccent)],
+                },
             ],
         };
 
@@ -539,6 +586,16 @@ public static class DefaultStyles
             Setters =
             [
                 Setter.Create(Control.BackgroundProperty, t => t.Palette.ControlBorder.WithAlpha(128)),
+                Setter.Create(TextElement.ForegroundProperty, t => t.Palette.Accent),
+            ],
+            Triggers =
+            [
+                new StateTrigger
+                {
+                    Match = VisualStateFlags.None,
+                    Exclude = VisualStateFlags.Enabled,
+                    Setters = [Setter.Create(TextElement.ForegroundProperty, t => t.Palette.DisabledAccent)],
+                },
             ],
         };
 

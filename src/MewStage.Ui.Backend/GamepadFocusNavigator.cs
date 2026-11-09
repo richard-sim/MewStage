@@ -12,7 +12,8 @@
 //   * Cross-axis (column / row) memory keeps your column on vertical moves and your row on horizontal moves.
 //   * Value controls (Slider / RangeBase, ComboBox / DropDownBase, and any IGamepadValueControl) use an ENGAGE model:
 //     A / Enter engages, Left / Right (with repeat) adjust the value / cycle items, B (or A) disengages; plain controls
-//     (Button) activate on A / Enter.
+//     (Button) activate on A / Enter. Up / Down adjust too: a vertical Slider (Slider.Orientation) steps with them,
+//     Up raising the value as its thumb rises, and a horizontal one takes them as well.
 //   * A routes Enter (activate) to the focused element; B / Back route Escape to it, which falls through to the window's
 //     input map, where Escape is the screen's Back command (NavCommands): the pad's B and the keyboard's Escape are one
 //     path.
@@ -522,7 +523,8 @@ public sealed class GamepadFocusNavigator : IDisposable
         {
             acted |= RouteKey(window, isCombo ? MewKey.Down : MewKey.Right);
         }
-        // Vertical also adjusts (sliders) / cycles (combos) for convenience.
+        // Vertical adjusts too: the main axis of a vertical Slider (MewUI maps Up to a larger value whatever the
+        // orientation, and its thumb rises with the value), and a convenience on a horizontal one; it cycles combos.
         if (fireUp)
         {
             acted |= RouteKey(window, MewKey.Up);

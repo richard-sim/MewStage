@@ -1,5 +1,3 @@
-using Aprillz.MewUI.Rendering;
-
 namespace Aprillz.MewUI.Controls;
 
 /// <summary>
@@ -21,7 +19,6 @@ internal sealed class VariableHeightItemsPresenter : Control, IItemsPresenter
     private readonly Dictionary<int, FrameworkElement> _recycledByIndex = new();
     private readonly ResetHeldContainers _resetHeld = new();
     private readonly List<int> _recycleScratch = new();
-    private readonly List<int> _arrangedItems = new();
     private readonly List<(int OldIndex, FrameworkElement Element)> _remapScratch = new();
     private readonly List<double> _insertHeightScratch = new(); // reused -1 fill buffer for InsertRange, avoids Enumerable.Repeat allocation
     private double[] _oldPrefixScratch = Array.Empty<double>(); // reused prefix-sum buffer for OnItemsChanged anchor calc, grow-only
@@ -50,7 +47,6 @@ internal sealed class VariableHeightItemsPresenter : Control, IItemsPresenter
     private int _pendingScrollIntoViewIndex = -1;
     private ItemsAnchor _anchor;
     private bool _followEndRequest;
-    private bool _pendingAnchorShiftArrange;
 
     // Tracks the DPI scale from the last layout pass so we can detect DPI changes
     // and invalidate prefix sums (which are DPI-dependent due to per-item pixel rounding).
@@ -282,27 +278,14 @@ internal sealed class VariableHeightItemsPresenter : Control, IItemsPresenter
 
     bool IVisualTreeHost.VisitChildren(Func<Element, bool> visitor)
     {
-        foreach (var element in _realized.Values)
-        {
-            if (!visitor(element))
-            {
-                return false;
-            }
-        }
-
-        // A Reset holds containers still attached until the next layout; tree-wide changes must reach them too.
-        return _resetHeld.Visit(visitor);
+        // Item order is drawing order. A Reset holds containers still attached until the next layout;
+        // tree-wide changes must reach them too.
+        return VisitRealized(visitor) && _resetHeld.Visit(visitor);
     }
 
     protected override Size MeasureContent(Size availableSize)
     {
         RecomputeExtent();
-
-        if (_pendingAnchorShiftArrange)
-        {
-            _pendingAnchorShiftArrange = false;
-            InvalidateArrange();
-        }
 
         return new Size(
             Math.Max(0, availableSize.Width),
@@ -311,8 +294,6 @@ internal sealed class VariableHeightItemsPresenter : Control, IItemsPresenter
 
     protected override void ArrangeContent(Rect bounds)
     {
-        _arrangedItems.Clear();
-
         int count = ItemsSource.Count;
         if (count <= 0)
         {
@@ -427,7 +408,6 @@ internal sealed class VariableHeightItemsPresenter : Control, IItemsPresenter
         bool LayoutContainersOnce(double offsetY)
         {
             EnsurePrefix();
-            _arrangedItems.Clear();
 
             // Visible range (with small overscan).
             int first = Math.Max(0, FindIndexByY(Math.Max(0, offsetY - EstimatedItemHeight * 2)));
@@ -449,6 +429,7 @@ internal sealed class VariableHeightItemsPresenter : Control, IItemsPresenter
                         // user-interaction state (e.g. ToggleSwitch.IsChecked).
                         // Defer rebind + style snap until the item re-enters the visible range.
                         (_pendingRebind ??= new()).Add(key);
+                        _realized[key].IsHeldOutOfView = true;
                     }
                 }
             }
@@ -491,7 +472,6 @@ internal sealed class VariableHeightItemsPresenter : Control, IItemsPresenter
                 containerRect = LayoutRounding.RoundRectToPixels(containerRect, dpiScale);
 
                 element.Arrange(containerRect);
-                _arrangedItems.Add(i);
 
                 y += alignedH;
             }
@@ -592,35 +572,6 @@ internal sealed class VariableHeightItemsPresenter : Control, IItemsPresenter
         }
     }
 
-    protected override void OnRender(IGraphicsContext context)
-    {
-        for (int i = 0; i < _arrangedItems.Count; i++)
-        {
-            int index = _arrangedItems[i];
-            if (!_realized.TryGetValue(index, out var element))
-            {
-                continue;
-            }
-
-            element.Render(context);
-        }
-    }
-
-    internal override void WriteComposition(Rendering.Retained.CompositionPlanBuilder builder)
-    {
-        // No own content slot: OnRender draws only the arranged containers.
-        for (int ordinal = 0; ordinal < _arrangedItems.Count; ordinal++)
-        {
-            int index = _arrangedItems[ordinal];
-            if (!_realized.TryGetValue(index, out var element))
-            {
-                continue;
-            }
-
-            builder.Child(element);
-        }
-    }
-
     protected override UIElement? OnHitTest(Point point)
     {
         if (!IsVisible || !IsHitTestVisible || !IsEffectivelyEnabled)
@@ -633,21 +584,17 @@ internal sealed class VariableHeightItemsPresenter : Control, IItemsPresenter
             return null;
         }
 
-        UIElement? hit = null;
-        foreach (var element in _realized.Values)
+        // The last item drawn is on top, so it is asked first.
+        var keys = GetSortedKeys();
+        for (int ordinal = keys.Length - 1; ordinal >= 0; ordinal--)
         {
-            if (hit != null)
+            if (_realized[keys[ordinal]] is UIElement ui && ui.HitTest(point) is UIElement hit)
             {
-                break;
-            }
-
-            if (element is UIElement ui)
-            {
-                hit = ui.HitTest(point);
+                return hit;
             }
         }
 
-        return hit ?? this;
+        return this;
     }
 
     public void RecycleAll()
@@ -1106,9 +1053,8 @@ internal sealed class VariableHeightItemsPresenter : Control, IItemsPresenter
         double onePixelDip = dpiScale > 0 ? 1.0 / dpiScale : 1.0;
         if (Math.Abs(GetAnchorShift() - previousShift) >= onePixelDip * 0.99)
         {
-            // Raising the arrange invalidation here would not survive: this also runs inside the
-            // arrange pass, which clears that flag when it ends. MeasureContent raises it instead.
-            _pendingAnchorShiftArrange = true;
+            // This also runs inside the arrange pass, which clears an arrange request when it ends; a measured
+            // element is arranged again, so the measure request carries it.
             InvalidateMeasure();
         }
     }
@@ -1124,6 +1070,8 @@ internal sealed class VariableHeightItemsPresenter : Control, IItemsPresenter
     {
         if (_realized.TryGetValue(index, out var existing))
         {
+            existing.IsHeldOutOfView = false;
+
             // Also rebind if the item was focus-pinned and missed a prior rebind pass.
             bool pending = _pendingRebind != null && _pendingRebind.Remove(index);
             bool generationMismatch = !_itemBindingGenerations.TryGetValue(existing, out var boundGeneration)
@@ -1239,6 +1187,7 @@ internal sealed class VariableHeightItemsPresenter : Control, IItemsPresenter
         UnbindItemContainer(element);
         _itemBindingGenerations.Remove(element);
         _resetHeld.Forget(element);
+        element.IsHeldOutOfView = false;
         element.Parent = null;
 
         if (index is not int recycledIndex || !_recycledByIndex.TryAdd(recycledIndex, element))

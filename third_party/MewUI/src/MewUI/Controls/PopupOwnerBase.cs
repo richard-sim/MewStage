@@ -92,7 +92,7 @@ public abstract class PopupOwnerBase : Control, IPopupOwner
     protected virtual UIElement GetPopupFocusTarget(UIElement popup) => popup;
 
     /// <summary>
-    /// Gets whether a click inside the header should toggle the dropdown.
+    /// Gets whether a click inside the header should toggle the drop-down.
     /// Override to limit toggling to the arrow button area only.
     /// </summary>
     protected virtual bool IsToggleHit(in Rect headerRect, Point positionInControl) => headerRect.Contains(positionInControl);
@@ -100,7 +100,7 @@ public abstract class PopupOwnerBase : Control, IPopupOwner
     /// <summary>
     /// When true, the popup width comes from the popup's own content rather than this control's width,
     /// so the popup manager re-derives that width once the popup is connected and its inherited font
-    /// applies. Fixed-width dropdowns (sized to the control) leave this false.
+    /// applies. Fixed-width drop-downs (sized to the control) leave this false.
     /// </summary>
     protected virtual bool PopupSizesToContent => false;
 
@@ -115,7 +115,7 @@ public abstract class PopupOwnerBase : Control, IPopupOwner
     /// </summary>
     protected virtual Rect CalculatePopupBounds(Window window, UIElement popup)
     {
-        var bounds = Bounds;
+        var bounds = GetBoundsInRoot();
 
         double width = Math.Max(0, bounds.Width);
         if (width <= 0)
@@ -139,11 +139,15 @@ public abstract class PopupOwnerBase : Control, IPopupOwner
         // Open downward when the dropdown fits below the header (standard behavior), flipping up only
         // when it does not fit below - preferring the side with more raw space would open upward for a
         // control low in the window because the native work-area region extends far above it.
-        double belowY = bounds.Y + ResolveAnchorHeight();
+        double belowY = GetAnchorInRoot(ResolveAnchorHeight()).Bottom;
         var (y, height) = PopupPlacement.ResolveVerticalPreferBelowIfFits(bounds.Y, belowY, region, desiredHeight);
 
         return new Rect(x, y, width, height);
     }
+
+    /// <summary>The top <paramref name="anchorHeight"/> band of this control where it is drawn, in window coordinates.</summary>
+    private protected Rect GetAnchorInRoot(double anchorHeight)
+        => TransformToRoot(new Rect(Bounds.X, Bounds.Y, Bounds.Width, anchorHeight));
 
     protected override void ArrangeContent(Rect bounds)
     {
@@ -225,7 +229,7 @@ public abstract class PopupOwnerBase : Control, IPopupOwner
         // (e.g. stretch in a panel), but the whole button face should toggle.
         var headerRect = bounds;
 
-        if (IsToggleHit(headerRect, e.Position))
+        if (IsToggleHit(headerRect, TransformFromRoot(e.Position)))
         {
             IsDropDownOpen = !IsDropDownOpen;
             e.Handled = true;

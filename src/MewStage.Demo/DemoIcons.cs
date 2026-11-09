@@ -10,7 +10,6 @@
 using System;
 using System.Collections.Concurrent;
 
-using Aprillz.MewUI;
 using Aprillz.MewUI.Controls;
 using Aprillz.MewUI.Svg;
 

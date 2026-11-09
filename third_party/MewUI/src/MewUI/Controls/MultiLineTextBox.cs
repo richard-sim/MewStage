@@ -122,6 +122,7 @@ public sealed partial class MultiLineTextBox : TextBase, IVisualTreeHost, ITextV
         };
     }
 
+    /// <summary>Gets or sets the text content.</summary>
     public string Text
     {
         get => GetTextSnapshot();
@@ -130,19 +131,21 @@ public sealed partial class MultiLineTextBox : TextBase, IVisualTreeHost, ITextV
 
     private protected override MewProperty<string>? TextSyncProperty => TextProperty;
 
+    /// <summary>Gets the currently selected text.</summary>
     public string SelectedText => GetSelectedDocumentText();
 
     private protected override bool SupportsClipboardCopy => true;
 
     private protected override string? GetClipboardCopyText() => SelectedText;
 
+    /// <summary>Gets or sets whether lines wrap at the viewport width.</summary>
     public bool Wrap
     {
         get => GetValue(WrapProperty);
         set => SetValue(WrapProperty, value);
     }
 
-    /// <summary>When the vertical scroll bar is shown; the text scrolls either way.</summary>
+    /// <summary>Gets or sets when the vertical scrollbar is shown; the text scrolls either way.</summary>
     public ScrollBarVisibility VerticalScrollBarVisibility
     {
         get => GetValue(VerticalScrollBarVisibilityProperty);
@@ -150,26 +153,35 @@ public sealed partial class MultiLineTextBox : TextBase, IVisualTreeHost, ITextV
     }
 
     /// <summary>
-    /// Whether the desired size is the document's extent, clamped to the offered space, instead of
-    /// the offered space itself. Off by default: reporting the offered space is what an editor
-    /// filling a pane wants, and it costs no extent lookup.
+    /// Gets or sets whether the desired size is the document's extent clamped to the offered space,
+    /// instead of the offered space itself; the default is false.
     /// </summary>
+    /// <remarks>
+    /// Reporting the offered space is what an editor filling a pane wants, and it costs no extent
+    /// lookup.
+    /// </remarks>
     public bool SizeToDocument
     {
         get => GetValue(SizeToDocumentProperty);
         set => SetValue(SizeToDocumentProperty, value);
     }
 
-    /// <summary>Tab width in space characters.</summary>
+    /// <summary>Gets or sets the tab width in space characters.</summary>
     public int TabSize
     {
         get => GetValue(TabSizeProperty);
         set => SetValue(TabSizeProperty, value);
     }
 
+    /// <summary>Gets the horizontal scroll offset in DIPs.</summary>
     public double HorizontalOffset => _horizontalOffset;
+    /// <summary>Gets the vertical scroll offset in DIPs.</summary>
     public double VerticalOffset => _verticalOffset;
-    /// <summary>Backing document. Assigning a new one keeps the view and extension registrations while caret, selection, scroll, and undo history reset.</summary>
+    /// <summary>
+    /// Gets or sets the backing document; assigning a new one keeps the view and extension
+    /// registrations while caret, selection, scroll and undo history reset.
+    /// </summary>
+    [FluentExcluded("Host-level document object")]
     public EditableTextDocument Document
     {
         get => _document;
@@ -177,12 +189,16 @@ public sealed partial class MultiLineTextBox : TextBase, IVisualTreeHost, ITextV
     }
 
     IReadOnlyTextDocument ITextViewHost.Document => _document;
+    /// <summary>Gets the extension pipeline of the text view.</summary>
     public TextViewExtensionPipeline Extensions { get; }
 
     /// <summary>Raised after the document content changed or the document was replaced.</summary>
+    [FluentExcluded("Text view host event")]
     public event Action<ITextViewHost>? DocumentChanged;
+    /// <summary>Gets the line layouts currently materialized.</summary>
     public IReadOnlyList<TextLineLayout> VisibleTextLines
         => _view?.MaterializedLines ?? Array.Empty<TextLineLayout>();
+    /// <summary>Gets the bounds the text is drawn in, in local coordinates.</summary>
     public Rect TextViewportBounds => _contentBounds;
 
     internal int MaterializedLineCount => _view?.MaterializedLines.Count ?? 0;
@@ -195,7 +211,9 @@ public sealed partial class MultiLineTextBox : TextBase, IVisualTreeHost, ITextV
         => (_verticalScrollBar.Value, _verticalScrollBar.Maximum);
     internal bool IsHorizontalScrollBarVisible => _horizontalScrollBar.IsVisible;
 
+    /// <summary>Occurs when the caret, the selection or the undo state changes.</summary>
     public event Action? EditingStateChanged;
+    /// <summary>Occurs when <see cref="Wrap"/> changes.</summary>
     public event Action<bool>? WrapChanged;
 
     /// <summary>Re-runs registered classifiers, generators, projections, and layers.</summary>
@@ -345,32 +363,9 @@ public sealed partial class MultiLineTextBox : TextBase, IVisualTreeHost, ITextV
 
     private Rect GetTextClip() => LayoutRounding.MakeClipRect(GetEditorContentBounds(), GetDpi() / 96.0);
 
-    protected override void RenderSubtree(IGraphicsContext context)
-    {
-        TextViewLayerVisuals.Render(_layerVisuals, context, GetTextClip());
-        if (_verticalScrollBar.IsVisible)
-        {
-            _verticalScrollBar.Render(context);
-        }
-        if (_horizontalScrollBar.IsVisible)
-        {
-            _horizontalScrollBar.Render(context);
-        }
-    }
-
-    internal override void WriteComposition(Rendering.Retained.CompositionPlanBuilder builder)
-    {
-        builder.Content(0);
-        TextViewLayerVisuals.WriteComposition(_layerVisuals, builder, GetTextClip());
-        if (_verticalScrollBar.IsVisible)
-        {
-            builder.Child(_verticalScrollBar);
-        }
-        if (_horizontalScrollBar.IsVisible)
-        {
-            builder.Child(_horizontalScrollBar);
-        }
-    }
+    /// <summary>The layer visuals draw under the text clip; the scroll bars lie over the frame unclipped.</summary>
+    protected override ChildClip? GetChildClip(UIElement child)
+        => child is TextViewLayerVisual ? new ChildClip(GetTextClip()) : null;
 
     protected override UIElement? OnHitTest(Point point)
     {
@@ -620,9 +615,11 @@ public sealed partial class MultiLineTextBox : TextBase, IVisualTreeHost, ITextV
     }
 
     /// <inheritdoc/>
+    [FluentExcluded("Text view host event")]
     public event Action<ITextViewHost, int>? LineConstructionStarting;
 
     /// <inheritdoc/>
+    [FluentExcluded("Text view host event")]
     public event Action<ITextViewHost>? LinesChanged;
 
     /// <inheritdoc/>
@@ -1018,6 +1015,8 @@ public sealed partial class MultiLineTextBox : TextBase, IVisualTreeHost, ITextV
         {
             return;
         }
+        double startVertical = _verticalOffset;
+        double startHorizontal = _horizontalOffset;
         var caret = _view.GetCaretBounds(_editor.CaretPosition);
         if (double.IsNaN(_preferredCaretX))
         {
@@ -1051,6 +1050,7 @@ public sealed partial class MultiLineTextBox : TextBase, IVisualTreeHost, ITextV
         }
         UpdateViewport();
         _preferredCaretX = preferredCaretX;
+        RequestArrangeIfScrolled(startVertical, startHorizontal);
     }
 
     protected override void OnMouseDown(MouseEventArgs e)
@@ -1061,7 +1061,7 @@ public sealed partial class MultiLineTextBox : TextBase, IVisualTreeHost, ITextV
             return;
         }
         Focus();
-        SetCaretFromPoint(e.Position, e.ShiftKey);
+        SetCaretFromPoint(TransformFromRoot(e.Position), e.ShiftKey);
         _dragSelecting = true;
         if (FindVisualRoot() is Window window)
         {
@@ -1074,7 +1074,7 @@ public sealed partial class MultiLineTextBox : TextBase, IVisualTreeHost, ITextV
     {
         base.OnMouseDoubleClick(e);
         if (e.Handled || e.Button != MouseButton.Left || !IsEffectivelyEnabled) return;
-        SetCaretFromPoint(e.Position, false);
+        SetCaretFromPoint(TransformFromRoot(e.Position), false);
         _editor.SelectWordAt(_editor.CaretPosition);
         EnsureCaretVisible();
         e.Handled = true;
@@ -1087,8 +1087,8 @@ public sealed partial class MultiLineTextBox : TextBase, IVisualTreeHost, ITextV
         {
             return;
         }
-        AutoScroll(e.Position);
-        SetCaretFromPoint(e.Position, true);
+        AutoScroll(TransformFromRoot(e.Position));
+        SetCaretFromPoint(TransformFromRoot(e.Position), true);
         e.Handled = true;
     }
 
@@ -1199,9 +1199,18 @@ public sealed partial class MultiLineTextBox : TextBase, IVisualTreeHost, ITextV
         }
 
         // A caret already in view scrolls nothing; the caret move itself repaints through the selection.
+        RequestArrangeIfScrolled(startVertical, startHorizontal);
+    }
+
+    /// <summary>
+    /// Asks for the arrange a scroll made outside the arrange pass needs: arranging is where the layers learn the new
+    /// offset and record again.
+    /// </summary>
+    private void RequestArrangeIfScrolled(double startVertical, double startHorizontal)
+    {
         if (_verticalOffset != startVertical || _horizontalOffset != startHorizontal)
         {
-            InvalidateVisual();
+            InvalidateArrange();
         }
     }
 
@@ -1221,7 +1230,11 @@ public sealed partial class MultiLineTextBox : TextBase, IVisualTreeHost, ITextV
     public void EnterText(int start, int length, string? text)
         => _editor.EnterText(start, length, text);
 
-    /// <summary>Consulted before every edit. Null leaves the document fully editable.</summary>
+    /// <summary>
+    /// Gets or sets the provider consulted before every edit; null leaves the document fully
+    /// editable.
+    /// </summary>
+    [FluentExcluded("Host-level document object")]
     public IEditableRegionProvider? EditableRegions
     {
         get => _editableRegions;
@@ -1254,6 +1267,7 @@ public sealed partial class MultiLineTextBox : TextBase, IVisualTreeHost, ITextV
     public Point ScrollOffset => new(_horizontalOffset, _verticalOffset);
 
     /// <inheritdoc/>
+    [FluentExcluded("Text view host event")]
     public event Action<ITextViewHost>? ScrollOffsetChanged;
 
     /// <inheritdoc/>
@@ -1279,6 +1293,10 @@ public sealed partial class MultiLineTextBox : TextBase, IVisualTreeHost, ITextV
         InvalidateVisual();
     }
 
+    /// <summary>
+    /// Scrolls to <paramref name="value"/>; <paramref name="invalidate"/> false is for the arrange pass itself, and a
+    /// caller outside it requests the arrange that tells the layers.
+    /// </summary>
     private void SetVerticalOffset(double value, bool invalidate = true)
     {
         // Against the extent the last layout measured. Arrange clamps again once the lines for the

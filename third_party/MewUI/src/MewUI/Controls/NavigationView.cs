@@ -118,10 +118,10 @@ public sealed partial class NavigationView : Control, IVisualTreeHost
         return button;
     }
 
-    /// <summary>Gets the navigation pane list. Prefer the typed <c>Items</c> extension.</summary>
+    /// <summary>Gets the navigation pane list. Prefer the typed <see cref="ControlExtensions.Items{T}(NavigationView, IReadOnlyList{T}, Func{T, string}, Func{T, PathGeometry}, Func{T, Element}, Func{T, NavigationItemKind}, Func{T, object})"/> extension.</summary>
     public NavigationList Pane => _pane;
 
-    /// <summary>Gets the bottom-pinned footer list. Prefer the typed <c>FooterItems</c> extension.</summary>
+    /// <summary>Gets the bottom-pinned footer list. Prefer the typed <see cref="ControlExtensions.FooterItems{T}(NavigationView, IReadOnlyList{T}, Func{T, string}, Func{T, PathGeometry}, Func{T, Element}, Func{T, NavigationItemKind}, Func{T, object})"/> extension.</summary>
     public NavigationList FooterPane => _footerPane;
 
     /// <summary>Gets or sets the expanded pane width.</summary>
@@ -138,7 +138,10 @@ public sealed partial class NavigationView : Control, IVisualTreeHost
         set => SetValue(CompactPaneWidthProperty, value);
     }
 
-    /// <summary>Gets or sets the requested pane placement. <see cref="PaneDisplayMode.Auto"/> resolves from width.</summary>
+    /// <summary>
+    /// Gets or sets the requested pane placement; <see cref="PaneDisplayMode.Auto"/> resolves from
+    /// the width.
+    /// </summary>
     public PaneDisplayMode PaneDisplayMode
     {
         get => GetValue(PaneDisplayModeProperty);
@@ -158,7 +161,10 @@ public sealed partial class NavigationView : Control, IVisualTreeHost
         set => SetValue(IsPaneOpenProperty, value);
     }
 
-    /// <summary>Gets or sets whether the toggle button is shown. Hiding it pins the pane to its current state.</summary>
+    /// <summary>
+    /// Gets or sets whether the toggle button is shown; hiding it pins the pane to its current
+    /// state.
+    /// </summary>
     public bool IsPaneToggleButtonVisible
     {
         get => GetValue(IsPaneToggleButtonVisibleProperty);
@@ -166,7 +172,7 @@ public sealed partial class NavigationView : Control, IVisualTreeHost
     }
 
     /// <summary>
-    /// Occurs after <see cref="EffectivePaneDisplayMode"/> changes. Raised once the layout pass that
+    /// Occurs after <see cref="EffectivePaneDisplayMode"/> changes, once the layout pass that
     /// resolved it has finished, so a handler may invalidate layout without re-entering it.
     /// </summary>
     public event Action? EffectivePaneDisplayModeChanged;
@@ -181,16 +187,21 @@ public sealed partial class NavigationView : Control, IVisualTreeHost
     /// <summary>Gets the selected item object (from either the main or footer region), or <see langword="null"/>.</summary>
     public object? SelectedItem => _footerActive ? _footerPane.SelectedItem : _pane.SelectedItem;
 
-    /// <summary>True when the pane currently shows item text.</summary>
+    /// <summary>Gets whether the pane currently shows item text.</summary>
     public bool PaneShowsText => IsPaneOpen;
 
-    /// <summary>True when the pane is a closed inline pane, i.e. an icon-only rail.</summary>
+    /// <summary>Gets whether the pane is a closed inline pane, that is an icon-only rail.</summary>
     public bool PaneIsRail => _effectiveMode == PaneDisplayMode.Inline && !IsPaneOpen;
 
     /// <summary>
-    /// Gets or sets the selector mapping the selected item to its content element. Built content is cached
-    /// per item. Prefer supplying this via the typed <c>Items</c> extension.
+    /// Gets or sets the selector mapping the selected item to its content element, which is cached
+    /// per item.
     /// </summary>
+    /// <remarks>
+    /// Prefer supplying this via the typed
+    /// <see cref="ControlExtensions.Items{T}(NavigationView, IReadOnlyList{T}, Func{T, string}, Func{T, PathGeometry}, Func{T, Element}, Func{T, NavigationItemKind}, Func{T, object})"/>
+    /// extension.
+    /// </remarks>
     public Func<object?, Element?>? ContentSelector
     {
         get => _contentSelector;
@@ -203,9 +214,13 @@ public sealed partial class NavigationView : Control, IVisualTreeHost
     }
 
     /// <summary>
-    /// Gets or sets the selector mapping a selected footer item to its content element. Prefer supplying this
-    /// via the typed <c>FooterItems</c> extension.
+    /// Gets or sets the selector mapping a selected footer item to its content element.
     /// </summary>
+    /// <remarks>
+    /// Prefer supplying this via the typed
+    /// <see cref="ControlExtensions.FooterItems{T}(NavigationView, IReadOnlyList{T}, Func{T, string}, Func{T, PathGeometry}, Func{T, Element}, Func{T, NavigationItemKind}, Func{T, object})"/>
+    /// extension.
+    /// </remarks>
     public Func<object?, Element?>? FooterContentSelector
     {
         get => _footerContentSelector;
@@ -493,7 +508,9 @@ public sealed partial class NavigationView : Control, IVisualTreeHost
         double paneWidth = minimal ? PaneWidth : inlinePane;
         double paneX = minimal ? inner.X - (1 - _overlayProgress) * PaneWidth : inner.X;
         _paneRect = new Rect(paneX, inner.Y, paneWidth, inner.Height);
-        _paneHost.Arrange(_paneRect);
+
+        // A closed overlay is not drawn, which the layout states by giving the pane no area.
+        _paneHost.Arrange(IsPaneDrawn ? _paneRect : Rect.Empty);
 
         // The hamburger stays pinned to the top-left in every mode.
         _paneToggle.Arrange(new Rect(inner.X, inner.Y, CompactSlot, CompactSlot));
@@ -514,47 +531,15 @@ public sealed partial class NavigationView : Control, IVisualTreeHost
             BorderThickness, CornerRadius);
     }
 
-    protected override void RenderSubtree(IGraphicsContext context)
+    /// <summary>Whether the pane is on screen: an inline pane, or the Minimal overlay while it is (partly) slid in.</summary>
+    private bool IsPaneDrawn => _effectiveMode != PaneDisplayMode.Overlay || _overlayProgress > 0.001;
+
+    protected override void OnRenderOverlay(IGraphicsContext context)
     {
-        _contentHost.Render(context);
-
-        // Inline pane, or the Minimal overlay while it is (partly) slid in.
-        if (_effectiveMode != PaneDisplayMode.Overlay || _overlayProgress > 0.001)
-        {
-            _paneHost.Render(context);
-            DrawPaneSeparator(context);
-        }
-
-        // The pinned hamburger always renders on top so it never moves and is never covered by the pane.
-        _paneToggle.Render(context);
-    }
-
-    private const int PANE_SEPARATOR_SLOT = 1;
-
-    internal override void WriteOwnContent(IGraphicsContext context, int slotIndex)
-    {
-        if (slotIndex == PANE_SEPARATOR_SLOT)
+        if (IsPaneDrawn)
         {
             DrawPaneSeparator(context);
         }
-        else
-        {
-            base.WriteOwnContent(context, slotIndex);
-        }
-    }
-
-    internal override void WriteComposition(Rendering.Retained.CompositionPlanBuilder builder)
-    {
-        builder.Content(0);
-        builder.Child(_contentHost);
-
-        if (_effectiveMode != PaneDisplayMode.Overlay || _overlayProgress > 0.001)
-        {
-            builder.Child(_paneHost);
-            builder.Content(PANE_SEPARATOR_SLOT);
-        }
-
-        builder.Child(_paneToggle);
     }
 
     private void DrawPaneSeparator(IGraphicsContext context)
@@ -607,8 +592,9 @@ public sealed partial class NavigationView : Control, IVisualTreeHost
         }
     }
 
+    /// <summary>Visits in drawing order: the pane lies over the content, and the pinned hamburger over both.</summary>
     bool IVisualTreeHost.VisitChildren(Func<Element, bool> visitor)
-        => visitor(_paneHost) && visitor(_paneToggle) && visitor(_contentHost);
+        => visitor(_contentHost) && visitor(_paneHost) && visitor(_paneToggle);
 }
 
 /// <summary>

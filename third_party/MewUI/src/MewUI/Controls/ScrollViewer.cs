@@ -61,10 +61,13 @@ public sealed class ScrollViewer : ContentControl
             static (self, _, newVal) => self.OnAutoHideScrollBarsChanged(newVal));
 
     /// <summary>
-    /// When true, scroll bars overlay the content (no reserved width) and stay hidden until revealed: they
-    /// fade in on scroll or when the pointer is over the bar region, and fade out after leaving / going idle.
-    /// Default false (bars follow the normal visibility rules at full opacity).
+    /// Gets or sets whether scrollbars overlay the content, reserving no width, and stay hidden
+    /// until a scroll or a pointer over the bar region reveals them; the default is false.
     /// </summary>
+    /// <remarks>
+    /// Revealed bars fade out after the pointer leaves or the view goes idle; with the option off,
+    /// bars follow the normal visibility rules at full opacity.
+    /// </remarks>
     public bool AutoHideScrollBars
     {
         get => GetValue(AutoHideScrollBarsProperty);
@@ -81,7 +84,7 @@ public sealed class ScrollViewer : ContentControl
     public event Action? ScrollChanged;
 
     /// <summary>
-    /// Gets or sets the vertical scrollbar mode.
+    /// Gets or sets the vertical scroll mode.
     /// </summary>
     public ScrollMode VerticalScroll
     {
@@ -90,7 +93,7 @@ public sealed class ScrollViewer : ContentControl
     }
 
     /// <summary>
-    /// Gets or sets the horizontal scrollbar mode.
+    /// Gets or sets the horizontal scroll mode.
     /// </summary>
     public ScrollMode HorizontalScroll
     {
@@ -467,33 +470,23 @@ public sealed class ScrollViewer : ContentControl
         }
     }
 
-    protected override void RenderSubtree(IGraphicsContext context)
+    /// <summary>
+    /// Content that is not scroll-driven is moved as a whole by the arrange, so the scene frames it. A
+    /// scroll-driven content stays where the viewport is and places its items itself.
+    /// </summary>
+    internal override bool IsChildFrame(UIElement child)
+        => ReferenceEquals(child, Content) && child is not IScrollContent;
+
+    /// <summary>The content is clipped to the viewport; the bars draw over it unclipped.</summary>
+    protected override ChildClip? GetChildClip(UIElement child)
     {
+        if (!ReferenceEquals(child, Content))
+        {
+            return null;
+        }
+
         GetContentClip(out var clip, out double clipRadius);
-
-        // Render content clipped to viewport.
-        context.Save();
-        if (clipRadius > 0)
-        {
-            context.SetClipRoundedRect(clip, clipRadius, clipRadius);
-        }
-        else
-        {
-            context.SetClip(clip);
-        }
-        Content?.Render(context);
-        context.Restore();
-
-        // Bars render on top (overlay).
-        if (_vBar.IsVisible)
-        {
-            _vBar.Render(context);
-        }
-
-        if (_hBar.IsVisible)
-        {
-            _hBar.Render(context);
-        }
+        return ChildClip.Rounded(clip, clipRadius);
     }
 
     private void GetContentClip(out Rect clip, out double clipRadius)
@@ -506,34 +499,6 @@ public sealed class ScrollViewer : ContentControl
         if (clipRadius > 0)
         {
             clipRadius = Math.Min(clipRadius, Math.Min(clip.Width, clip.Height) / 2);
-        }
-    }
-
-    internal override void WriteComposition(Rendering.Retained.CompositionPlanBuilder builder)
-    {
-        builder.Content(0);
-
-        GetContentClip(out var clip, out double clipRadius);
-        if (clipRadius > 0)
-        {
-            builder.PushClipRoundedRect(clip, clipRadius, clipRadius);
-        }
-        else
-        {
-            builder.PushClipRect(clip);
-        }
-
-        builder.Child(Content);
-        builder.Pop();
-
-        if (_vBar.IsVisible)
-        {
-            builder.Child(_vBar);
-        }
-
-        if (_hBar.IsVisible)
-        {
-            builder.Child(_hBar);
         }
     }
 
@@ -994,4 +959,7 @@ public sealed class ScrollViewer : ContentControl
             return clock;
         }
     }
+
+    /// <summary>The content size the offsets scroll over, for an automation client's scroll percent.</summary>
+    internal Size Extent => _extent;
 }

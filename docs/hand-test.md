@@ -355,9 +355,10 @@ Conventions: run everything from the repository root; `python` is Python 3.11 or
 - **Where:** push to `main` (or open a pull request) and watch the Actions tab.
 - **Expected:** four green jobs. The Linux job's log shows four `[lavapipe] N lavapipe tests RAN` lines (5, 17, 5,
   16) and `[kit-smoke] OK`; the Windows job's test summary shows the DX12 smoke passing rather than skipped; the
-  `vendor-lock` job prints each source as verified. The two things not run on the build box are the Windows job
-  (no Windows there) and `vendor.py --check` itself (the container's proxy refused the codeload download); a failure
-  in either is a CI-environment problem to read, not a code change to expect.
+  `vendor-lock` job prints each source as verified. The one thing not run on the build box is the Windows job (no
+  Windows there). `vendor.py --check` ran there with `--tarball-dir` (the container's proxy refuses codeload, so the
+  tarballs came from another machine), so a `vendor-lock` failure is a CI-environment problem to read, not a code
+  change to expect.
 - **Previously:** new.
 
 ### Documentation read-through
@@ -420,4 +421,49 @@ embedded window did nothing.
   - With `set MEWSTAGE_VK_VALIDATION=1` and `--render-vk`: no `[VK-VALIDATION` line while switching and on quit.
 - **Previously:** the demo dropped its windows without closing them; their icon caches stayed allocated until the app
   quit, and `Window.Close()` on an embedded window was a no-op.
+
+## MewUI re-pin (2026-11-09)
+
+MewUI moved from `8b9c9433` to `8c43abf3` (140 upstream commits). The text/0003 font-registry patch was dropped
+because upstream now registers every face of a family itself, and the embedded host gained a dispatcher (vendor
+patch `multi-host/0003`) and upstream's pulse. Before, every `DispatcherTimer` and posted job in Overlay and
+Workbench silently did nothing.
+
+### UI tests on Windows (again)
+
+- **What:** the headless UI suite now includes the dispatcher, pulse, pseudo-handle and vertical-slider tests.
+- **Where:** `dotnet test tests/MewStage.Ui.Tests`.
+- **Expected:** `Passed! ... Passed: 74, Skipped: 17`. With
+  `python scripts/vk_lavapipe.py -- dotnet test tests/MewStage.Ui.Tests`: `Passed: 91` and
+  `[lavapipe] 17 lavapipe tests RAN in MewStage.Ui.Tests`.
+- **Previously:** 67 pass / 17 skip headless, 84 on lavapipe.
+
+### The caret blinks in the embedded modes
+
+- **What:** a focused TextBox blinks its caret in Overlay and Workbench.
+- **Where:** `dotnet run --project src/MewStage.Demo -- --overlay`, Escape, click the pause menu's text box; then
+  `-- --workbench`, click the Inspector's numeric text box. Both with and without `--render-vk`.
+- **Expected:**
+  - The caret blinks about twice a second and stays solid while you type.
+  - Holding a key in the text box repeats it as before; Escape still closes the menu one window at a time.
+- **Previously:** the caret was drawn solid and never blinked (its timer never ticked without a dispatcher).
+
+### Kit mode still draws every Lora face (Win32)
+
+- **What:** the Kit's Type tab draws Lora Regular, Italic, Bold and Bold Italic as four different faces. This now
+  comes from upstream's own multi-face font registry instead of MewStage's dropped text/0003 patch.
+- **Where:** `dotnet run --project src/MewStage.Demo -- --standard`, the Type tab.
+- **Expected:** the four Lora lines differ visibly (slant and weight) at 20 and 32; Roboto 14 / 20 / 32 above them
+  look as before. The X11 kit smoke screenshot of the Type tab (`kit-tab6.png` under `MEWSTAGE_JOURNEY_OUT`) shows
+  the same on Linux; the build box checked it.
+- **Previously:** the same picture, through the text/0003 patch.
+
+### Workbench menus
+
+- **What:** the menu bar's three menus open (the demo now builds them with `SubMenu`, upstream's new name for the
+  old `Menu` setter).
+- **Where:** `-- --workbench`, click File, View and Help, and use their items.
+- **Expected:** each menu opens under its header; View's two check items follow Viewport 2 and the stats window;
+  About opens the About panel.
+- **Previously:** the same, built with the now-obsolete `MenuItem.Menu(...)`.
 

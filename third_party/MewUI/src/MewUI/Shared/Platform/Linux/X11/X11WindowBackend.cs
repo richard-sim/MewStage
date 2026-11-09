@@ -58,6 +58,8 @@ internal sealed class X11WindowBackend : IWindowBackend
     // Static so a key press allocates no closure for the layout-group lookup.
     private static readonly Func<nint, int, int, long> _keysymOfGroup =
         static (display, keycode, group) => NativeX11.XkbKeycodeToKeysym(display, (byte)keycode, group, 0).ToInt64();
+    // Keycodes pressed and not yet released, so a press of one of them is a repeat.
+    private readonly HashSet<uint> _pressedKeycodes = new();
     private nint _netWmNameAtom;
     private nint _netWmIconNameAtom;
     private nint _utf8StringAtom;
@@ -1625,6 +1627,9 @@ internal sealed class X11WindowBackend : IWindowBackend
                         // acknowledges earlier requests coalesced in the same event batch.
                         _pendingFrameSyncValue = ((long)client.data[3] << 32) | (uint)client.data[2];
                         _hasPendingFrameSyncValue = true;
+                        // The counter is raised after the next frame; without a size change nothing
+                        // else would schedule one, and the WM would wait on this window indefinitely.
+                        NeedsRender = true;
                         break;
                     }
 
@@ -1650,6 +1655,21 @@ internal sealed class X11WindowBackend : IWindowBackend
             case KeyPress:
             case KeyRelease:
                 bool isKeyDown = ev.type == KeyPress;
+
+                // With detectable auto-repeat a held key presses again without a release; input methods commit with keycode 0.
+                bool isRepeat = false;
+                if (ev.xkey.keycode != 0)
+                {
+                    if (isKeyDown)
+                    {
+                        isRepeat = !_pressedKeycodes.Add(ev.xkey.keycode);
+                    }
+                    else
+                    {
+                        _pressedKeycodes.Remove(ev.xkey.keycode);
+                    }
+                }
+
                 var imeResult = _inputMethod?.ProcessKeyEvent(ref ev, isKeyDown)
                     ?? new X11ImeProcessResult(Handled: false, ForwardKeyToApp: true, CommittedText: null, IsKeyTranslation: true);
 
@@ -1661,7 +1681,7 @@ internal sealed class X11WindowBackend : IWindowBackend
                 KeyEventArgs? keyArgs = null;
                 if (imeResult.ForwardKeyToApp)
                 {
-                    keyArgs = HandleKey(ev.xkey, isDown: isKeyDown, imeHandled: imeResult.Handled);
+                    keyArgs = HandleKey(ev.xkey, isDown: isKeyDown, imeHandled: imeResult.Handled, isRepeat: isRepeat);
                 }
 
                 // Committed text follows KeyDown routing so a handled KeyDown can drop the key's own text;
@@ -1733,6 +1753,9 @@ internal sealed class X11WindowBackend : IWindowBackend
                 {
                     SetWindowActive(false);
                     _inputMethod?.OnFocusOut();
+
+                    // Keys released while another window has focus send their release there.
+                    _pressedKeycodes.Clear();
                 }
                 break;
 
@@ -1871,7 +1894,7 @@ internal sealed class X11WindowBackend : IWindowBackend
     /// <summary>
     /// Routes the key and returns its event args, or null when no visual root could take it.
     /// </summary>
-    private KeyEventArgs? HandleKey(XKeyEvent e, bool isDown, bool imeHandled)
+    private KeyEventArgs? HandleKey(XKeyEvent e, bool isDown, bool imeHandled, bool isRepeat)
     {
         if (Window.EffectiveVisualRoot == null)
         {
@@ -1879,8 +1902,16 @@ internal sealed class X11WindowBackend : IWindowBackend
         }
 
         var ks = NativeX11.XLookupKeysym(ref e, 0).ToInt64();
-        var key = X11KeyMap.Resolve(ks, (int)e.keycode, Display, _keysymOfGroup);
-        var args = new KeyEventArgs(key, platformKey: (int)ks, modifiers: GetModifiers(e.state), isRepeat: false);
+
+        // A keypad key types a digit or moves by Num Lock, so it is named by the keysym the lock state gives it.
+        long namingKeysym = X11KeyMap.IsKeypadKeysym(ks) ? X11KeyTranslation.TranslatedKeysym(e) : ks;
+        var key = X11KeyMap.Resolve(namingKeysym, (int)e.keycode, Display, _keysymOfGroup);
+        var (keySymbol, baseKeySymbol) = X11KeyTranslation.KeySymbols(e);
+        var args = new KeyEventArgs(key, platformKey: (int)ks, modifiers: GetModifiers(e.state), isRepeat: isRepeat)
+        {
+            KeySymbol = keySymbol,
+            BaseKeySymbol = baseKeySymbol,
+        };
 
         if (isDown)
         {

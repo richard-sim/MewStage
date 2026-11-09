@@ -11,10 +11,17 @@ public partial class Expander : HeaderedContentControl, IVisualTreeHost
     private static readonly bool _defaultStyleRegistered =
         DefaultStyles.Register<Expander>(DefaultStyles.CreateExpanderStyle);
 
+    /// <summary>
+    /// The optional toggle part of a template; its checked state and <see cref="IsExpanded"/> follow each other.
+    /// </summary>
+    public const string PART_HEADER_TOGGLE = "PART_HeaderToggle";
+
     public static readonly MewProperty<bool> IsExpandedProperty =
         MewProperty<bool>.Register<Expander>(nameof(IsExpanded), true,
             MewPropertyOptions.AffectsLayout | MewPropertyOptions.AffectsVisualState | MewPropertyOptions.BindsTwoWayByDefault,
-            static (self, oldValue, newValue) => self.OnIsExpandedChanged(oldValue, newValue));
+            static (self, oldValue, newValue) => self.OnIsExpandedPropertyChanged(oldValue, newValue));
+
+    private ToggleButton? _headerToggle;
 
     public static readonly MewProperty<double> GlyphSizeProperty =
         MewProperty<double>.Register<Expander>(nameof(GlyphSize), 4.0, MewPropertyOptions.AffectsRender);
@@ -42,6 +49,53 @@ public partial class Expander : HeaderedContentControl, IVisualTreeHost
     protected virtual void OnIsExpandedChanged(bool oldValue, bool newValue)
     {
         ExpandedChanged?.Invoke(newValue);
+    }
+
+    private void OnIsExpandedPropertyChanged(bool oldValue, bool newValue)
+    {
+        if (_headerToggle != null && _headerToggle.IsChecked != newValue)
+        {
+            _headerToggle.CommitIsChecked(newValue);
+        }
+
+        OnIsExpandedChanged(oldValue, newValue);
+    }
+
+    private void OnHeaderToggleCheckedChanged(bool isChecked)
+    {
+        if (IsExpanded != isChecked)
+        {
+            CommitTargetValue(IsExpandedProperty, isChecked);
+        }
+    }
+
+    private protected override void OnTemplateInstanceAttached()
+    {
+        base.OnTemplateInstanceAttached();
+
+        var toggle = GetTemplateChild<ToggleButton>(PART_HEADER_TOGGLE);
+        if (toggle == null)
+        {
+            return;
+        }
+
+        _headerToggle = toggle;
+        toggle.CommitIsChecked(IsExpanded);
+        toggle.CheckedChanged += OnHeaderToggleCheckedChanged;
+    }
+
+    private protected override void OnTemplateInstanceDetached()
+    {
+        base.OnTemplateInstanceDetached();
+
+        var toggle = _headerToggle;
+        if (toggle == null)
+        {
+            return;
+        }
+
+        _headerToggle = null;
+        toggle.CheckedChanged -= OnHeaderToggleCheckedChanged;
     }
 
     /// <summary>
@@ -140,37 +194,6 @@ public partial class Expander : HeaderedContentControl, IVisualTreeHost
         Content.Arrange(new Rect(inner.X, y, inner.Width, Math.Max(0, inner.Bottom - y)));
     }
 
-    protected override void RenderSubtree(IGraphicsContext context)
-    {
-        if (HasTemplateInstance)
-        {
-            base.RenderSubtree(context);
-            return;
-        }
-
-        Header?.Render(context);
-        if (IsExpanded)
-        {
-            Content?.Render(context);
-        }
-    }
-
-    internal override void WriteComposition(Rendering.Retained.CompositionPlanBuilder builder)
-    {
-        if (HasTemplateInstance)
-        {
-            base.WriteComposition(builder);
-            return;
-        }
-
-        builder.Content(0);
-        builder.Child(Header);
-        if (IsExpanded)
-        {
-            builder.Child(Content);
-        }
-    }
-
     protected override void OnRender(IGraphicsContext context)
     {
         if (HasTemplateInstance)
@@ -230,7 +253,7 @@ public partial class Expander : HeaderedContentControl, IVisualTreeHost
         headerH = Math.Max(headerH, GlyphAreaWidth);
         var headerRow = new Rect(inner.X, inner.Y, inner.Width, headerH);
 
-        if (headerRow.Contains(e.Position))
+        if (headerRow.Contains(TransformFromRoot(e.Position)))
         {
             CommitTargetValue(IsExpandedProperty, !IsExpanded);
             Focus();

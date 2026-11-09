@@ -2,71 +2,118 @@ using System.Buffers.Binary;
 
 namespace Aprillz.MewUI.Resources;
 
-/// <summary>
-/// MewStage vendor patch text/0003: the weight and style a font file's face declares, for <see cref="FontRegistry"/> to tell a
-/// family's faces apart. The OS/2 table's usWeightClass and fsSelection (ITALIC bit 0, OBLIQUE bit 9) when it has one;
-/// otherwise the head table's macStyle (Bold bit 0 = 700, Italic bit 1); otherwise a regular face (400, upright). A
-/// collection (.ttc) answers for its first face.
-/// </summary>
+/// <summary>Reads the weight and slant a font file declares for itself in its <c>OS/2</c> table.</summary>
 internal static class OpenTypeFaceStyle
 {
-    internal readonly record struct Style(int Weight, bool Italic);
+    private const uint TTC_TAG = 0x74746366;
+    private const uint OS2_TAG = 0x4F532F32;
+    private const ushort FS_SELECTION_ITALIC = 1 << 0;
+    private const ushort FS_SELECTION_OBLIQUE = 1 << 9;
 
-    private static readonly Style Regular = new(400, false);
-
-    private const uint TagOs2 = 0x4F532F32, TagHead = 0x68656164, TagTtcf = 0x74746366;   // 'OS/2', 'head', 'ttcf'
-    private const int Os2WeightClass = 4, Os2FsSelection = 62, HeadMacStyle = 44;
-    private const ushort FsItalic = 1 << 0, FsOblique = 1 << 9, MacBold = 1 << 0, MacItalic = 1 << 1;
-    private const int BoldWeight = 700;
-
-    public static Style Read(string path)
+    /// <summary>Reads the first face of <paramref name="path"/>; a file without a readable <c>OS/2</c> table reports 400 upright.</summary>
+    public static bool TryRead(string path, out int weight, out bool italic)
     {
+        weight = (int)FontWeight.Normal;
+        italic = false;
+
         try
         {
-            return Read(File.ReadAllBytes(path));
+            using var stream = File.OpenRead(path);
+            return TryRead(stream, out weight, out italic);
         }
         catch (IOException)
         {
-            return Regular;
+            return false;
         }
         catch (UnauthorizedAccessException)
         {
-            return Regular;
+            return false;
         }
     }
 
-    public static Style Read(ReadOnlySpan<byte> font)
+    private static bool TryRead(Stream stream, out int weight, out bool italic)
     {
-        int sfnt = 0;
-        if (font.Length >= 16 && BinaryPrimitives.ReadUInt32BigEndian(font) == TagTtcf)
-            sfnt = (int)BinaryPrimitives.ReadUInt32BigEndian(font[12..]);   // the first face's offset table
+        weight = (int)FontWeight.Normal;
+        italic = false;
 
-        if (sfnt < 0 || font.Length < sfnt + 12)
-            return Regular;
-        int numTables = BinaryPrimitives.ReadUInt16BigEndian(font[(sfnt + 4)..]);
-        int os2 = -1, head = -1;
-        for (int i = 0; i < numTables; i++)
+        Span<byte> header = stackalloc byte[12];
+        if (!ReadAt(stream, 0, header))
         {
-            int rec = sfnt + 12 + i * 16;
-            if (font.Length < rec + 16)
-                return Regular;
-            uint tag = BinaryPrimitives.ReadUInt32BigEndian(font[rec..]);
-            int offset = (int)BinaryPrimitives.ReadUInt32BigEndian(font[(rec + 8)..]);
-            if (tag == TagOs2) os2 = offset;
-            else if (tag == TagHead) head = offset;
+            return false;
         }
 
-        if (os2 >= 0 && font.Length >= os2 + Os2FsSelection + 2)
+        long faceOffset = 0;
+        if (BinaryPrimitives.ReadUInt32BigEndian(header) == TTC_TAG)
         {
-            int weight = BinaryPrimitives.ReadUInt16BigEndian(font[(os2 + Os2WeightClass)..]);
-            ushort fs = BinaryPrimitives.ReadUInt16BigEndian(font[(os2 + Os2FsSelection)..]);
-            return new Style(weight is >= 1 and <= 1000 ? weight : Regular.Weight, (fs & (FsItalic | FsOblique)) != 0);
+            Span<byte> firstOffset = stackalloc byte[4];
+            if (BinaryPrimitives.ReadUInt32BigEndian(header[8..12]) == 0 || !ReadAt(stream, 12, firstOffset))
+            {
+                return false;
+            }
+
+            faceOffset = BinaryPrimitives.ReadUInt32BigEndian(firstOffset);
+            if (!ReadAt(stream, faceOffset, header))
+            {
+                return false;
+            }
         }
-        if (head >= 0 && font.Length >= head + HeadMacStyle + 2)
+
+        ushort tableCount = BinaryPrimitives.ReadUInt16BigEndian(header[4..6]);
+        if (tableCount == 0 || tableCount > 512)
         {
-            ushort mac = BinaryPrimitives.ReadUInt16BigEndian(font[(head + HeadMacStyle)..]);
-            return new Style((mac & MacBold) != 0 ? BoldWeight : Regular.Weight, (mac & MacItalic) != 0);
+            return false;
         }
-        return Regular;
+
+        Span<byte> record = stackalloc byte[16];
+        for (int index = 0; index < tableCount; index++)
+        {
+            if (!ReadAt(stream, faceOffset + 12 + index * 16L, record))
+            {
+                return false;
+            }
+
+            if (BinaryPrimitives.ReadUInt32BigEndian(record) != OS2_TAG)
+            {
+                continue;
+            }
+
+            long tableOffset = BinaryPrimitives.ReadUInt32BigEndian(record[8..12]);
+            Span<byte> table = stackalloc byte[64];
+            if (BinaryPrimitives.ReadUInt32BigEndian(record[12..16]) < table.Length || !ReadAt(stream, tableOffset, table))
+            {
+                return false;
+            }
+
+            int weightClass = BinaryPrimitives.ReadUInt16BigEndian(table[4..6]);
+            ushort selection = BinaryPrimitives.ReadUInt16BigEndian(table[62..64]);
+            if (weightClass > 0)
+            {
+                // Some old fonts give the weight on a 1-9 scale.
+                weight = Math.Clamp(weightClass < 10 ? weightClass * 100 : weightClass, 1, 1000);
+            }
+
+            italic = (selection & (FS_SELECTION_ITALIC | FS_SELECTION_OBLIQUE)) != 0;
+            return true;
+        }
+
+        return false;
+    }
+
+    private static bool ReadAt(Stream stream, long offset, Span<byte> buffer)
+    {
+        stream.Position = offset;
+        int total = 0;
+        while (total < buffer.Length)
+        {
+            int read = stream.Read(buffer[total..]);
+            if (read <= 0)
+            {
+                return false;
+            }
+
+            total += read;
+        }
+
+        return true;
     }
 }

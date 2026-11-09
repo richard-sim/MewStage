@@ -72,6 +72,7 @@ public sealed partial class ContextMenu : Control, IPopupOwner, ICommandSource, 
     public static readonly MewProperty<double> ItemHeightProperty =
         MewProperty<double>.Register<ContextMenu>(nameof(ItemHeight), double.NaN, MewPropertyOptions.AffectsLayout);
 
+    /// <summary>Gets or sets the height of menu items.</summary>
     public double ItemHeight
     {
         get => GetValue(ItemHeightProperty);
@@ -84,6 +85,7 @@ public sealed partial class ContextMenu : Control, IPopupOwner, ICommandSource, 
     public static readonly MewProperty<Thickness> ItemPaddingProperty =
         MewProperty<Thickness>.Register<ContextMenu>(nameof(ItemPadding), default, MewPropertyOptions.AffectsLayout);
 
+    /// <summary>Gets or sets the padding around menu items.</summary>
     public Thickness ItemPadding
     {
         get => GetValue(ItemPaddingProperty);
@@ -94,9 +96,12 @@ public sealed partial class ContextMenu : Control, IPopupOwner, ICommandSource, 
         MewProperty<double>.Register<ContextMenu>(nameof(MaxMenuHeight), double.PositiveInfinity, MewPropertyOptions.AffectsLayout);
 
     /// <summary>
-    /// Gets or sets an upper bound on the menu height. The default is no bound; the menu is never taller
-    /// than the room on the side it opens toward, and scrolls beyond either limit.
+    /// Gets or sets an upper bound on the menu height; the default is no bound.
     /// </summary>
+    /// <remarks>
+    /// The menu is never taller than the room on the side it opens toward, and scrolls beyond
+    /// either limit.
+    /// </remarks>
     public double MaxMenuHeight
     {
         get => GetValue(MaxMenuHeightProperty);
@@ -241,6 +246,7 @@ public sealed partial class ContextMenu : Control, IPopupOwner, ICommandSource, 
         return null;
     }
 
+    /// <summary>Adds a command item that uses the command's presentation.</summary>
     public void AddItem(Command command)
     {
         ArgumentNullException.ThrowIfNull(command);
@@ -250,6 +256,7 @@ public sealed partial class ContextMenu : Control, IPopupOwner, ICommandSource, 
         InvalidateVisual();
     }
 
+    /// <summary>Adds a non-executable presentation item.</summary>
     public void AddItem(string text, bool isEnabled = true)
     {
         Menu.Items.Add(new MenuItem(text) { IsEnabled = isEnabled });
@@ -258,6 +265,7 @@ public sealed partial class ContextMenu : Control, IPopupOwner, ICommandSource, 
         InvalidateVisual();
     }
 
+    /// <summary>Adds a command item with a presentation and access-key override.</summary>
     public void AddItem(string text, Command command)
     {
         ArgumentNullException.ThrowIfNull(command);
@@ -279,6 +287,7 @@ public sealed partial class ContextMenu : Control, IPopupOwner, ICommandSource, 
         InvalidateVisual();
     }
 
+    /// <summary>Adds a submenu item.</summary>
     public void AddSubMenu(string text, Menu subMenu, bool isEnabled = true)
     {
         ArgumentNullException.ThrowIfNull(subMenu);
@@ -288,6 +297,7 @@ public sealed partial class ContextMenu : Control, IPopupOwner, ICommandSource, 
         InvalidateVisual();
     }
 
+    /// <summary>Adds an entry built beforehand after the existing items.</summary>
     public void AddEntry(MenuEntry entry)
     {
         ArgumentNullException.ThrowIfNull(entry);
@@ -297,6 +307,7 @@ public sealed partial class ContextMenu : Control, IPopupOwner, ICommandSource, 
         InvalidateVisual();
     }
 
+    /// <summary>Replaces the menu items.</summary>
     public void SetItems(params MenuEntry[] items)
     {
         ArgumentNullException.ThrowIfNull(items);
@@ -307,6 +318,7 @@ public sealed partial class ContextMenu : Control, IPopupOwner, ICommandSource, 
         }
     }
 
+    /// <summary>Adds a separator.</summary>
     public void AddSeparator()
     {
         Menu.Separator();
@@ -467,7 +479,7 @@ public sealed partial class ContextMenu : Control, IPopupOwner, ICommandSource, 
         }
         else
         {
-            ShowCore(placementTarget, placementTarget.Bounds, Placement);
+            ShowCore(placementTarget, placementTarget.GetBoundsInRoot(), Placement);
         }
     }
 
@@ -488,6 +500,10 @@ public sealed partial class ContextMenu : Control, IPopupOwner, ICommandSource, 
     internal void Show(UIElement placementTarget, Rect anchorInWindow)
         => ShowCore(placementTarget, anchorInWindow, Placement);
 
+    /// <summary>
+    /// Obsolete: use <see cref="Show(UIElement)"/> with <see cref="Placement"/>, or
+    /// <see cref="Show(UIElement, Point)"/> for an explicit position.
+    /// </summary>
     [Obsolete("Use Show(placementTarget) with Placement = MenuPlacement.Below for target-anchored menus, or Show(placementTarget, positionInWindow) for an explicit position. Side placements derive the flip anchor that anchorTopY carried by hand.")]
     public void ShowAt(UIElement owner, Point positionInWindow, double? anchorTopY = null)
     {
@@ -1107,7 +1123,7 @@ public sealed partial class ContextMenu : Control, IPopupOwner, ICommandSource, 
             return;
         }
 
-        int index = HitTestEntryIndex(e.Position);
+        int index = HitTestEntryIndex(TransformFromRoot(e.Position));
         SetHotIndex(index);
 
         if (index >= 0 && index < Items.Count && Items[index] is MenuItem item && item.SubMenu != null && item.IsEffectivelyEnabled)
@@ -1139,7 +1155,7 @@ public sealed partial class ContextMenu : Control, IPopupOwner, ICommandSource, 
             return;
         }
 
-        int index = HitTestEntryIndex(e.Position);
+        int index = HitTestEntryIndex(TransformFromRoot(e.Position));
         if (index < 0 || index >= Items.Count)
         {
             return;
@@ -1480,40 +1496,20 @@ public sealed partial class ContextMenu : Control, IPopupOwner, ICommandSource, 
         return LayoutRounding.MakeClipRect(contentBounds, GetDpi() / 96.0);
     }
 
-    protected override void RenderSubtree(IGraphicsContext context)
+    protected override ChildClip? GetChildClip(UIElement child)
     {
+        // A viewport without area shows neither rows nor bar; otherwise the bar draws over the rows unclipped.
         if (GetRowClip() is not Rect clip)
         {
-            return;
+            return new ChildClip(Rect.Empty);
         }
 
-        context.Save();
-        context.SetClip(clip);
-        foreach (var row in _rows.Values)
+        if (ReferenceEquals(child, _vBar))
         {
-            row.Render(context);
+            return null;
         }
 
-        context.Restore();
-        _vBar.Render(context);
-    }
-
-    internal override void WriteComposition(Rendering.Retained.CompositionPlanBuilder builder)
-    {
-        builder.Content(0);
-        if (GetRowClip() is not Rect clip)
-        {
-            return;
-        }
-
-        builder.PushClipRect(clip);
-        foreach (var row in _rows.Values)
-        {
-            builder.Child(row);
-        }
-
-        builder.Pop();
-        builder.Child(_vBar);
+        return new ChildClip(clip);
     }
 
     bool IVisualTreeHost.VisitChildren(Func<Element, bool> visitor)

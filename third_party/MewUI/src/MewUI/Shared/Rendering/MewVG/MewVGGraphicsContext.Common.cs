@@ -9,6 +9,8 @@ namespace Aprillz.MewUI.Rendering.MewVG;
 internal sealed partial class MewVGMacOSGraphicsContext : GraphicsContextBase, ITransparentDirtyRectContext, IOpaqueDirtyRectContext
 #elif MEWUI_MEWVG_X11
 internal sealed partial class MewVGX11GraphicsContext : GraphicsContextBase, ITransparentDirtyRectContext, IOpaqueDirtyRectContext, ISurfaceCopyContext
+#elif MEWUI_MEWVG_FRAMEBUFFER
+internal sealed partial class MewVGFramebufferGraphicsContext : GraphicsContextBase, ITransparentDirtyRectContext, IOpaqueDirtyRectContext, ISurfaceCopyContext
 #elif MEWUI_MEWVG_MEWSTAGE
 // MewStage vendor patch core-bridge/0001 (see third_party/NOTICE): a GPU-agnostic branch. No GL; Clear takes the fill path.
 internal sealed partial class MewStageMewVGGraphicsContext : GraphicsContextBase, ITransparentDirtyRectContext, IOpaqueDirtyRectContext, IGroupOpacityContext
@@ -34,6 +36,11 @@ internal sealed partial class MewVGWin32GraphicsContext : GraphicsContextBase, I
     private float _globalAlpha = 1f;
     private bool _textPixelSnap = true;
     private Matrix3x2 _transform = Matrix3x2.Identity;
+
+    // Maps world DIPs to the target: identity, or a vertical flip for a target whose first row is its top line,
+    // such as a scan-out buffer drawn through a framebuffer object, where GL otherwise puts y=0 on the first row.
+    private Matrix3x2 _deviceTransform = Matrix3x2.Identity;
+    private bool _targetTopDown;
     private Rect? _clipBoundsWorld;
     private double _viewportWidthDip;
     private double _viewportHeightDip;
@@ -167,6 +174,8 @@ internal sealed partial class MewVGWin32GraphicsContext : GraphicsContextBase, I
         _globalAlpha = 1f;
         _textPixelSnap = true;
         _transform = Matrix3x2.Identity;
+        _deviceTransform = Matrix3x2.Identity;
+        _targetTopDown = false;
         _clipBoundsWorld = null;
         _saveStack.Clear();
         _acquiredExternalsThisFrame.Clear();
@@ -257,9 +266,9 @@ internal sealed partial class MewVGWin32GraphicsContext : GraphicsContextBase, I
         _clipBoundsWorld = IntersectClipBounds(_clipBoundsWorld, worldClip);
 
         var clip = _clipBoundsWorld.Value;
-        _vg.SetTransformMatrix(Matrix3x2.Identity);
+        ApplyDeviceTransform();
         _vg.Scissor((float)clip.X, (float)clip.Y, (float)clip.Width, (float)clip.Height);
-        _vg.SetTransformMatrix(_transform);
+        ApplyWorldTransform();
     }
 
     protected override void SetClipRoundedRectCore(Rect rect, double radiusX, double radiusY)
@@ -274,9 +283,9 @@ internal sealed partial class MewVGWin32GraphicsContext : GraphicsContextBase, I
         _clipBoundsWorld = IntersectClipBounds(_clipBoundsWorld, worldClip);
 
         var clip = _clipBoundsWorld.Value;
-        _vg.SetTransformMatrix(Matrix3x2.Identity);
+        ApplyDeviceTransform();
         _vg.Scissor((float)clip.X, (float)clip.Y, (float)clip.Width, (float)clip.Height);
-        _vg.SetTransformMatrix(_transform);
+        ApplyWorldTransform();
 
         float radius = (float)Math.Max(0, Math.Min(radiusX, radiusY));
         _vg.BeginPath();
@@ -296,9 +305,9 @@ internal sealed partial class MewVGWin32GraphicsContext : GraphicsContextBase, I
         _clipBoundsWorld = IntersectClipBounds(_clipBoundsWorld, worldClip);
 
         var clip = _clipBoundsWorld.Value;
-        _vg.SetTransformMatrix(Matrix3x2.Identity);
+        ApplyDeviceTransform();
         _vg.Scissor((float)clip.X, (float)clip.Y, (float)clip.Width, (float)clip.Height);
-        _vg.SetTransformMatrix(_transform);
+        ApplyWorldTransform();
 
         ReplayNvgPathCommands(path, path.FillRule);
         _vg.Clip();
@@ -308,25 +317,39 @@ internal sealed partial class MewVGWin32GraphicsContext : GraphicsContextBase, I
     protected override void TranslateCore(double dx, double dy)
     {
         _transform = Matrix3x2.CreateTranslation((float)dx, (float)dy) * _transform;
-        _vg.SetTransformMatrix(_transform);
+        ApplyWorldTransform();
     }
 
     protected override void RotateCore(double angleRadians)
     {
         _transform = Matrix3x2.CreateRotation((float)angleRadians) * _transform;
-        _vg.SetTransformMatrix(_transform);
+        ApplyWorldTransform();
     }
 
     protected override void ScaleCore(double sx, double sy)
     {
         _transform = Matrix3x2.CreateScale((float)sx, (float)sy) * _transform;
-        _vg.SetTransformMatrix(_transform);
+        ApplyWorldTransform();
     }
+
+    /// <summary>Tells MewVG whether the target's first row is its top line; called by the platform frame start.</summary>
+    private void SetTargetOrientation(bool topDown)
+    {
+        _targetTopDown = topDown;
+        _deviceTransform = topDown
+            ? new Matrix3x2(1f, 0f, 0f, -1f, 0f, (float)_viewportHeightDip)
+            : Matrix3x2.Identity;
+        ApplyDeviceTransform();
+    }
+
+    private void ApplyWorldTransform() => _vg.SetTransformMatrix(_transform * _deviceTransform);
+
+    private void ApplyDeviceTransform() => _vg.SetTransformMatrix(_deviceTransform);
 
     protected override void SetTransformCore(Matrix3x2 matrix)
     {
         _transform = matrix;
-        _vg.SetTransformMatrix(_transform);
+        ApplyWorldTransform();
     }
 
     protected override Matrix3x2 GetTransformCore() => _transform;
@@ -334,7 +357,7 @@ internal sealed partial class MewVGWin32GraphicsContext : GraphicsContextBase, I
     protected override void ResetTransformCore()
     {
         _transform = Matrix3x2.Identity;
-        _vg.SetTransformMatrix(_transform);
+        ApplyWorldTransform();
     }
 
     public override float GlobalAlpha
@@ -365,7 +388,7 @@ internal sealed partial class MewVGWin32GraphicsContext : GraphicsContextBase, I
         ClearTargetPixels(new Rect(0, 0, _viewportWidthDip, _viewportHeightDip), ToNvgColor(color));
 #else
         _vg.Save();
-        _vg.ResetTransform();
+        ApplyDeviceTransform();
         _vg.ResetScissor();
         _vg.ShapeAntiAlias(false);
         _vg.BeginPath();
@@ -391,7 +414,7 @@ internal sealed partial class MewVGWin32GraphicsContext : GraphicsContextBase, I
         ClearTargetPixels(rect, color);
 #else
         _vg.Save();
-        _vg.ResetTransform();
+        ApplyDeviceTransform();
         _vg.ResetScissor();
         _vg.ShapeAntiAlias(false);
         // Copy replaces the destination channels instead of blending over them, which is what makes
@@ -423,7 +446,7 @@ internal sealed partial class MewVGWin32GraphicsContext : GraphicsContextBase, I
 
         FlushQueuedDraws();
         Native.GL.Enable(Native.GL.GL_SCISSOR_TEST);
-        Native.GL.Scissor(left, _viewportHeightPx - bottom, right - left, bottom - top);
+        Native.GL.Scissor(left, _targetTopDown ? top : _viewportHeightPx - bottom, right - left, bottom - top);
         Native.GL.ColorMask(true, true, true, true);
         // The target holds premultiplied colour, as the fill it replaces would have written.
         Native.GL.ClearColor(color.R * color.A, color.G * color.A, color.B * color.A, color.A);
@@ -438,6 +461,13 @@ internal sealed partial class MewVGWin32GraphicsContext : GraphicsContextBase, I
             !Native.OpenGLExt.IsBlitFramebufferSupported)
         {
             return false;
+        }
+
+        bool copied = false;
+        BeforeSurfaceCopy(source, area, ref copied);
+        if (copied)
+        {
+            return true;
         }
 
         // A multisampled target rejects the blit: a browser canvas whose context the page made first
@@ -487,10 +517,11 @@ internal sealed partial class MewVGWin32GraphicsContext : GraphicsContextBase, I
         Native.OpenGLExt.BindFramebuffer(Native.OpenGLExt.GL_READ_FRAMEBUFFER, readFramebuffer);
         Native.OpenGLExt.BindFramebuffer(Native.OpenGLExt.GL_DRAW_FRAMEBUFFER, target);
         Native.GL.Disable(Native.GL.GL_SCISSOR_TEST);
-        // Both are drawn bottom-up, so rows are measured from the bottom of each one's content.
+        // The source is drawn bottom-up, so its rows are measured from the bottom of its content; a top-down
+        // target takes them in the opposite order, which the swapped destination rows ask the blit for.
         Native.OpenGLExt.BlitFramebuffer(
             left, sourceHeight - bottom, right, sourceHeight - top,
-            left, _viewportHeightPx - bottom, right, _viewportHeightPx - top,
+            left, _targetTopDown ? bottom : _viewportHeightPx - bottom, right, _targetTopDown ? top : _viewportHeightPx - top,
             Native.GL.GL_COLOR_BUFFER_BIT, Native.OpenGLExt.GL_NEAREST);
         Native.OpenGLExt.BindFramebuffer(Native.OpenGLExt.GL_FRAMEBUFFER, target);
 
@@ -534,6 +565,12 @@ internal sealed partial class MewVGWin32GraphicsContext : GraphicsContextBase, I
 
     /// <summary>Performs the clear a platform defers from the start of a frame to its first write, if one is pending.</summary>
     partial void ApplyPendingFrameClear();
+
+    /// <summary>
+    /// Runs before a surface is copied onto the target, so a platform can first restore what its target lacks or copy
+    /// the area itself; setting <paramref name="copied"/> skips the copy here.
+    /// </summary>
+    partial void BeforeSurfaceCopy(IRenderSurface source, Rect area, ref bool copied);
 
     /// <summary>Drops a deferred frame clear because the first write replaces the whole target anyway.</summary>
     partial void DiscardPendingFrameClear();
@@ -1035,7 +1072,7 @@ internal sealed partial class MewVGWin32GraphicsContext : GraphicsContextBase, I
         if (identityTransform)
         {
             _vg.Save();
-            _vg.ResetTransform();
+            ApplyDeviceTransform();
         }
 
         _vg.BeginPath();

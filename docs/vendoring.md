@@ -33,8 +33,9 @@ apply to which component in which order.
   `mewvg/build` patch), which restricts the vendored projects to net10.0.
 - `[categories.*]`: the patch categories, each mandatory or optional, with the one-line reason.
 
-The pins at the time of writing: MewUI `8b9c9433` (main, 2026-10-16, version 0.22.1+), MewVG `5758c6bf` (tag
-v0.10.1, the version MewUI main builds against), SvgNet `853a9ae8`, Clipper2 `21ebba05`, LiveCharts2 `1cab5f34`.
+The pins at the time of writing: MewUI `8c43abf3` (main, 2026-11-07, version 0.22.1+), MewVG `5758c6bf` (tag
+v0.10.1, the version MewUI main builds against, and MewVG's `main`), SvgNet `853a9ae8`, Clipper2 `21ebba05`,
+LiveCharts2 `1cab5f34` (the three submodule commits MewUI records).
 
 ## The patch categories
 
@@ -42,10 +43,10 @@ v0.10.1, the version MewUI main builds against), SvgNet `853a9ae8`, Clipper2 `21
 | --- | --- | --- |
 | `core-bridge` | yes | A MewStage branch of the shared MewVG `IGraphicsContext` bridge: the backend supplies a `MewVGContext` over the app's GPU device, group opacity composites inside the one UI pass, and the GL-only clear and blit path is compiled out. The backend does not compile without it. |
 | `design-space` | yes | A window frame drawn to a surface whose scale is below 1 derives its client DIPs from that scale. The clamp at 1 made a 1280 x 720 window showing a 1920 x 1080 layout clip a third of it. |
-| `multi-host` | yes | Per-thread UI statics (the tree-walk scratch lists), a per-thread graphics factory and a per-thread animation manager, so several embedded hosts run in one process (parallel test classes, secondary windows). |
+| `multi-host` | yes | Per-thread UI statics (the tree-walk scratch lists), a per-thread graphics factory, a per-thread animation manager and a per-thread dispatcher, so several embedded hosts run in one process (parallel test classes, secondary windows) and each pumps its own deferred work (timers, posted jobs). |
 | `build` | yes | The local-override hook in MewVG's build props, so the vendored MewVG builds net10.0 only. |
 | `allocation` | no | Six patches that remove per-frame allocations from the steady state (text replay delegates, gradient LUT lookups, cache eviction closures, the scene pass, template wiring, dashed strokes). Skipping them makes a frame allocate and the allocation gates fail, as expected. |
-| `text` | no | Letter spacing drawn per grapheme, a negative half-leading, and a font registry that keeps every face of a family (the Kit draws every weight of Lora on the platform host because of the last one). |
+| `text` | no | Letter spacing drawn per grapheme and a negative half-leading. (A third patch, a font registry that keeps every face of a family, was dropped at the 2026-11 re-pin: upstream now does the same thing.) |
 | `rendering` | no | Rectangle strokes keep antialiasing when the transform takes them off the pixel grid. |
 | `mewdock` | no | MewDock tool groups can hide their caption bar. |
 
@@ -86,6 +87,17 @@ whose hunks no longer match stops the run with the file and hunk. Rebase that pa
 to the intended state, regenerate the patch with `diff -u` against a clean copy of the upstream file, keep the
 header paragraph), run again, then `--check`, build, and run the suites. The allocation gates and the lavapipe
 contract tests are the ones that notice an upstream behavior change.
+
+**Re-pin history.** 2026-11: MewUI `8b9c9433` -> `8c43abf3` (140 upstream commits; MewVG and the three submodules
+unchanged). Eleven patches applied as they were. Three were rebased because only their context had moved:
+`core-bridge/0001` (upstream added a `MEWUI_MEWVG_FRAMEBUFFER` branch beside ours), `multi-host/0002` and
+`mewdock/0001` (rewritten doc comments next to the hunks). `text/0003` (the multi-face font registry) was dropped
+because upstream's `e5a2c954` does the same thing. `multi-host/0003` (the per-thread dispatcher) is new. On the
+MewStage side the vendor update needed three small demo changes: the generated fluent setters made `MenuItem.Menu`
+obsolete in favor of `SubMenu`, made one `using` unnecessary, and pushed the Workbench shell's `Build` past the class
+coupling limit (split into helpers). When the build box cannot reach codeload.github.com, download the tarballs
+elsewhere and pass `--tarball-dir`; GNU `patch --fuzz=3` against the new upstream file is a quick way to rebase a
+patch whose context moved, after which the patch is regenerated from the result.
 
 **Add a patch.** Make the change in the vendored file. Produce a unified diff against the unpatched upstream file
 (the cache tarball has it) with paths relative to the component's destination, `-p1` style. Write the header

@@ -7,7 +7,7 @@ using System.Runtime.CompilerServices;
 namespace Aprillz.MewUI.Controls;
 
 /// <summary>
-/// Base class for all UI elements. Provides the core Measure/Arrange layout system.
+/// Base class for all UI elements, providing the measure and arrange layout passes.
 /// </summary>
 public abstract partial class Element : MewObject
 {
@@ -42,6 +42,9 @@ public abstract partial class Element : MewObject
         }
     }
 
+    /// <summary>
+    /// Assigns the field when the value differs and returns whether it changed.
+    /// </summary>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     protected static bool Set<T>(ref T field, T value)
     {
@@ -54,6 +57,9 @@ public abstract partial class Element : MewObject
         return true;
     }
 
+    /// <summary>
+    /// Assigns the field when the value differs and returns whether it changed; NaN equals NaN.
+    /// </summary>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     protected static bool SetDouble(ref double field, double value)
     {
@@ -73,23 +79,25 @@ public abstract partial class Element : MewObject
     public Size DesiredSize { get; private set; }
 
     /// <summary>
-    /// Gets the final bounds calculated during the Arrange pass, in window-absolute coordinates
-    /// (not the parent's coordinate space): panels arrange children by offsetting from their own
-    /// absolute <c>Bounds</c>, and element transforms are translate-only. Custom panels must pass
-    /// window-absolute rects to <see cref="Arrange"/>. Prefer <see cref="RenderSize"/> for
-    /// WPF-like usage.
+    /// Gets the bounds from the arrange pass in window coordinates, not the parent's, left untransformed
+    /// under an element that transforms its children.
     /// </summary>
+    /// <remarks>
+    /// Panels arrange children by offsetting from their own window-absolute bounds, so custom panels must
+    /// pass window-absolute rects to <see cref="Arrange"/>. <see cref="TranslatePoint"/> and
+    /// <see cref="TranslateRect"/> follow any child transform. Prefer <see cref="RenderSize"/> for
+    /// WPF-like usage.
+    /// </remarks>
     [EditorBrowsable(EditorBrowsableState.Never)]
     public Rect Bounds { get; private set; }
 
     /// <summary>
-    /// Gets the final render size calculated during the Arrange pass.
-    /// Equivalent to WPF's <c>RenderSize</c>.
+    /// Gets the size from the arrange pass, equivalent to WPF's RenderSize.
     /// </summary>
     public Size RenderSize => new(Bounds.Width, Bounds.Height);
 
     /// <summary>
-    /// Gets or sets the parent element.
+    /// Gets the visual parent element, or null when detached.
     /// </summary>
     public Element? Parent
     {
@@ -119,6 +127,12 @@ public abstract partial class Element : MewObject
                 field = value;
                 BumpContextVersionDeep();
                 OnParentChanged();
+
+                if (Automation.AutomationGate.IsSupported)
+                {
+                    UIElement.NotifyAutomationStructureChanged(previousParent);
+                    UIElement.NotifyAutomationStructureChanged(value);
+                }
 
                 // Which children a visual draws, and in what order, is its composition.
                 (previousParent as UIElement)?.RaiseRenderDirty(Rendering.Retained.RenderDirtyKind.Composition);
@@ -187,10 +201,11 @@ public abstract partial class Element : MewObject
     internal Element? ContextParent => _contextParentOverride ?? Parent;
 
     /// <summary>
-    /// Attaches a child element to this element. Use this in derived controls
-    /// instead of setting Parent directly.
+    /// Attaches a child element to this element; derived controls use this instead of setting
+    /// <see cref="Parent"/> directly.
     /// </summary>
     /// <param name="child">The child to attach.</param>
+    /// <exception cref="InvalidOperationException">The child already has a different parent.</exception>
     protected void AttachChild(Element child)
     {
         ArgumentNullException.ThrowIfNull(child);
@@ -233,6 +248,7 @@ public abstract partial class Element : MewObject
     /// its visual <see cref="Parent"/>.
     /// </summary>
     /// <param name="child">The element to own logically.</param>
+    /// <exception cref="InvalidOperationException">The child is this element, already has a different logical parent, or is a logical ancestor of this element.</exception>
     protected void AttachLogicalChild(Element child)
     {
         ArgumentNullException.ThrowIfNull(child);
@@ -324,6 +340,7 @@ public abstract partial class Element : MewObject
     /// </summary>
     /// <param name="candidate">The proposed logical child; null is always valid.</param>
     /// <param name="allowTransfer">True when the caller adopts owned elements via <see cref="DetachFromCurrentLogicalOwner"/>.</param>
+    /// <exception cref="InvalidOperationException">The candidate is rejected for one of the reasons above.</exception>
     protected void ValidateLogicalChild(Element? candidate, bool allowTransfer = false)
     {
         if (candidate == null)
@@ -426,7 +443,7 @@ public abstract partial class Element : MewObject
     public bool IsArrangeDirty { get; private set; } = true;
 
     /// <summary>
-    /// Measures the element and determines its desired size.
+    /// Measures the element and determines its desired size; a clean element measured again with the same constraint is skipped.
     /// </summary>
     public void Measure(Size availableSize)
     {
@@ -435,6 +452,8 @@ public abstract partial class Element : MewObject
             return;
         }
 
+        MarkArrangeDirtyForMeasure();
+        var previousDesiredSize = DesiredSize;
         Size measured;
         using (DevToolsGate.IsSupported ? PerformanceProfiler.Instance.SampleElement(GetType(), ProfilerSampleCategory.Measure) : default)
         {
@@ -453,18 +472,73 @@ public abstract partial class Element : MewObject
         IsMeasureDirty = false;
         _lastMeasureConstraint = availableSize;
         _hasMeasureConstraint = true;
+        OnMeasured(previousDesiredSize);
     }
 
     /// <summary>
-    /// Core measurement logic. Override in derived classes.
+    /// Measures the element's content for the available size.
     /// </summary>
     protected abstract Size MeasureCore(Size availableSize);
 
+    /// <summary>Makes sure a measure the window layout does not cover is arranged, as WPF queues every measured element.</summary>
+    private void OnMeasured(Size previousDesiredSize)
+    {
+        if (FindVisualRoot() is not Window window)
+        {
+            return;
+        }
+
+        if (window.IsArrangingContent)
+        {
+            window.NoteArrangeRequest(this);
+            return;
+        }
+
+        if (window.IsInUpdatePass)
+        {
+            return;
+        }
+
+        // Outside any pass nothing would arrange it, and a parent that did not ask for the new size must measure again.
+        MarkArrangeDirtyThroughAncestors();
+        if (DesiredSize != previousDesiredSize && Parent is Element parent)
+        {
+            parent.InvalidateMeasure();
+        }
+
+        window.RequestUpdatePass();
+    }
+
+    /// <summary>Marks this element and every ancestor for arranging, so the next window arrange reaches it.</summary>
+    internal void MarkArrangeDirtyThroughAncestors()
+    {
+        for (Element? current = this; current != null; current = current.Parent)
+        {
+            current.IsArrangeDirty = true;
+        }
+    }
+
+    /// <summary>Marks this element and its ancestors for arranging, as a measured element is arranged again.</summary>
+    private void MarkArrangeDirtyForMeasure()
+    {
+        // An ancestor already waiting to arrange reaches this element; flags rather than InvalidateArrange ask no extra round.
+        for (Element? current = this; current != null && !current.IsArrangeDirty; current = current.Parent)
+        {
+            current.IsArrangeDirty = true;
+        }
+    }
+
     /// <summary>
-    /// Positions and sizes the element within the given bounds.
+    /// Positions and sizes the element within the given bounds, measuring it first when its measure is out of date.
     /// </summary>
     public void Arrange(Rect finalRect)
     {
+        // A host can arrange a child it did not measure, and no later pass would arrange it again once measured.
+        if (IsMeasureDirty)
+        {
+            Measure(_hasMeasureConstraint ? _lastMeasureConstraint : finalRect.Size);
+        }
+
         var arrangedRect = ApplyLayoutRounding(GetArrangedBounds(finalRect));
 
         if (!IsArrangeDirty && Bounds == arrangedRect)
@@ -515,7 +589,7 @@ public abstract partial class Element : MewObject
     }
 
     /// <summary>
-    /// Core arrangement logic. Override in derived classes.
+    /// Arranges the element within its final bounds.
     /// </summary>
     protected abstract void ArrangeCore(Rect finalRect);
 
@@ -597,6 +671,12 @@ public abstract partial class Element : MewObject
         if (!TakeLayoutInvalidationHandOff())
         {
             _ownLayoutInvalidated = true;
+
+            // An ancestor that already arranged it clears its own flag when it finishes, so the window has to come back.
+            if (FindVisualRoot() is Window window && !ReferenceEquals(window, this) && window.IsArrangingContent)
+            {
+                window.NoteArrangeRequest(this);
+            }
         }
 
         if (IsArrangeDirty)
@@ -706,17 +786,8 @@ public abstract partial class Element : MewObject
     }
 
     /// <summary>
-    /// Invalidates the visual representation, causing a repaint.
+    /// Invalidates the element's visuals so the next frame repaints them.
     /// </summary>
-    /// <remarks>
-    /// Unlike <see cref="InvalidateMeasure"/> and <see cref="InvalidateArrange"/>, this walk is
-    /// intentionally left unbounded: bounding it would require a per-element dirty flag that gets
-    /// cleared on render, but <see cref="Render"/> is bypassed by <c>UIElement</c>'s sealed
-    /// override (which never calls the base implementation), so no in-scope hook exists to clear
-    /// such a flag. Since every element defaults to "dirty", an unclearable flag would get stuck
-    /// true and silently stop all repaint propagation after the first call. Left unoptimized until
-    /// UIElement gains a render-completion hook.
-    /// </remarks>
     public virtual void InvalidateVisual() =>
         Parent?.InvalidateVisual();
 
@@ -750,8 +821,7 @@ public abstract partial class Element : MewObject
     internal virtual void OnDetaching(Element? oldRoot) { }
 
     /// <summary>
-    /// Renders the element to the graphics context.
-    /// Subclasses must override <see cref="OnRender"/> instead of this method.
+    /// Renders the element to the graphics context; subclasses override <see cref="OnRender"/> instead.
     /// </summary>
     public virtual void Render(IGraphicsContext context)
     {
@@ -764,7 +834,7 @@ public abstract partial class Element : MewObject
     protected virtual void OnRender(IGraphicsContext context) { }
 
     /// <summary>
-    /// Finds the visual root of this element (typically a Window).
+    /// Gets the <see cref="Window"/> at the root of this element's visual tree, or null when the tree is not rooted in a window.
     /// </summary>
     public Element? FindVisualRoot()
     {
@@ -904,8 +974,10 @@ public abstract partial class Element : MewObject
     }
 
     /// <summary>
-    /// Returns a transform from this element's coordinate space to the specified ancestor's coordinate space.
+    /// Returns a transform from this element's coordinate space to the specified ancestor's coordinate space,
+    /// including any transform an element between them applies to its children.
     /// </summary>
+    /// <exception cref="InvalidOperationException"><paramref name="ancestor"/> is not an ancestor of this element.</exception>
     public GeneralTransform TransformToAncestor(Element ancestor)
     {
         ArgumentNullException.ThrowIfNull(ancestor);
@@ -920,14 +992,13 @@ public abstract partial class Element : MewObject
             throw new InvalidOperationException("The specified element is not an ancestor of this element.");
         }
 
-        double dx = Bounds.X - ancestor.Bounds.X;
-        double dy = Bounds.Y - ancestor.Bounds.Y;
-        return new TranslateGeneralTransform(dx, dy);
+        return CreateTransform(this, ancestor, ancestor);
     }
 
     /// <summary>
     /// Returns a transform from this element's coordinate space to the specified descendant's coordinate space.
     /// </summary>
+    /// <exception cref="InvalidOperationException"><paramref name="descendant"/> is not a descendant of this element.</exception>
     public GeneralTransform TransformToDescendant(Element descendant)
     {
         ArgumentNullException.ThrowIfNull(descendant);
@@ -946,9 +1017,11 @@ public abstract partial class Element : MewObject
     }
 
     /// <summary>
-    /// Returns a transform from this element's coordinate space to the specified visual's coordinate space.
+    /// Returns a transform from this element's coordinate space to the specified visual's coordinate space,
+    /// including any transform an element between them applies to its children.
     /// Both elements must be in the same visual tree.
     /// </summary>
+    /// <exception cref="InvalidOperationException">The elements are not in the same visual tree.</exception>
     public GeneralTransform TransformToVisual(Element visual)
     {
         ArgumentNullException.ThrowIfNull(visual);
@@ -964,20 +1037,123 @@ public abstract partial class Element : MewObject
             throw new InvalidOperationException("The specified element is not in the same visual tree.");
         }
 
-        double dx = Bounds.X - visual.Bounds.X;
-        double dy = Bounds.Y - visual.Bounds.Y;
-        return new TranslateGeneralTransform(dx, dy);
+        return CreateTransform(this, visual, FindCommonAncestor(this, visual));
+    }
+
+    /// <summary>
+    /// Gets the transform this element applies to its children when drawing them, mapping window coordinates
+    /// before the transform to window coordinates after it; false when the children are drawn untransformed.
+    /// </summary>
+    protected virtual bool TryGetChildTransform(out System.Numerics.Matrix3x2 transform)
+    {
+        transform = System.Numerics.Matrix3x2.Identity;
+        return false;
+    }
+
+    /// <summary>The child transform as seen by the framework; same answer as <see cref="TryGetChildTransform"/>.</summary>
+    internal bool GetChildTransform(out System.Numerics.Matrix3x2 transform) => TryGetChildTransform(out transform);
+
+    private static GeneralTransform CreateTransform(Element source, Element target, Element common)
+    {
+        // Transforms above the common ancestor apply to both sides alike and cancel out.
+        var sourceChain = ComposeChildTransforms(source, common, includeCommon: ReferenceEquals(target, common));
+        var targetChain = ComposeChildTransforms(target, common, includeCommon: ReferenceEquals(source, common));
+        if (sourceChain == null && targetChain == null)
+        {
+            double dx = source.Bounds.X - target.Bounds.X;
+            double dy = source.Bounds.Y - target.Bounds.Y;
+            return new TranslateGeneralTransform(dx, dy);
+        }
+
+        var sourceToWindow = MatrixGeneralTransform.Translation(source.Bounds.X, source.Bounds.Y);
+        if (sourceChain != null)
+        {
+            sourceToWindow = sourceToWindow.Then(sourceChain);
+        }
+
+        var targetToWindow = MatrixGeneralTransform.Translation(target.Bounds.X, target.Bounds.Y);
+        if (targetChain != null)
+        {
+            targetToWindow = targetToWindow.Then(targetChain);
+        }
+
+        return sourceToWindow.Then(targetToWindow.Invert());
+    }
+
+    /// <summary>
+    /// The child transforms of the ancestors of <paramref name="element"/> up to <paramref name="common"/>, nearest
+    /// first, mapping window coordinates before them to window coordinates after them; null when none applies.
+    /// </summary>
+    internal static MatrixGeneralTransform? ComposeChildTransforms(Element element, Element common, bool includeCommon)
+    {
+        MatrixGeneralTransform? chain = null;
+        for (var current = element; !ReferenceEquals(current, common) && current.Parent != null; current = current.Parent)
+        {
+            var parent = current.Parent;
+            if ((includeCommon || !ReferenceEquals(parent, common)) && parent.TryGetChildTransform(out var matrix))
+            {
+                var step = MatrixGeneralTransform.FromMatrix(matrix);
+                if (chain == null)
+                {
+                    chain = step;
+                }
+                else
+                {
+                    chain = chain.Then(step);
+                }
+            }
+        }
+
+        return chain;
+    }
+
+    private static Element FindCommonAncestor(Element first, Element second)
+    {
+        int firstDepth = Depth(first);
+        int secondDepth = Depth(second);
+        var firstCursor = first;
+        var secondCursor = second;
+        for (; firstDepth > secondDepth; firstDepth--)
+        {
+            firstCursor = firstCursor.Parent!;
+        }
+
+        for (; secondDepth > firstDepth; secondDepth--)
+        {
+            secondCursor = secondCursor.Parent!;
+        }
+
+        while (!ReferenceEquals(firstCursor, secondCursor))
+        {
+            firstCursor = firstCursor.Parent!;
+            secondCursor = secondCursor.Parent!;
+        }
+
+        return firstCursor;
+    }
+
+    private static int Depth(Element element)
+    {
+        int depth = 0;
+        for (var current = element.Parent; current != null; current = current.Parent)
+        {
+            depth++;
+        }
+
+        return depth;
     }
 
     /// <summary>
     /// Converts a point in this element's coordinate space to the specified element's coordinate space.
     /// </summary>
+    /// <exception cref="InvalidOperationException">The elements are not in the same visual tree.</exception>
     public Point TranslatePoint(Point point, Element relativeTo)
         => TransformToVisual(relativeTo).Transform(point);
 
     /// <summary>
     /// Converts a rectangle in this element's coordinate space to the specified element's coordinate space.
     /// </summary>
+    /// <exception cref="InvalidOperationException">The elements are not in the same visual tree.</exception>
     public Rect TranslateRect(Rect rect, Element relativeTo)
         => TransformToVisual(relativeTo).TransformBounds(rect);
 
@@ -1114,6 +1290,10 @@ public abstract partial class Element : MewObject
             }
         });
     }
+
+    /// <summary>Gets the device pixel scale layout rounds to, or 0 when the window does not round layout.</summary>
+    internal double LayoutRoundingScale
+        => FindVisualRoot() is ILayoutRoundingHost host && host.UseLayoutRounding ? host.DpiScale : 0;
 
     private Size ApplyLayoutRounding(Size size)
     {

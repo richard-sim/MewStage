@@ -60,17 +60,6 @@ internal sealed class ColorPickerPopup : Control, IVisualTreeHost
         _scrollViewer.Arrange(inner);
     }
 
-    protected override void RenderSubtree(IGraphicsContext context)
-    {
-        _scrollViewer.Render(context);
-    }
-
-    internal override void WriteComposition(Rendering.Retained.CompositionPlanBuilder builder)
-    {
-        builder.Content(0);
-        builder.Child(_scrollViewer);
-    }
-
     protected override void OnRender(IGraphicsContext context)
     {
         base.OnRender(context);
@@ -382,7 +371,7 @@ internal sealed class ColorPickerPopup : Control, IVisualTreeHost
             BeginCapture();
             // Only a held capture delivers the release that ends the drag.
             _isDragging = IsMouseCaptured;
-            UpdateAlphaFromPosition(e.Position);
+            UpdateAlphaFromPosition(TransformFromRoot(e.Position));
             e.Handled = true;
         }
 
@@ -392,7 +381,7 @@ internal sealed class ColorPickerPopup : Control, IVisualTreeHost
             if (!_isDragging || !IsMouseCaptured || !e.LeftButton)
                 return;
 
-            UpdateAlphaFromPosition(e.Position);
+            UpdateAlphaFromPosition(TransformFromRoot(e.Position));
             e.Handled = true;
         }
 
@@ -764,7 +753,7 @@ internal sealed class ColorPickerPopup : Control, IVisualTreeHost
                 return;
 
             Focus();
-            var (px, py) = ToPixelPosition(e.Position);
+            var (px, py) = ToPixelPosition(TransformFromRoot(e.Position));
 
             if (HitTestHueRing(px, py))
             {
@@ -788,7 +777,7 @@ internal sealed class ColorPickerPopup : Control, IVisualTreeHost
             if (!IsEffectivelyEnabled || !IsMouseCaptured || !e.LeftButton)
                 return;
 
-            var (px, py) = ToPixelPosition(e.Position);
+            var (px, py) = ToPixelPosition(TransformFromRoot(e.Position));
 
             if (_isDraggingHue)
             {

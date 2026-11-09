@@ -78,7 +78,7 @@ public sealed partial class ToolBar
         {
             _anchor = anchor;
             anchor.IsOverflowOpen = true;
-            _popup.ShowAt(anchor, anchor.Bounds);
+            _popup.ShowAt(anchor, anchor.GetBoundsInRoot());
         }
 
         internal void Close() => _popup.Close();
@@ -117,7 +117,7 @@ public sealed partial class ToolBar
 
     /// <summary>
     /// The button a group or a band shows for what it could not fit. It reports <see cref="
-    /// VisualStateFlags.Active"/> while its popup is up, the same state a dropdown reports, so the face
+    /// VisualStateFlags.Active"/> while its popup is up, the same state a drop-down reports, so the face
     /// stays lit for as long as what it opened is on screen.
     /// </summary>
     internal sealed class ToolBarOverflowButton : Button

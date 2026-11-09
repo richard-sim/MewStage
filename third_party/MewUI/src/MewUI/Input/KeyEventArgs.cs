@@ -3,7 +3,7 @@ using Aprillz.MewUI.Platform;
 namespace Aprillz.MewUI;
 
 /// <summary>
-/// Modifier keys enumeration.
+/// Modifier keys that can be held during an input event.
 /// </summary>
 [Flags]
 public enum ModifierKeys
@@ -53,6 +53,28 @@ public class KeyEventArgs
     public bool IsRepeat { get; }
 
     /// <summary>
+    /// Gets the text the key types in the current keyboard layout with Shift, Caps Lock and the layout's third level
+    /// (AltGr, Option) applied, or null when it types nothing, starts a dead key, or the platform does not report it.
+    /// </summary>
+    /// <remarks>
+    /// Control, Meta and Alt on its own do not change the value: Ctrl+A gives "a". Where the third level is reached with
+    /// Ctrl and Alt together, that combination applies it. A key an input method takes for a composition may report no
+    /// value.
+    /// </remarks>
+    public string? KeySymbol { get; init; }
+
+    /// <summary>
+    /// Gets the text the key types in the current keyboard layout with only Shift and Caps Lock applied, or null when it
+    /// types nothing or the platform does not report it.
+    /// </summary>
+    /// <remarks>
+    /// A dead key gives its spacing character. Where an input method types its own script over a keyboard layout, this
+    /// is the layout's text. When <see cref="KeySymbol"/> is set and differs from this value, the key typed a third-level
+    /// character.
+    /// </remarks>
+    public string? BaseKeySymbol { get; init; }
+
+    /// <summary>
     /// Gets or sets whether the event has been handled.
     /// </summary>
     public bool Handled { get; set; }
@@ -72,6 +94,9 @@ public class KeyEventArgs
         IsRepeat = isRepeat;
     }
 
+    /// <summary>
+    /// Creates arguments for a key the platform could not map, with <see cref="MewUI.Key.None"/>.
+    /// </summary>
     public KeyEventArgs(int platformKey, ModifierKeys modifiers = ModifierKeys.None, bool isRepeat = false)
         : this(Key.None, platformKey, modifiers, isRepeat)
     {
@@ -93,7 +118,7 @@ public class KeyEventArgs
     public bool AltKey => (Modifiers & ModifierKeys.Alt) != 0;
 
     /// <summary>
-    /// Gets whether the Meta key is pressed (Cmd on macOS, Win on Windows).
+    /// Gets whether the Meta key is pressed (Cmd on macOS, Win on Windows, Super on Linux).
     /// </summary>
     public bool MetaKey => (Modifiers & ModifierKeys.Meta) != 0;
 
@@ -111,9 +136,12 @@ public class TextInputEventArgs
     private string _text;
 
     /// <summary>
-    /// The text being input. A subscriber may assign a replacement, which the control then inserts
-    /// in place of what arrived; newlines are normalized the same way as on construction.
+    /// Gets or sets the text being input; a subscriber may assign a replacement, which the control
+    /// inserts in place of what arrived.
     /// </summary>
+    /// <remarks>
+    /// Newlines in an assigned replacement are normalized the same way as on construction.
+    /// </remarks>
     public string Text
     {
         get => _text;

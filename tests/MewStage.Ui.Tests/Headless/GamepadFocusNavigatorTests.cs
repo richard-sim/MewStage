@@ -339,6 +339,41 @@ public sealed class GamepadFocusNavigatorTests
     }
 
     [Fact]
+    public void Engage_VerticalSlider_UpDownAdjustsValue_UpRaisesIt()
+    {
+        Slider slider = new Slider { Orientation = Orientation.Vertical }.Minimum(0).Maximum(10);
+        slider.Value = 5;
+        Button ok = new Button().Content(new Label().Text("OK"));
+        using var screen = new Screen(new StackPanel { Orientation = Orientation.Horizontal }.Children(slider, ok), 400, 200);
+        GamepadFocusNavigator nav = Seeded(screen.Window);
+        screen.Window.FocusManager.SetFocus(slider);
+        double start = slider.Value;
+
+        Assert.True(nav.Update(screen.Window, Press(GamepadButton.A)));
+        Assert.Equal(start, slider.Value, 6);
+
+        // Up raises the value (the thumb rises with it); the focus stays on the slider.
+        Assert.True(nav.Update(screen.Window, Stick(GamepadAxis.LeftY, -1f), dt: 0.0));
+        double raised = slider.Value;
+        Assert.True(raised > start, $"Up left a vertical slider at {raised} (from {start})");
+        Assert.Same(slider, screen.Window.FocusManager.FocusedElement);
+
+        // Down lowers it again.
+        nav.Update(screen.Window, Stick(GamepadAxis.LeftY, 0f), dt: 0.0);
+        Assert.True(nav.Update(screen.Window, Stick(GamepadAxis.LeftY, 1f), dt: 0.0));
+        Assert.True(slider.Value < raised, $"Down left a vertical slider at {slider.Value} (from {raised})");
+        Assert.Same(slider, screen.Window.FocusManager.FocusedElement);
+
+        // B disengages; Right now moves the focus to the button and leaves the value alone.
+        nav.Update(screen.Window, Stick(GamepadAxis.LeftY, 0f), dt: 0.0);
+        nav.Update(screen.Window, Press(GamepadButton.B));
+        double settled = slider.Value;
+        nav.Update(screen.Window, Stick(GamepadAxis.LeftX, 1f));
+        Assert.NotSame(slider, screen.Window.FocusManager.FocusedElement);
+        Assert.Equal(settled, slider.Value, 6);
+    }
+
+    [Fact]
     public void PlainButton_A_Activates_NotEngaged()
     {
         (Screen screen, Button a, _, _) = MakeRow();

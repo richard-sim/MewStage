@@ -7,9 +7,6 @@ namespace Aprillz.MewUI.Controls;
 /// </summary>
 public sealed partial class Border : Control, IVisualTreeHost, ILogicalTreeHost
 {
-    private const int BACKGROUND_SLOT = 0;
-    private const int BORDER_STROKE_SLOT = 1;
-
     static Border() { }
 
     private static readonly bool _defaultStyleRegistered =
@@ -46,6 +43,7 @@ public sealed partial class Border : Control, IVisualTreeHost, ILogicalTreeHost
             static (self, oldValue, newValue) => self.OnChildChanged(oldValue, newValue),
             validate: static (self, value) => self.ValidateLogicalChild(value, allowTransfer: true));
 
+    /// <summary>Gets or sets the child element.</summary>
     public UIElement? Child
     {
         get => GetValue(ChildProperty);
@@ -66,8 +64,8 @@ public sealed partial class Border : Control, IVisualTreeHost, ILogicalTreeHost
     }
 
     /// <summary>
-    /// Gets or sets the per-side border thickness. When set (non-zero), overrides the
-    /// uniform <see cref="Control.BorderThickness"/> inherited from Control.
+    /// Gets or sets the per-side border thickness, which when non-zero overrides the uniform
+    /// <see cref="Control.BorderThickness"/>.
     /// </summary>
     public Thickness NonUniformBorderThickness
     {
@@ -76,8 +74,8 @@ public sealed partial class Border : Control, IVisualTreeHost, ILogicalTreeHost
     }
 
     /// <summary>
-    /// Gets or sets the per-corner radius. When set (non-zero), overrides the
-    /// uniform <see cref="Control.CornerRadius"/> inherited from Control.
+    /// Gets or sets the per-corner radius, which when non-zero overrides the uniform
+    /// <see cref="Control.CornerRadius"/>.
     /// </summary>
     public CornerRadius NonUniformCornerRadius
     {
@@ -103,6 +101,10 @@ public sealed partial class Border : Control, IVisualTreeHost, ILogicalTreeHost
         }
     }
 
+    /// <summary>
+    /// Gets or sets whether the child is clipped to the border bounds, following the rounded
+    /// corners when <see cref="Control.CornerRadius"/> is set.
+    /// </summary>
     public bool ClipToBounds
     {
         get => GetValue(ClipToBoundsProperty);
@@ -142,7 +144,7 @@ public sealed partial class Border : Control, IVisualTreeHost, ILogicalTreeHost
 
         if (metrics.IsSimple)
         {
-            // Background only - border is drawn after subtree in RenderSubtree.
+            // Background only - the stroke is drawn over the child in OnRenderOverlay.
             if (bg.A == 0)
             {
                 return;
@@ -231,49 +233,49 @@ public sealed partial class Border : Control, IVisualTreeHost, ILogicalTreeHost
         }
     }
 
-    protected override void RenderSubtree(IGraphicsContext context)
+    protected override void OnRenderOverlay(IGraphicsContext context)
     {
         var metrics = CreateMetrics(Bounds);
-
-        if (Child != null)
-        {
-            if (ClipToBounds)
-            {
-                context.Save();
-                GetChildClip(in metrics, out var clipRect, out double radiusX, out double radiusY);
-                if (radiusX > 0 || radiusY > 0)
-                {
-                    context.SetClipRoundedRect(clipRect, radiusX, radiusY);
-                }
-                else
-                {
-                    context.SetClip(clipRect);
-                }
-
-                Child.Render(context);
-                context.Restore();
-            }
-            else
-            {
-                Child.Render(context);
-            }
-        }
-
         RenderBorderStroke(context, in metrics);
     }
 
-    private void GetChildClip(in BorderRenderMetrics metrics, out Rect clipRect, out double radiusX, out double radiusY)
+    protected override ChildClip? GetChildClip(UIElement child)
+    {
+        if (!ClipToBounds)
+        {
+            return null;
+        }
+
+        var metrics = CreateMetrics(Bounds);
+        ComputeChildClip(in metrics, out var clipRect, out double radiusX, out double radiusY);
+        return new ChildClip(clipRect, radiusX, radiusY);
+    }
+
+    private void ComputeChildClip(in BorderRenderMetrics metrics, out Rect clipRect, out double radiusX, out double radiusY)
     {
         if (metrics.IsSimple)
         {
             var borderThickness = metrics.UniformThickness;
-            clipRect = borderThickness > 0
-                ? new Rect(metrics.Bounds.X + borderThickness, metrics.Bounds.Y + borderThickness,
-                    Math.Max(0, metrics.Bounds.Width - borderThickness * 2),
-                    Math.Max(0, metrics.Bounds.Height - borderThickness * 2))
-                : metrics.Bounds;
+            if (borderThickness > 0 && BorderBrush.A > 0)
+            {
+                // The child stops at the stroke's centre line, where the background stops too. Clipped at the
+                // inner contour, its antialiased edge and the stroke's would fade over the same pixels and let
+                // the frame show through; the stroke is drawn after the child and covers its inner half.
+                double inset = borderThickness / 2;
+                clipRect = metrics.Bounds.Inflate(-inset, -inset);
+                radiusX = metrics.UniformRadius > 0 ? Math.Max(0, metrics.UniformRadius - inset) : 0;
+            }
+            else
+            {
+                clipRect = borderThickness > 0
+                    ? new Rect(metrics.Bounds.X + borderThickness, metrics.Bounds.Y + borderThickness,
+                        Math.Max(0, metrics.Bounds.Width - borderThickness * 2),
+                        Math.Max(0, metrics.Bounds.Height - borderThickness * 2))
+                    : metrics.Bounds;
+                radiusX = metrics.UniformRadius > 0 ? metrics.UniformInnerRadius : 0;
+            }
+
             clipRect = clipRect.Deflate(Padding);
-            radiusX = metrics.UniformRadius > 0 ? metrics.UniformInnerRadius : 0;
             radiusY = radiusX;
         }
         else
@@ -312,50 +314,6 @@ public sealed partial class Border : Control, IVisualTreeHost, ILogicalTreeHost
                 context.DrawRectangle(bounds, borderBrush, thickness, strokeInset: true);
             }
         }
-    }
-
-    internal override void WriteOwnContent(IGraphicsContext context, int slotIndex)
-    {
-        if (slotIndex == BORDER_STROKE_SLOT)
-        {
-            var metrics = CreateMetrics(Bounds);
-            RenderBorderStroke(context, in metrics);
-        }
-        else
-        {
-            OnRender(context);
-        }
-    }
-
-    internal override void WriteComposition(Rendering.Retained.CompositionPlanBuilder builder)
-    {
-        builder.Content(BACKGROUND_SLOT);
-
-        if (Child != null)
-        {
-            var metrics = CreateMetrics(Bounds);
-            if (ClipToBounds)
-            {
-                GetChildClip(in metrics, out var clipRect, out double radiusX, out double radiusY);
-                if (radiusX > 0 || radiusY > 0)
-                {
-                    builder.PushClipRoundedRect(clipRect, radiusX, radiusY);
-                }
-                else
-                {
-                    builder.PushClipRect(clipRect);
-                }
-
-                builder.Child(Child);
-                builder.Pop();
-            }
-            else
-            {
-                builder.Child(Child);
-            }
-        }
-
-        builder.Content(BORDER_STROKE_SLOT);
     }
 
     bool IVisualTreeHost.VisitChildren(Func<Element, bool> visitor)

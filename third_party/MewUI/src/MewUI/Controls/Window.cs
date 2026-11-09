@@ -18,9 +18,7 @@ public sealed class ClosingEventArgs
     private Action? _decisionResolved;
     private int _deferralsPending;
 
-    /// <summary>
-    /// Set to <c>true</c> to cancel the close operation.
-    /// </summary>
+    /// <summary>Gets or sets whether the close is cancelled.</summary>
     public bool Cancel { get; set; }
 
     /// <summary>
@@ -123,9 +121,42 @@ public partial class Window : ContentControl, ILayoutRoundingHost
     private ulong _layoutCompletedGeneration = ulong.MaxValue;
     private int _updatePassDepth;
 
+    // Elements that asked to be arranged while the content arranged; those still waiting get another round.
+    private readonly List<Element> _arrangeRequests = new();
+    private readonly HashSet<Element> _arrangeRequestsRetried = new();
+
     // A settled pass recorded its generation; an unsettled pass leaves it behind and posts
     // exactly one continuation.
     internal bool IsUpdatePassSettled => _updateGeneration == _layoutCompletedGeneration;
+
+    /// <summary>Gets whether an update pass is running.</summary>
+    internal bool IsInUpdatePass => _updatePassDepth > 0;
+
+    /// <summary>Gets whether the update pass is arranging the content.</summary>
+    internal bool IsArrangingContent { get; private set; }
+
+    /// <summary>Records an element that asked to be arranged while the content arranged.</summary>
+    internal void NoteArrangeRequest(Element element) => _arrangeRequests.Add(element);
+
+    /// <summary>Marks the noted elements still waiting to be arranged so the next round reaches them, and reports whether any did.</summary>
+    private bool SettleArrangeRequests()
+    {
+        bool waiting = false;
+        for (int index = 0; index < _arrangeRequests.Count; index++)
+        {
+            var element = _arrangeRequests[index];
+
+            // An element its host never arranges is retried once per layout, not every round.
+            if (element.IsArrangeDirty && ReferenceEquals(element.FindVisualRoot(), this) && _arrangeRequestsRetried.Add(element))
+            {
+                element.MarkArrangeDirtyThroughAncestors();
+                waiting = true;
+            }
+        }
+
+        _arrangeRequests.Clear();
+        return waiting;
+    }
 
     // Sizing transaction (spec -> desired -> requested -> applied): the fit branch submits a
     // target once per change and accepts whatever client size the platform applies.
@@ -506,13 +537,16 @@ public partial class Window : ContentControl, ILayoutRoundingHost
         }
     }
 
+    /// <summary>Gets the adorner layer of this window.</summary>
     public AdornerLayer AdornerLayer { get; }
 
     /// <summary>
-    /// Window-level overlay layer for elements positioned relative to the full window area.
-    /// Renders above adorners and in-surface popups. Native popups use separate OS surfaces.
-    /// Examples: toast, progress ring, dim background.
+    /// Gets the window-level overlay layer for elements positioned relative to the whole window,
+    /// rendered above adorners and in-surface popups.
     /// </summary>
+    /// <remarks>
+    /// Native popups use separate OS surfaces. Examples: toast, progress ring, dim background.
+    /// </remarks>
     public OverlayLayer OverlayLayer { get; }
 
     private readonly PopupManager _popupManager;
@@ -643,6 +677,7 @@ public partial class Window : ContentControl, ILayoutRoundingHost
     /// <summary>
     /// Gets or sets the window size configuration.
     /// </summary>
+    [FluentExcluded("Computed; use MoveTo and the size helpers")]
     public WindowSize WindowSize
     {
         get;
@@ -764,17 +799,19 @@ public partial class Window : ContentControl, ILayoutRoundingHost
     internal bool IsDialogWindow => _isDialogWindow;
 
     /// <summary>
-    /// Hint for platform backends to use alert-panel animation (e.g. macOS bounce).
+    /// Hint for platform backends to use their alert-panel animation, where they have one.
     /// </summary>
     internal bool IsAlertWindow { get; set; }
 
     /// <summary>
-    /// Gets or sets whether this is a floating tool/utility window: a thin native title bar with move and
-    /// close only (no minimize/maximize), excluded from the taskbar, floating above its <see cref="Owner"/>.
-    /// Must be set BEFORE <see cref="Show(Window?)"/> (the native window is built from it); setting it
-    /// after the window is shown throws. Ignored when <see cref="AllowsTransparency"/> is true (which removes
-    /// the chrome entirely).
+    /// Gets or sets whether this is a floating tool window: a thin native title bar with move and
+    /// close only, excluded from the taskbar, floating above its <see cref="Owner"/>.
     /// </summary>
+    /// <remarks>
+    /// Must be set before <see cref="Show(Window?)"/>, since the native window is built from it;
+    /// setting it after the window is shown throws. Ignored when <see cref="AllowsTransparency"/>
+    /// is true, which removes the chrome entirely.
+    /// </remarks>
     public bool IsToolWindow
     {
         get => _kind == WindowKind.Tool;
@@ -832,8 +869,8 @@ public partial class Window : ContentControl, ILayoutRoundingHost
     internal Color EffectiveOpaqueBackground => Background.A > 0 ? Background : Theme.Palette.WindowBackground;
 
     /// <summary>
-    /// Gets or sets the initial window placement behavior.
-    /// Must be set before <see cref="Show"/> is called.
+    /// Gets or sets the initial window placement behavior, which must be set before
+    /// <see cref="Show"/> is called.
     /// </summary>
     public WindowStartupLocation StartupLocation
     {
@@ -903,10 +940,9 @@ public partial class Window : ContentControl, ILayoutRoundingHost
     }
 
     /// <summary>
-    /// Gets or sets the height of the custom title bar area (in DIPs).
-    /// When set to a value greater than 0, the client area extends into the title bar,
-    /// hiding the default title bar while preserving the native frame (rounded corners, shadow).
-    /// Set to 0 to restore the default title bar.
+    /// Gets or sets the height in DIPs of the custom title bar area; a value above 0 extends the
+    /// client area into the title bar while keeping the native frame, and 0 restores the default
+    /// title bar.
     /// </summary>
     public double ExtendClientAreaTitleBarHeight
     {
@@ -916,9 +952,12 @@ public partial class Window : ContentControl, ILayoutRoundingHost
 
     /// <summary>
     /// Gets or sets whether the entire native non-client area (title bar and border) is removed.
-    /// Independent of <see cref="WindowState"/> and preserved across fullscreen transitions.
-    /// A borderless window has no native resize/move grips; use <see cref="DragMove"/> / <see cref="DragResize"/>.
     /// </summary>
+    /// <remarks>
+    /// Independent of <see cref="WindowState"/> and preserved across fullscreen transitions. A
+    /// borderless window has no native resize/move grips; use <see cref="DragMove"/> /
+    /// <see cref="DragResize"/>.
+    /// </remarks>
     public bool Borderless
     {
         get => GetValue(BorderlessProperty);
@@ -926,8 +965,7 @@ public partial class Window : ContentControl, ILayoutRoundingHost
     }
 
     /// <summary>
-    /// Gets or sets the platform-specific window options.
-    /// Setting options for a mismatched platform throws
+    /// Gets or sets the platform-specific window options; options for a mismatched platform throw
     /// <see cref="InvalidOperationException"/> at backend attach time.
     /// </summary>
     public PlatformWindowOptions? PlatformOptions
@@ -954,7 +992,8 @@ public partial class Window : ContentControl, ILayoutRoundingHost
     public Thickness NativeChromeButtonInset => _backend?.NativeChromeButtonInset ?? default;
 
     /// <summary>
-    /// Sets the native window border color (Win11+). Use null to restore default.
+    /// Sets the native window border color where the platform supports it (see
+    /// <see cref="WindowChromeCapabilities.NativeBorderColor"/>); null restores the default.
     /// </summary>
     public void SetWindowBorderColor(Color? color) => _backend?.SetWindowBorderColor(color);
 
@@ -1020,18 +1059,14 @@ public partial class Window : ContentControl, ILayoutRoundingHost
         set => SetValue(WindowStateProperty, value);
     }
 
-    /// <summary>
-    /// Gets or sets whether the minimize button is enabled. Default is true.
-    /// </summary>
+    /// <summary>Gets or sets whether the minimize button is enabled; the default is true.</summary>
     public bool CanMinimize
     {
         get => GetValue(CanMinimizeProperty);
         set => SetValue(CanMinimizeProperty, value);
     }
 
-    /// <summary>
-    /// Gets or sets whether the maximize button is enabled. Default is true.
-    /// </summary>
+    /// <summary>Gets or sets whether the maximize button is enabled; the default is true.</summary>
     public bool CanMaximize
     {
         get => GetValue(CanMaximizeProperty);
@@ -1039,8 +1074,8 @@ public partial class Window : ContentControl, ILayoutRoundingHost
     }
 
     /// <summary>
-    /// Gets or sets whether the window can be closed. Default is true.
-    /// When false, the close button in the native chrome is disabled.
+    /// Gets or sets whether the native close button is enabled; the default is true. Keyboard shortcuts and
+    /// <see cref="Close"/> still close the window; cancel <see cref="Closing"/> to keep it open.
     /// </summary>
     public bool CanClose
     {
@@ -1163,6 +1198,7 @@ public partial class Window : ContentControl, ILayoutRoundingHost
     /// <summary>
     /// Gets or sets the window position in screen coordinates (DIPs).
     /// </summary>
+    [FluentExcluded("Computed; use MoveTo and the size helpers")]
     public Point Position
     {
         get
@@ -1210,9 +1246,10 @@ public partial class Window : ContentControl, ILayoutRoundingHost
     }
 
     /// <summary>
-    /// Moves the window to a screen position given in device pixels.
+    /// Moves the window so its top-left corner is at the given screen position, in device pixels (origin top-left, Y down).
+    /// No-op before the window is shown or where the platform cannot move windows.
     /// </summary>
-    internal void MoveToPx(int leftPx, int topPx)
+    public void MoveToScreenPixels(int leftPx, int topPx)
     {
         if (_backend == null || Handle == 0)
         {
@@ -1258,7 +1295,8 @@ public partial class Window : ContentControl, ILayoutRoundingHost
     /// </summary>
     public IGraphicsFactory GraphicsFactory => Application.IsRunning ? Application.Current.GraphicsFactory : Application.DefaultGraphicsFactory;
 
-    internal IDispatcher? ApplicationDispatcher => Application.IsRunning ? Application.Current.Dispatcher : null;
+    // MewStage vendor patch multi-host/0003: falls back to the dispatcher an embedded host bound to this thread.
+    internal IDispatcher? ApplicationDispatcher => Application.ResolveDispatcher();
 
     #region Events
 
@@ -1268,7 +1306,8 @@ public partial class Window : ContentControl, ILayoutRoundingHost
     public event Action? Loaded;
 
     /// <summary>
-    /// Occurs when the window is about to close. Set <see cref="ClosingEventArgs.Cancel"/> to <c>true</c> to prevent closing.
+    /// Occurs when the window is about to close; set <see cref="ClosingEventArgs.Cancel"/> to true
+    /// to prevent it.
     /// </summary>
     public event Action<ClosingEventArgs>? Closing;
 
@@ -1323,47 +1362,49 @@ public partial class Window : ContentControl, ILayoutRoundingHost
     public RenderStats LastFrameStats { get; private set; }
 
     /// <summary>
-    /// Preview (tunneling) keyboard events for the whole window.
-    /// If <see cref="KeyEventArgs.Handled"/> is set, the focused element will not receive the event
-    /// and the text input that keystroke would produce is dropped.
+    /// Occurs before the focused element receives a key press; a handled event is not delivered to
+    /// it and the text input the keystroke would produce is dropped.
     /// </summary>
     public event Action<KeyEventArgs>? PreviewKeyDown;
 
     /// <summary>
-    /// Preview (tunneling) keyboard events for the whole window.
-    /// If <see cref="KeyEventArgs.Handled"/> is set, the focused element will not receive the event.
+    /// Occurs before the focused element receives a key release; a handled event is not delivered
+    /// to it.
     /// </summary>
     public event Action<KeyEventArgs>? PreviewKeyUp;
 
     /// <summary>
-    /// Preview (tunneling) text input for the whole window.
-    /// If <see cref="TextInputEventArgs.Handled"/> is set, the focused element will not receive the event.
+    /// Occurs before the focused element receives text input; a handled event is not delivered to
+    /// it.
     /// </summary>
     public event Action<TextInputEventArgs>? PreviewTextInput;
 
     /// <summary>
-    /// Preview (tunneling) text composition (IME pre-edit) start for the whole window.
-    /// If <see cref="TextCompositionEventArgs.Handled"/> is set, the focused element will not receive the event.
+    /// Occurs before the focused element receives the start of an IME composition; a handled event
+    /// is not delivered to it.
     /// </summary>
     public event Action<TextCompositionEventArgs>? PreviewTextCompositionStart;
 
     /// <summary>
-    /// Preview (tunneling) text composition (IME pre-edit) update for the whole window.
-    /// If <see cref="TextCompositionEventArgs.Handled"/> is set, the focused element will not receive the event.
+    /// Occurs before the focused element receives an IME composition update; a handled event is not
+    /// delivered to it.
     /// </summary>
     public event Action<TextCompositionEventArgs>? PreviewTextCompositionUpdate;
 
     /// <summary>
-    /// Preview (tunneling) text composition (IME pre-edit) end for the whole window.
-    /// If <see cref="TextCompositionEventArgs.Handled"/> is set, the focused element will not receive the event.
+    /// Occurs before the focused element receives the end of an IME composition; a handled event is
+    /// not delivered to it.
     /// </summary>
     public event Action<TextCompositionEventArgs>? PreviewTextCompositionEnd;
 
     /// <summary>
-    /// Raised before the framework processes a native platform message.
-    /// Set <see cref="NativeMessageEventArgs.Handled"/> to suppress default processing.
-    /// Cast the argument to the platform-specific subclass to access raw message data.
+    /// Raised before the framework processes a native platform message; set
+    /// <see cref="NativeMessageEventArgs.Handled"/> to suppress default processing.
     /// </summary>
+    /// <remarks>
+    /// Cast the argument to the platform-specific subclass to access raw message data.
+    /// </remarks>
+    [FluentExcluded("Low-level platform interop event")]
     public event Action<NativeMessageEventArgs>? NativeMessage;
 
     #endregion
@@ -1762,10 +1803,6 @@ public partial class Window : ContentControl, ILayoutRoundingHost
     }
 
     /// <summary>
-    /// Applies modal state and shows the window: marks it as a dialog, disables and parents to the owner,
-    /// inherits the owner icon, then shows and activates. Shared by <see cref="ShowDialog"/> and <see cref="ShowDialogAsync"/>.
-    /// </summary>
-    /// <summary>
     /// Host a modal dialog in its own OS window instead of the owner surface; a platform with a
     /// single surface sets it false and the dialog renders inside its owner.
     /// </summary>
@@ -1776,6 +1813,10 @@ public partial class Window : ContentControl, ILayoutRoundingHost
     /// <summary>The modal dialog living in this window's surface, if one is open.</summary>
     internal Window? ActiveInSurfaceDialog { get; private set; }
 
+    /// <summary>
+    /// Applies modal state and shows the window: marks it as a dialog, disables and parents to the owner,
+    /// inherits the owner icon, then shows and activates. Shared by <see cref="ShowDialog"/> and <see cref="ShowDialogAsync"/>.
+    /// </summary>
     private void BeginModal(Window? owner)
     {
         _isDialogWindow = true;
@@ -2089,10 +2130,6 @@ public partial class Window : ContentControl, ILayoutRoundingHost
             _backend.SetExtendClientAreaToTitleBar(ExtendClientAreaTitleBarHeight);
     }
 
-    /// <summary>
-    /// Queues <paramref name="element"/> for visual-state reconciliation at the next layout pass.
-    /// Called by <see cref="UIElement.InvalidateVisualState"/>.
-    /// </summary>
     /// <summary>Where the element was last drawn on this window's surface, or its layout box when the scene has no place for it.</summary>
     private Rect SurfaceBoundsOf(UIElement element)
     {
@@ -2106,6 +2143,10 @@ public partial class Window : ContentControl, ILayoutRoundingHost
         }
     }
 
+    /// <summary>
+    /// Queues <paramref name="element"/> for visual-state reconciliation at the next layout pass.
+    /// Called by <see cref="UIElement.InvalidateVisualState"/>.
+    /// </summary>
     internal void RegisterVisualStateDirty(UIElement element)
     {
         // Registrations while UpdateVisualStates is running are allowed: its indexed loop
@@ -2175,6 +2216,8 @@ public partial class Window : ContentControl, ILayoutRoundingHost
         finally
         {
             _updatePassDepth--;
+            _arrangeRequests.Clear();
+            _arrangeRequestsRetried.Clear();
         }
     }
 
@@ -2331,11 +2374,24 @@ public partial class Window : ContentControl, ILayoutRoundingHost
             {
                 // A hosted portal subtree is arranged at the owner's coordinates (HostedPortalOrigin);
                 // for regular windows the origin is zero and this is the plain client rect.
-                visualRoot.Arrange(new Rect(
-                    padding.Left + _hostedPortalOrigin.X,
-                    padding.Top + _hostedPortalOrigin.Y,
-                    contentSize.Width,
-                    contentSize.Height));
+                IsArrangingContent = true;
+                try
+                {
+                    visualRoot.Arrange(new Rect(
+                        padding.Left + _hostedPortalOrigin.X,
+                        padding.Top + _hostedPortalOrigin.Y,
+                        contentSize.Width,
+                        contentSize.Height));
+                }
+                finally
+                {
+                    IsArrangingContent = false;
+                }
+            }
+
+            if (SettleArrangeRequests())
+            {
+                _updateGeneration++;
             }
             if (profiling)
             {
@@ -2423,7 +2479,7 @@ public partial class Window : ContentControl, ILayoutRoundingHost
             // stays at (0,0,0,0). Use the client size rect when the adorned element is this window.
             var bounds = ReferenceEquals(adorned, this)
                 ? new Rect(0, 0, _clientSizeDip.Width, _clientSizeDip.Height)
-                : adorned.Bounds;
+                : adorned.GetBoundsInRoot();
             adorner.Measure(new Size(bounds.Width, bounds.Height));
             adorner.Arrange(bounds);
         }
@@ -2523,7 +2579,7 @@ public partial class Window : ContentControl, ILayoutRoundingHost
     public void Invalidate() => RequestRender();
 
     /// <summary>
-    /// Requests that the window be redrawn.
+    /// Invalidates the window's visuals so the next frame repaints them.
     /// </summary>
     public override void InvalidateVisual() => RequestRender();
 

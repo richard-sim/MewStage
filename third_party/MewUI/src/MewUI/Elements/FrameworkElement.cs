@@ -12,6 +12,7 @@ public abstract class FrameworkElement : UIElement, IDisposable
     private bool _hasArrangedSize;
     private StyleSheet? _styleSheet;
 
+    /// <summary>The theme this element resolves its metrics and palette from.</summary>
     protected static readonly MewProperty<Theme> ThemeProperty = MewProperty<Theme>.Register<FrameworkElement>(nameof(Theme), null!, MewPropertyOptions.AffectsRender);
 
     /// <summary>
@@ -52,39 +53,51 @@ public abstract class FrameworkElement : UIElement, IDisposable
 
     #region MewProperty Declarations
 
+    /// <summary>The explicit width in DIPs; NaN sizes to content.</summary>
     public static readonly MewProperty<double> WidthProperty =
         MewProperty<double>.Register<FrameworkElement>(nameof(Width), double.NaN, MewPropertyOptions.AffectsLayout);
 
+    /// <summary>The explicit height in DIPs; NaN sizes to content.</summary>
     public static readonly MewProperty<double> HeightProperty =
         MewProperty<double>.Register<FrameworkElement>(nameof(Height), double.NaN, MewPropertyOptions.AffectsLayout);
 
+    /// <summary>The minimum width in DIPs.</summary>
     public static readonly MewProperty<double> MinWidthProperty =
         MewProperty<double>.Register<FrameworkElement>(nameof(MinWidth), 0.0, MewPropertyOptions.AffectsLayout);
 
+    /// <summary>The minimum height in DIPs.</summary>
     public static readonly MewProperty<double> MinHeightProperty =
         MewProperty<double>.Register<FrameworkElement>(nameof(MinHeight), 0.0, MewPropertyOptions.AffectsLayout);
 
+    /// <summary>The maximum width in DIPs; infinity is no bound.</summary>
     public static readonly MewProperty<double> MaxWidthProperty =
         MewProperty<double>.Register<FrameworkElement>(nameof(MaxWidth), double.PositiveInfinity, MewPropertyOptions.AffectsLayout);
 
+    /// <summary>The maximum height in DIPs; infinity is no bound.</summary>
     public static readonly MewProperty<double> MaxHeightProperty =
         MewProperty<double>.Register<FrameworkElement>(nameof(MaxHeight), double.PositiveInfinity, MewPropertyOptions.AffectsLayout);
 
+    /// <summary>The outer margin in DIPs.</summary>
     public static readonly MewProperty<Thickness> MarginProperty =
         MewProperty<Thickness>.Register<FrameworkElement>(nameof(Margin), default, MewPropertyOptions.AffectsLayout);
 
+    /// <summary>The horizontal alignment within the parent; the default is <see cref="HorizontalAlignment.Stretch"/>.</summary>
     public static readonly MewProperty<HorizontalAlignment> HorizontalAlignmentProperty =
         MewProperty<HorizontalAlignment>.Register<FrameworkElement>(nameof(HorizontalAlignment), HorizontalAlignment.Stretch, MewPropertyOptions.AffectsLayout);
 
+    /// <summary>The vertical alignment within the parent; the default is <see cref="VerticalAlignment.Stretch"/>.</summary>
     public static readonly MewProperty<VerticalAlignment> VerticalAlignmentProperty =
         MewProperty<VerticalAlignment>.Register<FrameworkElement>(nameof(VerticalAlignment), VerticalAlignment.Stretch, MewPropertyOptions.AffectsLayout);
 
+    /// <summary>An arbitrary object value for custom use.</summary>
     public static readonly MewProperty<object?> TagProperty =
         MewProperty<object?>.Register<FrameworkElement>(nameof(Tag), null, MewPropertyOptions.None);
 
+    /// <summary>What to show when the pointer rests on this element, or null for nothing.</summary>
     public static readonly MewProperty<Element?> ToolTipProperty =
         MewProperty<Element?>.Register<FrameworkElement>(nameof(ToolTip), null, MewPropertyOptions.None);
 
+    /// <summary>The menu shown when the pointer is right-pressed over this element, or null for none.</summary>
     public static readonly MewProperty<ContextMenu?> ContextMenuProperty =
         MewProperty<ContextMenu?>.Register<FrameworkElement>(nameof(ContextMenu), null, MewPropertyOptions.None);
 
@@ -94,8 +107,11 @@ public abstract class FrameworkElement : UIElement, IDisposable
 
     /// <summary>
     /// Gets or sets what to show when the pointer rests on this element.
-    /// Use the <c>ToolTip(string)</c> extension method for simple text tooltips.
     /// </summary>
+    /// <remarks>
+    /// For simple text tooltips, use the <see cref="ControlExtensions.ToolTip{T}(T, string)"/>
+    /// extension.
+    /// </remarks>
     public Element? ToolTip
     {
         get => GetValue(ToolTipProperty);
@@ -168,9 +184,9 @@ public abstract class FrameworkElement : UIElement, IDisposable
     }
 
     /// <summary>
-    /// What to show when the pointer rests on this element, or <see langword="null"/> to show nothing.
-    /// Called each time a tooltip is about to appear, so an element that builds its content from something
-    /// that changes can build it here rather than keeping <see cref="ToolTip"/> in step.
+    /// Returns what to show when the pointer rests on this element, or <see langword="null"/> for nothing; called each
+    /// time a tooltip is about to appear, so content built from changing state is built here rather than kept in
+    /// step through <see cref="ToolTip"/>.
     /// </summary>
     protected virtual Element? ResolveToolTipContent() => ToolTip;
 
@@ -202,7 +218,8 @@ public abstract class FrameworkElement : UIElement, IDisposable
         }
         if (anchor.X == 0 && anchor.Y == 0 && Bounds.Width > 0 && Bounds.Height > 0)
         {
-            anchor = new Point(Bounds.X + Bounds.Width / 2, Bounds.Bottom);
+            var drawnBounds = GetBoundsInRoot();
+            anchor = new Point(drawnBounds.X + drawnBounds.Width / 2, drawnBounds.Bottom);
         }
 
         var region = window.GetPopupPlacementRegion(new Rect(anchor.X, anchor.Y, 0, 0));
@@ -243,27 +260,30 @@ public abstract class FrameworkElement : UIElement, IDisposable
     /// </summary>
     public event Action<SizeChangedEventArgs>? SizeChanged;
 
-    /// <summary>
-    /// Gets or sets the explicit width. Use double.NaN for automatic sizing.
-    /// </summary>
+    /// <summary>Gets or sets the explicit width; <see cref="double.NaN"/> means automatic sizing.</summary>
     public double Width
     {
         get => GetValue(WidthProperty);
         set => SetValue(WidthProperty, value);
     }
 
-    /// <summary>
-    /// Gets or sets the explicit height. Use double.NaN for automatic sizing.
-    /// </summary>
+    /// <summary>Gets or sets the explicit height; <see cref="double.NaN"/> means automatic sizing.</summary>
     public double Height
     {
         get => GetValue(HeightProperty);
         set => SetValue(HeightProperty, value);
     }
 
+    /// <summary>Width that measure and arrange honor; NaN sizes to content.</summary>
+    internal virtual double LayoutWidth => Width;
+
+    /// <summary>Height that measure and arrange honor; NaN sizes to content.</summary>
+    internal virtual double LayoutHeight => Height;
+
     /// <summary>
-    /// Gets or sets the minimum width.
+    /// Gets or sets the minimum width in DIPs.
     /// </summary>
+    /// <exception cref="ArgumentOutOfRangeException">The value is negative.</exception>
     public double MinWidth
     {
         get => GetValue(MinWidthProperty);
@@ -276,8 +296,9 @@ public abstract class FrameworkElement : UIElement, IDisposable
     }
 
     /// <summary>
-    /// Gets or sets the minimum height.
+    /// Gets or sets the minimum height in DIPs.
     /// </summary>
+    /// <exception cref="ArgumentOutOfRangeException">The value is negative.</exception>
     public double MinHeight
     {
         get => GetValue(MinHeightProperty);
@@ -290,8 +311,9 @@ public abstract class FrameworkElement : UIElement, IDisposable
     }
 
     /// <summary>
-    /// Gets or sets the maximum width.
+    /// Gets or sets the maximum width in DIPs; the default is no bound.
     /// </summary>
+    /// <exception cref="ArgumentOutOfRangeException">The value is negative.</exception>
     public double MaxWidth
     {
         get => GetValue(MaxWidthProperty);
@@ -304,8 +326,9 @@ public abstract class FrameworkElement : UIElement, IDisposable
     }
 
     /// <summary>
-    /// Gets or sets the maximum height.
+    /// Gets or sets the maximum height in DIPs; the default is no bound.
     /// </summary>
+    /// <exception cref="ArgumentOutOfRangeException">The value is negative.</exception>
     public double MaxHeight
     {
         get => GetValue(MaxHeightProperty);
@@ -354,21 +377,24 @@ public abstract class FrameworkElement : UIElement, IDisposable
     }
 
     /// <summary>
-    /// Gets the actual width after layout.
+    /// Gets the width from the last arrange pass, in DIPs.
     /// </summary>
     public double ActualWidth => Bounds.Width;
 
     /// <summary>
-    /// Gets the actual height after layout.
+    /// Gets the height from the last arrange pass, in DIPs.
     /// </summary>
     public double ActualHeight => Bounds.Height;
 
     /// <summary>
-    /// Gets the current DPI value.
+    /// Gets the DPI of the window hosting this element, or the system DPI when detached.
     /// </summary>
     /// <returns>The DPI value.</returns>
     public uint GetDpi() => GetDpiCached();
 
+    /// <summary>
+    /// Gets the theme in effect for this element.
+    /// </summary>
     protected Theme Theme => ThemeInternal;
 
     internal Theme ThemeInternal
@@ -396,6 +422,9 @@ public abstract class FrameworkElement : UIElement, IDisposable
         set => SetValue(ThemeProperty, value);
     }
 
+    /// <summary>
+    /// Hides the tooltip, releases bindings and calls <see cref="OnDispose"/>; later calls do nothing.
+    /// </summary>
     public void Dispose()
     {
         if (_disposed)
@@ -495,8 +524,8 @@ public abstract class FrameworkElement : UIElement, IDisposable
     }
 
     /// <summary>
-    /// Gets the process-wide graphics factory. Safe to call off the UI thread: unlike a
-    /// <see cref="Element.FindVisualRoot"/> lookup, it never touches the (UI-thread-only) Parent chain.
+    /// Gets the process-wide graphics factory; safe off the UI thread, since unlike a
+    /// <see cref="Element.FindVisualRoot"/> lookup it never reads the parent chain.
     /// </summary>
     /// <returns>The graphics factory.</returns>
     protected IGraphicsFactory GetGraphicsFactory()
@@ -592,25 +621,29 @@ public abstract class FrameworkElement : UIElement, IDisposable
 
     protected override Rect GetArrangedBounds(Rect finalRect)
     {
-        var innerSlot = finalRect.Deflate(Margin);
+        var limits = GetLayoutLimits();
+        var innerSlot = finalRect.Deflate(limits.Margin);
 
         double availableWidth = Math.Max(0, innerSlot.Width);
         double availableHeight = Math.Max(0, innerSlot.Height);
 
-        // If we have explicit size, use it; otherwise use desired (excluding margin)
-        double arrangeWidth = !double.IsNaN(Width) ? Width : DesiredSize.Width - Margin.Left - Margin.Right;
-        double arrangeHeight = !double.IsNaN(Height) ? Height : DesiredSize.Height - Margin.Top - Margin.Bottom;
+        double layoutWidth = limits.Width;
+        double layoutHeight = limits.Height;
 
-        arrangeWidth = Math.Clamp(arrangeWidth, MinWidth, MaxWidth);
-        arrangeHeight = Math.Clamp(arrangeHeight, MinHeight, MaxHeight);
+        // If we have explicit size, use it; otherwise use desired (excluding margin)
+        double arrangeWidth = !double.IsNaN(layoutWidth) ? layoutWidth : DesiredSize.Width - limits.Margin.HorizontalThickness;
+        double arrangeHeight = !double.IsNaN(layoutHeight) ? layoutHeight : DesiredSize.Height - limits.Margin.VerticalThickness;
+
+        arrangeWidth = Math.Clamp(arrangeWidth, limits.MinWidth, limits.MaxWidth);
+        arrangeHeight = Math.Clamp(arrangeHeight, limits.MinHeight, limits.MaxHeight);
 
         // Auto-sized elements stretch to fill the slot. Otherwise preserve the explicit or
         // desired size after min/max constraints, even when it exceeds the available slot.
-        double width = (HorizontalAlignment == HorizontalAlignment.Stretch && double.IsNaN(Width))
+        double width = (HorizontalAlignment == HorizontalAlignment.Stretch && double.IsNaN(layoutWidth))
             ? availableWidth
             : arrangeWidth;
 
-        double height = (VerticalAlignment == VerticalAlignment.Stretch && double.IsNaN(Height))
+        double height = (VerticalAlignment == VerticalAlignment.Stretch && double.IsNaN(layoutHeight))
             ? availableHeight
             : arrangeHeight;
 
@@ -639,26 +672,69 @@ public abstract class FrameworkElement : UIElement, IDisposable
 
     protected override Size MeasureOverride(Size availableSize)
     {
+        var limits = GetLayoutLimits();
+
         // Available content space, after margin (used when Width/Height is auto).
-        var availableWidth = Math.Max(0, availableSize.Width - Margin.HorizontalThickness);
-        var availableHeight = Math.Max(0, availableSize.Height - Margin.VerticalThickness);
+        var availableWidth = Math.Max(0, availableSize.Width - limits.Margin.HorizontalThickness);
+        var availableHeight = Math.Max(0, availableSize.Height - limits.Margin.VerticalThickness);
+
+        double layoutWidth = limits.Width;
+        double layoutHeight = limits.Height;
 
         // Measure content with explicit Width/Height when set; otherwise use the available
         // content size. Clamp both cases to [Min, Max] so wrapped content respects MaxWidth.
-        var constrainedWidth = Math.Clamp(double.IsNaN(Width) ? availableWidth : Width, MinWidth, MaxWidth);
-        var constrainedHeight = Math.Clamp(double.IsNaN(Height) ? availableHeight : Height, MinHeight, MaxHeight);
+        var constrainedWidth = Math.Clamp(double.IsNaN(layoutWidth) ? availableWidth : layoutWidth, limits.MinWidth, limits.MaxWidth);
+        var constrainedHeight = Math.Clamp(double.IsNaN(layoutHeight) ? availableHeight : layoutHeight, limits.MinHeight, limits.MaxHeight);
 
-        var measured = MeasureContent(new Size(constrainedWidth, constrainedHeight));
+        var measured = MeasureContent(new Size(limits.Round(constrainedWidth), limits.Round(constrainedHeight)));
 
         // Desired size honors explicit Width/Height when set (else the measured size), clamped, plus margin.
-        var finalWidth = Math.Clamp(double.IsNaN(Width) ? measured.Width : Width, MinWidth, MaxWidth);
-        var finalHeight = Math.Clamp(double.IsNaN(Height) ? measured.Height : Height, MinHeight, MaxHeight);
+        var finalWidth = Math.Clamp(double.IsNaN(layoutWidth) ? measured.Width : layoutWidth, limits.MinWidth, limits.MaxWidth);
+        var finalHeight = Math.Clamp(double.IsNaN(layoutHeight) ? measured.Height : layoutHeight, limits.MinHeight, limits.MaxHeight);
 
-        return new Size(finalWidth + Margin.HorizontalThickness, finalHeight + Margin.VerticalThickness);
+        return new Size(
+            limits.Round(finalWidth) + limits.Margin.HorizontalThickness,
+            limits.Round(finalHeight) + limits.Margin.VerticalThickness);
+    }
+
+    /// <summary>Returns the margin, size and limits layout uses, on whole device pixels when the window rounds layout.</summary>
+    private LayoutLimits GetLayoutLimits()
+    {
+        // As in WPF, each is rounded on its own, so a box is a whole number of pixels and snapping its edges keeps its size.
+        double scale = LayoutRoundingScale;
+        var margin = Margin;
+        if (scale > 0)
+        {
+            margin = new Thickness(
+                LayoutRounding.RoundToPixel(margin.Left, scale),
+                LayoutRounding.RoundToPixel(margin.Top, scale),
+                LayoutRounding.RoundToPixel(margin.Right, scale),
+                LayoutRounding.RoundToPixel(margin.Bottom, scale));
+        }
+
+        var limits = new LayoutLimits(scale, margin, LayoutWidth, LayoutHeight, MinWidth, MaxWidth, MinHeight, MaxHeight);
+        return limits with
+        {
+            Width = limits.Round(limits.Width),
+            Height = limits.Round(limits.Height),
+            MinWidth = limits.Round(limits.MinWidth),
+            MaxWidth = limits.Round(limits.MaxWidth),
+            MinHeight = limits.Round(limits.MinHeight),
+            MaxHeight = limits.Round(limits.MaxHeight),
+        };
+    }
+
+    /// <summary>The margin, explicit size and limits one layout pass reads.</summary>
+    private readonly record struct LayoutLimits(
+        double Scale, Thickness Margin, double Width, double Height,
+        double MinWidth, double MaxWidth, double MinHeight, double MaxHeight)
+    {
+        /// <summary>Rounds a length to a whole device pixel when the window rounds layout; NaN and infinity pass through.</summary>
+        public double Round(double value) => Scale > 0 ? LayoutRounding.RoundToPixel(value, Scale) : value;
     }
 
     /// <summary>
-    /// Measures the content. Override in derived classes.
+    /// Measures the content within the available size, after margin and explicit size constraints.
     /// </summary>
     protected virtual Size MeasureContent(Size availableSize) => Size.Empty;
 
@@ -669,7 +745,7 @@ public abstract class FrameworkElement : UIElement, IDisposable
     }
 
     /// <summary>
-    /// Arranges the content. Override in derived classes.
+    /// Arranges the content within the final bounds.
     /// </summary>
     protected virtual void ArrangeContent(Rect bounds)
     { }

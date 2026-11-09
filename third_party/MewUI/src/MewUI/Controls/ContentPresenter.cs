@@ -1,5 +1,3 @@
-using Aprillz.MewUI.Rendering;
-
 namespace Aprillz.MewUI.Controls;
 
 /// <summary>
@@ -12,10 +10,13 @@ public sealed class ContentPresenter : FrameworkElement, IVisualTreeHost
     private MewProperty<Element?>? _contentSource;
 
     /// <summary>
-    /// Gets or sets which slot of the templated parent to display. Leaving it unset projects the
-    /// templated parent's own display slot; set it to another element-typed slot (e.g. Header)
-    /// inside the template build.
+    /// Gets or sets which slot of the templated parent to display; unset projects the parent's own
+    /// display slot.
     /// </summary>
+    /// <remarks>
+    /// Set it to another element-typed slot (e.g. Header) inside the template build.
+    /// </remarks>
+    [FluentExcluded("Template wiring")]
     public MewProperty<Element?> ContentSource
     {
         get => _contentSource ?? ContentControl.ContentProperty;
@@ -105,18 +106,6 @@ public sealed class ContentPresenter : FrameworkElement, IVisualTreeHost
     {
         var projected = ActiveProjection;
         projected?.Arrange(bounds);
-    }
-
-    protected override void RenderSubtree(IGraphicsContext context)
-    {
-        var projected = ActiveProjection;
-        projected?.Render(context);
-    }
-
-    internal override void WriteComposition(Rendering.Retained.CompositionPlanBuilder builder)
-    {
-        builder.Content(0);
-        builder.Child(ActiveProjection);
     }
 
     bool IVisualTreeHost.VisitChildren(Func<Element, bool> visitor)

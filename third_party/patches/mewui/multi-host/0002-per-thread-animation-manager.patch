@@ -5,10 +5,70 @@ transitions and paid their allocations. The manager is now per UI thread ([Threa
 the manager it registered with until it stops, so Stop / Pause / Resume / completion reach the right one. One UI
 thread per process (MewUI's own platform hosts) behaves exactly as before. Applies after multi-host/0001.
 
+--- a/Animation/AnimationClock.cs
++++ b/Animation/AnimationClock.cs
+@@ -115,6 +115,10 @@
+         return owner.ResolveInputHostWindow();
+     }
+ 
++    // The manager this clock registered with (MewStage vendor patch multi-host/0002); the calling thread's until the first Start.
++    private AnimationManager? _manager;
++    private AnimationManager Manager => _manager ?? AnimationManager.Instance;
++
+     /// <summary>
+     /// Starts the animation from the beginning; a running clock restarts its timing.
+     /// </summary>
+@@ -136,7 +140,9 @@
+         // the render loop in Continuous mode forever.
+         if (!wasRunning)
+         {
+-            AnimationManager.Instance.Register(this);
++            // The starting thread's manager owns the clock until it stops (MewStage vendor patch multi-host/0002: managers are per thread).
++            _manager = AnimationManager.Instance;
++            _manager.Register(this);
+         }
+     }
+ 
+@@ -152,7 +158,7 @@
+ 
+         _isRunning = false;
+         _isPaused = false;
+-        AnimationManager.Instance.Unregister(this);
++        Manager.Unregister(this);
+     }
+ 
+     /// <summary>
+@@ -167,7 +173,7 @@
+ 
+         _isPaused = true;
+         _pauseTimestamp = Stopwatch.GetTimestamp();
+-        AnimationManager.Instance.OnPauseStateChanged();
++        Manager.OnPauseStateChanged();
+     }
+ 
+     /// <summary>
+@@ -182,7 +188,7 @@
+ 
+         _isPaused = false;
+         _pauseAccumulated += Stopwatch.GetTimestamp() - _pauseTimestamp;
+-        AnimationManager.Instance.OnPauseStateChanged();
++        Manager.OnPauseStateChanged();
+     }
+ 
+     /// <summary>
+@@ -224,7 +230,7 @@
+                 _progress = EasingFunction(directed);
+ 
+                 _isRunning = false;
+-                AnimationManager.Instance.Unregister(this);
++                Manager.Unregister(this);
+ 
+                 TickCallback?.Invoke(_progress);
+                 CompletedCallback?.Invoke();
 --- a/Animation/AnimationManager.cs
 +++ b/Animation/AnimationManager.cs
-@@ -12,7 +12,7 @@
- /// </summary>
+@@ -13,7 +13,7 @@
+ /// </remarks>
  public sealed class AnimationManager
  {
 -    private static AnimationManager? _instance;
@@ -16,7 +76,7 @@ thread per process (MewUI's own platform hosts) behaves exactly as before. Appli
  
      // Clocks start/stop from any UI thread (per-window render loops, tests), so every
      // list mutation and the update sweep run under _sync. Same-thread reentrancy from
-@@ -41,22 +41,11 @@
+@@ -42,22 +42,11 @@
      internal AnimationManager() { }
  
      /// <summary>
@@ -42,7 +102,7 @@ thread per process (MewUI's own platform hosts) behaves exactly as before. Appli
 +    internal static AnimationManager Instance => _instance ??= new AnimationManager();
  
      /// <summary>
-     /// Gets the number of currently active animations.
+     /// Gets the number of registered clocks, running or paused.
 @@ -307,7 +296,7 @@
      }
  
@@ -52,63 +112,3 @@ thread per process (MewUI's own platform hosts) behaves exactly as before. Appli
      /// </summary>
      internal static void Reset()
      {
---- a/Animation/AnimationClock.cs
-+++ b/Animation/AnimationClock.cs
-@@ -114,6 +114,10 @@
-         return owner.ResolveInputHostWindow();
-     }
- 
-+    // The manager this clock registered with (MewStage vendor patch multi-host/0002); the calling thread's until the first Start.
-+    private AnimationManager? _manager;
-+    private AnimationManager Manager => _manager ?? AnimationManager.Instance;
-+
-     /// <summary>
-     /// Starts the animation from the beginning.
-     /// </summary>
-@@ -135,7 +139,9 @@
-         // the render loop in Continuous mode forever.
-         if (!wasRunning)
-         {
--            AnimationManager.Instance.Register(this);
-+            // The starting thread's manager owns the clock until it stops (MewStage vendor patch multi-host/0002: managers are per thread).
-+            _manager = AnimationManager.Instance;
-+            _manager.Register(this);
-         }
-     }
- 
-@@ -151,7 +157,7 @@
- 
-         _isRunning = false;
-         _isPaused = false;
--        AnimationManager.Instance.Unregister(this);
-+        Manager.Unregister(this);
-     }
- 
-     /// <summary>
-@@ -166,7 +172,7 @@
- 
-         _isPaused = true;
-         _pauseTimestamp = Stopwatch.GetTimestamp();
--        AnimationManager.Instance.OnPauseStateChanged();
-+        Manager.OnPauseStateChanged();
-     }
- 
-     /// <summary>
-@@ -181,7 +187,7 @@
- 
-         _isPaused = false;
-         _pauseAccumulated += Stopwatch.GetTimestamp() - _pauseTimestamp;
--        AnimationManager.Instance.OnPauseStateChanged();
-+        Manager.OnPauseStateChanged();
-     }
- 
-     /// <summary>
-@@ -223,7 +229,7 @@
-                 _progress = EasingFunction(directed);
- 
-                 _isRunning = false;
--                AnimationManager.Instance.Unregister(this);
-+                Manager.Unregister(this);
- 
-                 TickCallback?.Invoke(_progress);
-                 CompletedCallback?.Invoke();

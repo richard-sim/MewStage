@@ -3,25 +3,26 @@ using System.Collections.Concurrent;
 namespace Aprillz.MewUI.Resources;
 
 /// <summary>
-/// Global registry mapping (familyName) → the cached files of that family's faces.
+/// Global registry mapping a family name to the font files registered under it, one per weight and slant.
 /// Populated by <see cref="FontResources.Register"/> and queried by each rendering backend's CreateFont.
 /// </summary>
-/// <remarks>
-/// MewStage vendor patch text/0003: a family may have several faces (Regular, Bold Italic, ...), each registered from its own
-/// file under the same family name. The registry keeps every face with the weight and style its file declares
-/// (OpenTypeFaceStyle) and picks one for a requested weight and style the way CSS font matching does; it used to keep
-/// only the last file registered under a name, so every weight and style of a family drew with that one face.
-/// </remarks>
 internal static class FontRegistry
 {
-    internal readonly record struct ResolvedFont(string FamilyName, string FilePath);
+    /// <summary>One registered font file and the weight and slant it declares.</summary>
+    internal readonly record struct RegisteredFace(string FilePath, int Weight, bool IsItalic);
 
-    private readonly record struct Face(string FilePath, int Weight, bool Italic);
+    /// <summary>A registered family and its faces, in registration order.</summary>
+    internal readonly record struct ResolvedFont(string FamilyName, RegisteredFace[] Faces)
+    {
+        /// <summary>Every file of the family, for backends that build a collection and match faces themselves.</summary>
+        public IEnumerable<string> FilePaths => Faces.Select(face => face.FilePath);
 
-    // Key: family name (case-insensitive)
-    // Value: the family's faces, in registration order (replaced whole, so a reader never sees a list being built)
-    private static readonly ConcurrentDictionary<string, Face[]> _map = new(StringComparer.OrdinalIgnoreCase);
-    private static readonly object _gate = new();
+        /// <summary>The face that draws <paramref name="weight"/> and <paramref name="italic"/>, matched the way CSS matches a family's faces.</summary>
+        public RegisteredFace SelectFace(FontWeight weight, bool italic) => FontRegistry.SelectFace(Faces, (int)weight, italic);
+    }
+
+    // Key: family name (case-insensitive). A changed family gets a new array, so a cache built from one can tell it is stale.
+    private static readonly ConcurrentDictionary<string, RegisteredFace[]> _families = new(StringComparer.OrdinalIgnoreCase);
 
     private static int _version;
 
@@ -29,90 +30,108 @@ internal static class FontRegistry
     internal static int Version => Volatile.Read(ref _version);
 
     /// <summary>
-    /// Registers a font file as a face of <paramref name="familyName"/>. The face's weight and style are read from
-    /// the file; registering the same file again changes nothing.
+    /// Adds a font file to a family, reading its weight and slant from the file. Registering the same file again changes nothing.
     /// </summary>
     internal static void Register(string familyName, string filePath)
     {
         if (string.IsNullOrWhiteSpace(familyName) || string.IsNullOrWhiteSpace(filePath))
             return;
 
-        var style = OpenTypeFaceStyle.Read(filePath);
-        var face = new Face(filePath, style.Weight, style.Italic);
-        lock (_gate)
+        OpenTypeFaceStyle.TryRead(filePath, out int weight, out bool italic);
+        Register(familyName, new RegisteredFace(filePath, weight, italic));
+    }
+
+    /// <summary>Adds a face whose weight and slant are already known.</summary>
+    internal static void Register(string familyName, RegisteredFace face)
+    {
+        bool changed = false;
+        _families.AddOrUpdate(
+            familyName,
+            _ =>
+            {
+                changed = true;
+                return [face];
+            },
+            (_, faces) =>
+            {
+                if (faces.Any(existing => string.Equals(existing.FilePath, face.FilePath, StringComparison.OrdinalIgnoreCase)))
+                {
+                    changed = false;
+                    return faces;
+                }
+
+                changed = true;
+                return [.. faces, face];
+            });
+
+        if (changed)
         {
-            if (_map.TryGetValue(familyName, out var faces))
-            {
-                if (Array.Exists(faces, f => string.Equals(f.FilePath, filePath, StringComparison.OrdinalIgnoreCase)))
-                    return;
-                _map[familyName] = [.. faces, face];
-            }
-            else
-            {
-                _map[familyName] = [face];
-            }
+            Interlocked.Increment(ref _version);
         }
-        Interlocked.Increment(ref _version);
+    }
+
+    /// <summary>Removes a font file from every family that holds it, dropping families left empty.</summary>
+    internal static void Unregister(string filePath)
+    {
+        bool changed = false;
+        foreach (var (family, faces) in _families)
+        {
+            if (!faces.Any(face => string.Equals(face.FilePath, filePath, StringComparison.OrdinalIgnoreCase)))
+            {
+                continue;
+            }
+
+            var remaining = faces.Where(face => !string.Equals(face.FilePath, filePath, StringComparison.OrdinalIgnoreCase)).ToArray();
+            bool updated = remaining.Length == 0
+                ? _families.TryRemove(new KeyValuePair<string, RegisteredFace[]>(family, faces))
+                : _families.TryUpdate(family, remaining, faces);
+            changed |= updated;
+        }
+
+        if (changed)
+        {
+            Interlocked.Increment(ref _version);
+        }
     }
 
     /// <summary>
-    /// Resolves a family name to a registered font file: the family's regular face (weight 400, upright), or the face
-    /// nearest to it. Returns null if no registered font matches.
+    /// Resolves a family name to its registered faces.
+    /// Returns null if no registered font matches.
     /// </summary>
-    internal static ResolvedFont? Resolve(string family) => Resolve(family, FontWeight.Normal, italic: false);
-
-    /// <summary>
-    /// Resolves a family name, weight and style to the registered face CSS font matching would pick (CSS Fonts 4
-    /// §5.2): the requested style first (italic, else upright), then the weight - for 400 to 500 the weights up to 500
-    /// ascending, then the lighter ones descending, then the heavier ones; below 400 the lighter ones descending, then
-    /// the heavier; above 500 the heavier ones ascending, then the lighter. Returns null if no registered font matches.
-    /// </summary>
-    internal static ResolvedFont? Resolve(string family, FontWeight weight, bool italic)
+    internal static ResolvedFont? Resolve(string family)
     {
-        if (string.IsNullOrWhiteSpace(family) || !_map.TryGetValue(family, out var faces) || faces.Length == 0)
+        if (string.IsNullOrWhiteSpace(family))
             return null;
 
-        var styled = Array.FindAll(faces, f => f.Italic == italic);
-        if (styled.Length == 0)
-            styled = faces;
+        if (_families.TryGetValue(family, out var faces))
+            return new ResolvedFont(family, faces);
 
-        int want = (int)weight;
-        Face best = styled[0];
-        long bestRank = long.MaxValue;
-        foreach (var f in styled)
-        {
-            long rank = WeightRank(want, f.Weight);
-            if (rank < bestRank)
-            {
-                bestRank = rank;
-                best = f;
-            }
-        }
-        return new ResolvedFont(family, best.FilePath);
+        return null;
     }
 
-    /// <summary>Every file registered under <paramref name="family"/> (empty when none is).</summary>
-    internal static IReadOnlyList<string> ResolveFiles(string family)
+    private static RegisteredFace SelectFace(RegisteredFace[] faces, int weight, bool italic)
     {
-        if (string.IsNullOrWhiteSpace(family) || !_map.TryGetValue(family, out var faces))
-            return [];
-        return Array.ConvertAll(faces, f => f.FilePath);
-    }
+        // CSS Fonts 4, font matching: slant narrows the set first, then weight picks within it.
+        var sameSlant = faces.Where(face => face.IsItalic == italic).ToArray();
+        var candidates = sameSlant.Length > 0 ? sameSlant : faces;
 
-    // The CSS weight preference order as a rank (lower is preferred); distances fit in 1000, so a group offset of
-    // 10000 keeps the groups apart.
-    private static long WeightRank(int want, int have)
-    {
-        const long Second = 10_000, Third = 20_000;
-        int d = Math.Abs(have - want);
-        if (want >= 400 && want <= 500)
+        var exact = candidates.Where(face => face.Weight == weight).ToArray();
+        if (exact.Length > 0)
         {
-            if (have >= want && have <= 500) return d;
-            if (have < want) return Second + d;
-            return Third + d;
+            return exact[0];
         }
-        if (want < 400)
-            return have <= want ? d : Second + d;
-        return have >= want ? d : Second + d;
+
+        var lighter = candidates.Where(face => face.Weight < weight).OrderByDescending(face => face.Weight);
+        var heavier = candidates.Where(face => face.Weight > weight).OrderBy(face => face.Weight);
+        if (weight >= (int)FontWeight.Normal && weight <= (int)FontWeight.Medium)
+        {
+            var upToMedium = heavier.Where(face => face.Weight <= (int)FontWeight.Medium);
+            var aboveMedium = heavier.Where(face => face.Weight > (int)FontWeight.Medium);
+            return upToMedium.Concat(lighter).Concat(aboveMedium).First();
+        }
+
+        return weight < (int)FontWeight.Normal
+            ? lighter.Concat(heavier).First()
+            : heavier.Concat(lighter).First();
     }
 }

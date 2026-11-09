@@ -74,7 +74,8 @@ public class NavigationList : ScrollableItemsBase, ISelector, IIndexedSelector
         ItemPadding = Theme.Metrics.ItemPadding;
     }
 
-    /// <summary>Gets or sets the items data source.</summary>
+    /// <summary>Gets or sets the items source.</summary>
+    [FluentExcluded("Configured through the Items builder")]
     public ISelectableItemsView ItemsSource
     {
         get => _itemsSource;
@@ -98,7 +99,7 @@ public class NavigationList : ScrollableItemsBase, ISelector, IIndexedSelector
     }
 
     /// <summary>
-    /// Gets or sets the per-item kind selector. When <see langword="null"/> every row is a selectable
+    /// Gets or sets the per-item kind selector; null makes every row a selectable
     /// <see cref="NavigationItemKind.Item"/>.
     /// </summary>
     public Func<object?, NavigationItemKind>? KindSelector
@@ -116,19 +117,24 @@ public class NavigationList : ScrollableItemsBase, ISelector, IIndexedSelector
         }
     }
 
-    /// <summary>Gets or sets the selected row index (-1 = none). Non-item rows are rejected.</summary>
+    /// <summary>Gets or sets the selected row index, or -1 for none; non-item rows are rejected.</summary>
     public int SelectedIndex
     {
         get => GetValue(SelectedIndexProperty);
         set => SetValue(SelectedIndexProperty, value);
     }
 
+    /// <summary>Gets or sets the padding around each row's content; the default comes from the theme.</summary>
     public Thickness ItemPadding
     {
         get => GetValue(ItemPaddingProperty);
         set => SetValue(ItemPaddingProperty, value);
     }
 
+    /// <summary>
+    /// Gets or sets the minimum height of selectable <see cref="NavigationItemKind.Item"/> rows;
+    /// headers and separators self-size, and NaN (the default) resolves from the theme.
+    /// </summary>
     public double ItemHeight
     {
         get => GetValue(ItemHeightProperty);
@@ -145,8 +151,11 @@ public class NavigationList : ScrollableItemsBase, ISelector, IIndexedSelector
     /// <summary>Occurs when the selection changes.</summary>
     public event Action<object?>? SelectionChanged;
 
-    /// <summary>Occurs when a selectable row is activated by click or Enter.</summary>
-    public event Action<object?>? ItemInvoked;
+    /// <summary>
+    /// Occurs when a selectable row is activated by click or Enter, before a click selects it; a handler that
+    /// sets <see cref="ItemInvokedEventArgs.Handled"/> keeps the selection as it is.
+    /// </summary>
+    public event Action<ItemInvokedEventArgs>? ItemInvoked;
 
     public bool TryGetItemIndexAt(Point position, out int index) => TryGetItemIndexAtCore(position, out index);
 
@@ -314,14 +323,6 @@ public class NavigationList : ScrollableItemsBase, ISelector, IIndexedSelector
             BorderThickness, radius);
     }
 
-    protected override void RenderSubtree(IGraphicsContext context) => _scrollViewer.Render(context);
-
-    internal override void WriteComposition(Rendering.Retained.CompositionPlanBuilder builder)
-    {
-        builder.Content(0);
-        builder.Child(_scrollViewer);
-    }
-
     private protected override bool IsItemSelectedForContainer(int index) => index == SelectedIndex;
 
     /// <summary>
@@ -435,8 +436,13 @@ public class NavigationList : ScrollableItemsBase, ISelector, IIndexedSelector
 
     private void InvokeItem(int index)
     {
-        CommitTargetValue(SelectedIndexProperty, index);
-        ItemInvoked?.Invoke(_itemsSource.GetItem(index));
+        var args = new ItemInvokedEventArgs(_itemsSource.GetItem(index));
+        ItemInvoked?.Invoke(args);
+        if (!args.Handled)
+        {
+            CommitTargetValue(SelectedIndexProperty, index);
+        }
+
         InvalidateVisual();
     }
 
@@ -475,7 +481,7 @@ public class NavigationList : ScrollableItemsBase, ISelector, IIndexedSelector
             case Key.Enter:
                 if (SelectedIndex >= 0)
                 {
-                    ItemInvoked?.Invoke(SelectedItem);
+                    ItemInvoked?.Invoke(new ItemInvokedEventArgs(SelectedItem));
                     e.Handled = true;
                 }
                 break;
@@ -666,4 +672,25 @@ public enum NavigationItemKind
 
     /// <summary>Non-interactive divider.</summary>
     Separator,
+}
+
+/// <summary>Arguments of <see cref="NavigationList.ItemInvoked"/>.</summary>
+public sealed class ItemInvokedEventArgs
+{
+    public ItemInvokedEventArgs(object? item)
+    {
+        Item = item;
+    }
+
+    /// <summary>Gets the item that was activated.</summary>
+    public object? Item { get; }
+
+    /// <summary>
+    /// Gets or sets whether a handler performed the activation itself, so the list leaves its
+    /// selection unchanged.
+    /// </summary>
+    /// <remarks>
+    /// A row activated with Enter is already selected, and the flag changes nothing there.
+    /// </remarks>
+    public bool Handled { get; set; }
 }

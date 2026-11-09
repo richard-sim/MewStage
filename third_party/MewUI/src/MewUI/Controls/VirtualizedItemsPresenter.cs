@@ -1,12 +1,10 @@
-using Aprillz.MewUI.Rendering;
-
 namespace Aprillz.MewUI.Controls;
 
 /// <summary>
 /// Realizes and recycles item containers for a scrollable items host to reduce UI element allocations.
 /// </summary>
 /// <remarks>
-/// This presenter is intended for fixed-height item layouts where only a contiguous visible range is rendered.
+/// This presenter is intended for fixed-height item layouts where only a contiguous visible range is arranged.
 /// </remarks>
 internal sealed class VirtualizedItemsPresenter
 {
@@ -209,93 +207,7 @@ internal sealed class VirtualizedItemsPresenter
     }
 
     /// <summary>
-    /// Realizes, arranges, and renders a contiguous range of items.
-    /// </summary>
-    public void RenderRange(
-        IGraphicsContext context,
-        Rect contentBounds,
-        int first,
-        int lastExclusive,
-        double itemHeight,
-        double yStart,
-        Func<int, Rect, Rect>? getContainerRect = null,
-        uint itemBindingGeneration = 0)
-    {
-        if (lastExclusive <= first)
-        {
-            RecycleAll();
-            return;
-        }
-
-        ArrangeRange(
-            contentBounds,
-            first,
-            lastExclusive,
-            itemHeight,
-            yStart,
-            getContainerRect,
-            itemBindingGeneration);
-
-        for (int i = first; i < lastExclusive; i++)
-        {
-            if (!_realized.TryGetValue(i, out var element)) continue;
-
-            element.Render(context);
-        }
-    }
-
-    /// <summary>
-    /// Renders a contiguous range of items assuming they have already been realized and arranged.
-    /// Does not create, bind, measure, arrange, or recycle containers.
-    /// </summary>
-    public void RenderArrangedRange(
-        IGraphicsContext context,
-        int first,
-        int lastExclusive)
-    {
-        if (lastExclusive <= first)
-        {
-            return;
-        }
-
-        for (int i = first; i < lastExclusive; i++)
-        {
-            if (!_realized.TryGetValue(i, out var element))
-            {
-                continue;
-            }
-
-            element.Render(context);
-        }
-    }
-
-    /// <summary>
-    /// Declares the realized containers of an already arranged range, in the same order and with the
-    /// same skips as <see cref="RenderArrangedRange"/>.
-    /// </summary>
-    internal void WriteArrangedRangeComposition(
-        Rendering.Retained.CompositionPlanBuilder builder,
-        int first,
-        int lastExclusive)
-    {
-        if (lastExclusive <= first)
-        {
-            return;
-        }
-
-        for (int index = first; index < lastExclusive; index++)
-        {
-            if (!_realized.TryGetValue(index, out var element))
-            {
-                continue;
-            }
-
-            builder.Child(element);
-        }
-    }
-
-    /// <summary>
-    /// Realizes and arranges a contiguous range of items without rendering.
+    /// Realizes and arranges a contiguous range of items; the host draws them as its children.
     /// </summary>
     public void ArrangeRange(
         Rect contentBounds,
@@ -328,6 +240,7 @@ internal sealed class VirtualizedItemsPresenter
                     // user-interaction state (e.g. ToggleSwitch.IsChecked).
                     // Defer rebind + style snap until the item re-enters the visible range.
                     (_pendingRebind ??= new()).Add(key);
+                    _realized[key].IsHeldOutOfView = true;
                 }
             }
         }
@@ -360,6 +273,8 @@ internal sealed class VirtualizedItemsPresenter
     {
         if (_realized.TryGetValue(index, out var existing))
         {
+            existing.IsHeldOutOfView = false;
+
             // Also rebind if the item was focus-pinned and missed a prior rebind pass.
             bool pending = _pendingRebind != null && _pendingRebind.Remove(index);
             bool generationMismatch = !_itemBindingGenerations.TryGetValue(existing, out var boundGeneration)
@@ -456,6 +371,7 @@ internal sealed class VirtualizedItemsPresenter
         _unbind?.Invoke(element);
         _itemBindingGenerations.Remove(element);
         _resetHeld.Forget(element);
+        element.IsHeldOutOfView = false;
         element.Parent = null;
         if (index is not int recycledIndex || !_recycledByIndex.TryAdd(recycledIndex, element))
         {

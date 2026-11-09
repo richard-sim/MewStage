@@ -47,7 +47,7 @@ public class ProgressIndicator : Control
     );
 
     /// <summary>
-    /// Gets or sets whether the ring animation is active.
+    /// Gets or sets whether the animation is active.
     /// </summary>
     public bool IsActive
     {
@@ -82,7 +82,8 @@ public class ProgressIndicator : Control
     {
         base.OnRender(context);
 
-        if (!IsActive || _clock == null)
+        // A template owns the control's entire visuals; the dots would draw over it.
+        if (HasTemplateInstance || !IsActive || _clock == null)
         {
             return;
         }

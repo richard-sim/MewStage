@@ -1,8 +1,8 @@
 // EmbeddedWindowBackend: the minimal IWindowBackend for an embedded (no OS window) MewUI Window. It gives the Window
 // a stable non-zero Handle (Window.PerformLayout early-returns when Handle == 0), records the client size in DIPs and
-// counts Invalidate() calls. With no ApplicationDispatcher installed, MewUI's RequestLayout / RequestRender fall back
-// to backend Invalidate, so the count is the authoritative "the window wants a redraw" signal the host's OnRequest
-// gate consults. Modal dialogs call SetEnabled(false) on the owner backend; HasModalDisable surfaces that for input
+// counts Invalidate() calls. MewUI's RequestLayout / RequestRender reach backend Invalidate through the thread's
+// dispatcher (merged passes the host pumps each frame before it decides), so the count is the authoritative "the
+// window wants a redraw" signal the host's OnRequest gate consults. Modal dialogs call SetEnabled(false) on the owner backend; HasModalDisable surfaces that for input
 // gating. Close() routes to the host (EmbeddedUiHost.CloseWindow), which does what an OS backend's destroy does:
 // Closing / Closed, out of the stack, graphics released, visual tree disposed. Everything else (chrome, drag, cursor,
 // IME, position, present) is a no-op: there is no native window.
@@ -15,8 +15,9 @@ namespace MewStage.Ui.Backend;
 
 internal sealed class EmbeddedWindowBackend : IWindowBackend
 {
-    // A fixed, non-zero pseudo-handle. Never an OS HWND; only used as a "backend present + Handle!=0" sentinel.
-    private static nint s_next = 0x4D657721; // 'Mew!'
+    // A unique, non-zero pseudo-handle. Never an OS HWND; only used as a "backend present + Handle!=0" sentinel.
+    // Hosts run on several threads at once (test classes in parallel), so the counter is taken atomically.
+    private static long s_next = 0x4D657720; // 'Mew!' - 1
 
     private readonly EmbeddedUiHost? _host;
     private readonly Window? _window;
@@ -34,7 +35,7 @@ internal sealed class EmbeddedWindowBackend : IWindowBackend
     }
 
     /// <summary>The pseudo-handle (non-zero so MewUI lays the window out; 0 once the window closed, like a destroyed HWND).</summary>
-    public nint Handle { get; private set; } = s_next++;
+    public nint Handle { get; private set; } = (nint)Interlocked.Increment(ref s_next);
 
     /// <summary>True once <see cref="EmbeddedUiHost.CloseWindow(Window)"/> closed the window.</summary>
     public bool IsClosed => Handle == 0;

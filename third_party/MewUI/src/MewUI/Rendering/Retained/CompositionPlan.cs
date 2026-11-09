@@ -10,6 +10,14 @@ internal enum CompositionEntryKind : byte
     ClipRect,
     ClipRoundedRect,
     Transform,
+    Alpha,
+
+    /// <summary>
+    /// A scope around one child that roots a <see cref="SceneFrame"/>: the scene reads what lies under the
+    /// child shifted by how far the child has moved since each node was staged, so a whole-pixel move of the
+    /// subtree visits no node that stays out of view. Drawing applies nothing for it.
+    /// </summary>
+    Frame,
 }
 
 /// <summary>
@@ -26,6 +34,12 @@ internal readonly struct CompositionEntry
     internal double RadiusY { get; init; }
     internal Matrix3x2 Matrix { get; init; }
 
+    // A transform scope under which glyphs would land between pixels turns text snapping off for what it encloses.
+    internal bool DisablesTextPixelSnap { get; init; }
+
+    // An alpha scope multiplies the global alpha of every drawing call it encloses.
+    internal double Alpha { get; init; }
+
     /// <summary>Number of entries this scope encloses; 0 for non-scope entries.</summary>
     internal int ScopeLength { get; init; }
 }
@@ -36,21 +50,17 @@ internal readonly struct CompositionEntry
 /// </summary>
 internal sealed class CompositionPlan
 {
-    internal static CompositionPlan Empty { get; } = new([], 0, false);
+    internal static CompositionPlan Empty { get; } = new([], 0);
 
-    internal CompositionPlan(CompositionEntry[] entries, int slotCount, bool isUnsupported)
+    internal CompositionPlan(CompositionEntry[] entries, int slotCount)
     {
         Entries = entries;
         SlotCount = slotCount;
-        IsUnsupported = isUnsupported;
     }
 
     internal CompositionEntry[] Entries { get; }
 
     internal int SlotCount { get; }
-
-    /// <summary>True when the declaration named something the scene cannot own as a node.</summary>
-    internal bool IsUnsupported { get; }
 }
 
 /// <summary>
@@ -61,7 +71,6 @@ internal sealed class CompositionPlanBuilder
     private readonly List<CompositionEntry> _entries = [];
     private readonly List<int> _openScopes = [];
     private int _slotCount;
-    private bool _unsupported;
 
     internal void Content(int slotIndex)
     {
@@ -70,27 +79,8 @@ internal sealed class CompositionPlanBuilder
         _slotCount = Math.Max(_slotCount, slotIndex + 1);
     }
 
-    /// <summary>
-    /// Says that what the visual draws right now cannot be put as a plan, so this pass records it
-    /// together with its subtree as one drawing. The visual declares again once it can.
-    /// </summary>
-    internal void DrawnAsOneForNow() => _unsupported = true;
-
-    internal void Child(Element? child)
-    {
-        if (child == null)
-        {
-            return;
-        }
-
-        if (child is not UIElement visual)
-        {
-            _unsupported = true;
-            return;
-        }
-
-        _entries.Add(new CompositionEntry { Kind = CompositionEntryKind.Child, Child = visual });
-    }
+    internal void Child(UIElement child)
+        => _entries.Add(new CompositionEntry { Kind = CompositionEntryKind.Child, Child = child });
 
     internal void PushClipRect(Rect rect) => PushScope(new CompositionEntry
     {
@@ -106,10 +96,24 @@ internal sealed class CompositionPlanBuilder
         RadiusY = radiusY,
     });
 
-    internal void PushTransform(Matrix3x2 matrix) => PushScope(new CompositionEntry
+    internal void PushTransform(Matrix3x2 matrix, bool disablesTextPixelSnap = false) => PushScope(new CompositionEntry
     {
         Kind = CompositionEntryKind.Transform,
         Matrix = matrix,
+        DisablesTextPixelSnap = disablesTextPixelSnap,
+    });
+
+    /// <summary>Opens a scope that draws what it encloses with its global alpha multiplied by <paramref name="alpha"/>.</summary>
+    internal void PushAlpha(double alpha) => PushScope(new CompositionEntry
+    {
+        Kind = CompositionEntryKind.Alpha,
+        Alpha = alpha,
+    });
+
+    /// <summary>Opens a scope whose one child roots a frame; the next entry has to be that child.</summary>
+    internal void PushFrame() => PushScope(new CompositionEntry
+    {
+        Kind = CompositionEntryKind.Frame,
     });
 
     internal void Pop()
@@ -141,16 +145,16 @@ internal sealed class CompositionPlanBuilder
             return previous;
         }
 
-        var plan = _entries.Count == 0 && !_unsupported
+        var plan = _entries.Count == 0
             ? CompositionPlan.Empty
-            : new CompositionPlan([.. _entries], _slotCount, _unsupported);
+            : new CompositionPlan([.. _entries], _slotCount);
         Reset();
         return plan;
     }
 
     private bool Matches(CompositionPlan plan)
     {
-        if (plan.SlotCount != _slotCount || plan.IsUnsupported != _unsupported || plan.Entries.Length != _entries.Count)
+        if (plan.SlotCount != _slotCount || plan.Entries.Length != _entries.Count)
         {
             return false;
         }
@@ -166,7 +170,9 @@ internal sealed class CompositionPlanBuilder
                 built.Rect != existing.Rect ||
                 built.RadiusX != existing.RadiusX ||
                 built.RadiusY != existing.RadiusY ||
-                built.Matrix != existing.Matrix)
+                built.Matrix != existing.Matrix ||
+                built.DisablesTextPixelSnap != existing.DisablesTextPixelSnap ||
+                built.Alpha != existing.Alpha)
             {
                 return false;
             }
@@ -180,7 +186,6 @@ internal sealed class CompositionPlanBuilder
         _entries.Clear();
         _openScopes.Clear();
         _slotCount = 0;
-        _unsupported = false;
     }
 
     private void PushScope(CompositionEntry entry)

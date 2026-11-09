@@ -1,6 +1,7 @@
 using System.Globalization;
 using System.Runtime.CompilerServices;
 using Aprillz.MewUI.Rendering;
+using Aprillz.MewUI.Resources;
 
 namespace Aprillz.MewUI.Text;
 
@@ -64,7 +65,7 @@ internal sealed partial class ManagedTextEngine : ITextEngine, IDisposable
         using var context = CreateMeasurementContext(snapshot.Dpi);
         if (fastPath)
         {
-            var font = GetFont(snapshot.DefaultStyle, snapshot.Dpi);
+            var font = GetFont(snapshot.DefaultStyle, snapshot);
             var segments = MeasureFastPathSegments(context, snapshot.Text, font, out var measured);
             double height = ResolveLineHeight(
                 snapshot.Paragraph, GetFontLineHeight(context, font), measured.Height);
@@ -118,7 +119,7 @@ internal sealed partial class ManagedTextEngine : ITextEngine, IDisposable
         using var context = CreateMeasurementContext(snapshot.Dpi);
         return context.Measure(
             snapshot.Text.AsSpan(start, length),
-            GetFont(snapshot.DefaultStyle, snapshot.Dpi)).Width;
+            GetFont(snapshot.DefaultStyle, snapshot)).Width;
     }
 
     internal double[]? MeasureFastPathAdvances(TextLayoutRequestSnapshot snapshot, int start, int length)
@@ -134,7 +135,7 @@ internal sealed partial class ManagedTextEngine : ITextEngine, IDisposable
         return context.SupportsUtf16PrefixAdvances
             ? context.GetUtf16PrefixAdvances(
                 snapshot.Text.AsSpan(start, length),
-                GetFont(snapshot.DefaultStyle, snapshot.Dpi))
+                GetFont(snapshot.DefaultStyle, snapshot))
             : null;
     }
 
@@ -210,9 +211,11 @@ internal sealed partial class ManagedTextEngine : ITextEngine, IDisposable
         return height;
     }
 
-    internal IFont GetFont(TextRunStyle style, uint dpi)
+    /// <summary>The font for <paramref name="style"/> as the font registry stood when <paramref name="snapshot"/> was taken.</summary>
+    internal IFont GetFont(TextRunStyle style, TextLayoutRequestSnapshot snapshot)
     {
-        var key = new FontKey(style.FontFamily, style.FontSize, style.Weight, style.Italic, dpi);
+        // Older fonts stay cached: layouts made before a font was registered still draw with them.
+        var key = new FontKey(style.FontFamily, style.FontSize, style.Weight, style.Italic, snapshot.Dpi, snapshot.FontRegistryVersion);
         if (!_fonts.TryGetValue(key, out var font))
         {
             // Decorations are drawn by the text renderer as geometry; baking them into the
@@ -221,7 +224,7 @@ internal sealed partial class ManagedTextEngine : ITextEngine, IDisposable
             font = _factory.CreateFont(
                 style.FontFamily,
                 style.FontSize,
-                dpi,
+                snapshot.Dpi,
                 style.Weight,
                 style.Italic);
             _fonts.Add(key, font);
@@ -362,7 +365,7 @@ internal sealed partial class ManagedTextEngine : ITextEngine, IDisposable
             }
         }
 
-        return line.RunCount > 0 ? capHeight : GetFont(snapshot.DefaultStyle, snapshot.Dpi).CapHeight;
+        return line.RunCount > 0 ? capHeight : GetFont(snapshot.DefaultStyle, snapshot).CapHeight;
     }
 
     /// <summary>Trims the first line's box to its cap height and, when requested, the last line's bottom to its baseline.</summary>
@@ -465,7 +468,7 @@ internal sealed partial class ManagedTextEngine : ITextEngine, IDisposable
         _fontLineHeights.Clear();
     }
 
-    private readonly record struct FontKey(string Family, double Size, FontWeight Weight, bool Italic, uint Dpi);
+    private readonly record struct FontKey(string Family, double Size, FontWeight Weight, bool Italic, uint Dpi, int FontRegistryVersion);
 }
 
 internal sealed class TextLayoutRequestSnapshot
@@ -482,7 +485,8 @@ internal sealed class TextLayoutRequestSnapshot
         InlineRun[] inlines,
         TextFidelity fidelity,
         long revision,
-        bool transient)
+        bool transient,
+        int fontRegistryVersion)
     {
         Text = text;
         Dpi = dpi;
@@ -493,6 +497,7 @@ internal sealed class TextLayoutRequestSnapshot
         Fidelity = fidelity;
         Revision = revision;
         Transient = transient;
+        FontRegistryVersion = fontRegistryVersion;
     }
 
     public string Text { get; }
@@ -504,6 +509,8 @@ internal sealed class TextLayoutRequestSnapshot
     public TextFidelity Fidelity { get; }
     public long Revision { get; }
     public bool Transient { get; }
+    /// <summary>The font registry version the request was made under; a later registration can resolve its families to other files.</summary>
+    public int FontRegistryVersion { get; }
     /// <summary>64-bit hash of every layout input including the text; equal inputs hash equal, so a hit still needs <see cref="ContentEquals"/>.</summary>
     public ulong ContentKey
     {
@@ -590,7 +597,8 @@ internal sealed class TextLayoutRequestSnapshot
             inlines,
             request.Fidelity,
             request.Revision,
-            request.Transient);
+            request.Transient,
+            FontRegistry.Version);
     }
 
     /// <summary>Index of the run that styles this position in <see cref="Runs"/>, or -1 for the default style.</summary>
@@ -652,6 +660,7 @@ internal sealed class TextLayoutRequestSnapshot
     public bool OwnerEquals(TextLayoutRequestSnapshot other)
     {
         if (Dpi != other.Dpi ||
+            FontRegistryVersion != other.FontRegistryVersion ||
             Fidelity != other.Fidelity ||
             !DefaultStyle.Equals(other.DefaultStyle) ||
             !ParagraphEquals(Paragraph, other.Paragraph) ||
@@ -727,6 +736,7 @@ internal sealed class TextLayoutRequestSnapshot
         }
 
         hash.Add(Dpi);
+        hash.Add(FontRegistryVersion);
         hash.Add((int)Fidelity);
         hash.Add(Paragraph.MaxWidth);
         hash.Add(Paragraph.MaxHeight);

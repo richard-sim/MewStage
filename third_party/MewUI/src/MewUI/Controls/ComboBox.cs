@@ -46,6 +46,10 @@ public sealed partial class ComboBox : DropDownBase, ISelector, IIndexedSelector
     private FrameworkElement? _headerView;
     private TemplateContext? _headerContext;
 
+    /// <summary>
+    /// Gets or sets whether alternating drop-down items use a second background color (zebra
+    /// striping).
+    /// </summary>
     public bool ZebraStriping
     {
         get => GetValue(ZebraStripingProperty);
@@ -53,7 +57,7 @@ public sealed partial class ComboBox : DropDownBase, ISelector, IIndexedSelector
     }
 
     /// <summary>
-    /// Gets or sets the items data source.
+    /// Gets or sets the items source.
     /// </summary>
     public ISelectableItemsView ItemsSource
     {
@@ -131,7 +135,8 @@ public sealed partial class ComboBox : DropDownBase, ISelector, IIndexedSelector
         MewProperty<bool>.Register<ComboBox>(nameof(ChangeOnWheel), true, MewPropertyOptions.None);
 
     /// <summary>
-    /// Whether the mouse wheel changes the selection to the previous or next item while the pointer is over the combo box.
+    /// Gets or sets whether the mouse wheel changes the selection to the previous or next item
+    /// while the pointer is over the combo box.
     /// </summary>
     public bool ChangeOnWheel
     {
@@ -149,11 +154,12 @@ public sealed partial class ComboBox : DropDownBase, ISelector, IIndexedSelector
     }
 
     /// <summary>
-    /// Gets or sets the height of items in the dropdown list.
+    /// Gets or sets the height of items in the drop-down list.
     /// </summary>
     public static readonly MewProperty<double> ItemHeightProperty =
         MewProperty<double>.Register<ComboBox>(nameof(ItemHeight), double.NaN, MewPropertyOptions.AffectsLayout);
 
+    /// <summary>Gets or sets the height of items in the drop-down list.</summary>
     public double ItemHeight
     {
         get => GetValue(ItemHeightProperty);
@@ -161,7 +167,8 @@ public sealed partial class ComboBox : DropDownBase, ISelector, IIndexedSelector
     }
 
     /// <summary>
-    /// Gets or sets the item template for the dropdown list. If null, the list uses its default template.
+    /// Gets or sets the item template for the drop-down list; null uses the list's default
+    /// template.
     /// </summary>
     public IDataTemplate? ItemTemplate
     {
@@ -184,8 +191,8 @@ public sealed partial class ComboBox : DropDownBase, ISelector, IIndexedSelector
     }
 
     /// <summary>
-    /// Gets or sets the template that presents the selected item in the header. Null falls back to
-    /// <see cref="ItemTemplate"/>; with neither set the header draws the item text.
+    /// Gets or sets the template that presents the selected item in the header; null falls back to
+    /// <see cref="ItemTemplate"/>, and with neither set the header draws the item text.
     /// </summary>
     /// <remarks>
     /// The header keeps its own size: the built view is clipped to the text area and never grows the
@@ -261,6 +268,12 @@ public sealed partial class ComboBox : DropDownBase, ISelector, IIndexedSelector
         SelectionChanged?.Invoke(_itemsSource.SelectedItem);
         BindHeaderView();
         InvalidateVisual();
+
+        // The header view is measured and placed only while an item is selected, so the selection decides its layout.
+        if (_headerView != null)
+        {
+            InvalidateMeasure();
+        }
 
         if (_popupList != null)
         {
@@ -369,11 +382,16 @@ public sealed partial class ComboBox : DropDownBase, ISelector, IIndexedSelector
     {
         base.ArrangeContent(bounds);
 
+        // Without a selection the view is unbound and not drawn, which the layout states by giving it no area.
         if (_headerView != null && !HasTemplateInstance)
         {
-            _headerView.Arrange(GetHeaderContentRect(bounds));
+            _headerView.Arrange(HasSelectedItem ? GetHeaderContentRect(bounds) : Rect.Empty);
         }
     }
+
+    /// <summary>The header view is clipped to the text area it presents the selection in; a template root is not.</summary>
+    protected override ChildClip? GetChildClip(UIElement child)
+        => ReferenceEquals(child, _headerView) ? new ChildClip(GetHeaderContentRect(Bounds)) : null;
 
     protected override Size MeasureHeader(Size availableSize)
     {
@@ -419,42 +437,30 @@ public sealed partial class ComboBox : DropDownBase, ISelector, IIndexedSelector
 
     protected override void RenderHeaderContent(IGraphicsContext context, Rect headerRect, Rect innerHeaderRect)
     {
-        var textRect = new Rect(innerHeaderRect.X, innerHeaderRect.Y, innerHeaderRect.Width - ArrowAreaWidth, innerHeaderRect.Height)
-            .Deflate(Padding);
-
+        // A selected item is presented by the header view, which is drawn as a child between the chrome and the arrow.
         if (_headerView != null && HasSelectedItem)
         {
-            // Rendered here rather than through RenderSubtree so it sits between the chrome and the arrow.
-            context.Save();
-            try
-            {
-                context.IntersectClip(textRect);
-                _headerView.Render(context);
-            }
-            finally
-            {
-                context.Restore();
-            }
+            return;
         }
-        else
-        {
-            string text = SelectedText ?? string.Empty;
-            var state = CurrentVisualState;
-            var textColor = state.IsEnabled ? Foreground : Theme.Palette.DisabledText;
-            if (string.IsNullOrEmpty(text) && !string.IsNullOrEmpty(Placeholder) && !state.IsFocused)
-            {
-                text = Placeholder;
-                textColor = Theme.Palette.PlaceholderText;
-            }
 
-            if (!string.IsNullOrEmpty(text))
-            {
-                var style = GetTextRunStyle();
-                var layout = TextLayoutOperations.GetOrCreate(
-                    GetGraphicsFactory(), text, GetDpi(), in style, textRect.Width, textRect.Height);
-                TextLayoutOperations.DrawInBounds(
-                    context, layout, textRect, textColor, TextAlignment.Center, this);
-            }
+        var textRect = new Rect(innerHeaderRect.X, innerHeaderRect.Y, innerHeaderRect.Width - ArrowAreaWidth, innerHeaderRect.Height)
+            .Deflate(Padding);
+        string text = SelectedText ?? string.Empty;
+        var state = CurrentVisualState;
+        var textColor = state.IsEnabled ? Foreground : Theme.Palette.DisabledText;
+        if (string.IsNullOrEmpty(text) && !string.IsNullOrEmpty(Placeholder) && !state.IsFocused)
+        {
+            text = Placeholder;
+            textColor = Theme.Palette.PlaceholderText;
+        }
+
+        if (!string.IsNullOrEmpty(text))
+        {
+            var style = GetTextRunStyle();
+            var layout = TextLayoutOperations.GetOrCreate(
+                GetGraphicsFactory(), text, GetDpi(), in style, textRect.Width, textRect.Height);
+            TextLayoutOperations.DrawInBounds(
+                context, layout, textRect, textColor, TextAlignment.Center, this);
         }
     }
 
@@ -465,7 +471,7 @@ public sealed partial class ComboBox : DropDownBase, ISelector, IIndexedSelector
             return base.CalculatePopupBounds(window, popup);
         }
 
-        var bounds = Bounds;
+        var bounds = GetBoundsInRoot();
         double width = Math.Max(0, bounds.Width);
         if (width <= 0)
         {

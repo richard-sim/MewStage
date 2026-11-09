@@ -6,10 +6,10 @@ No behavioural change to the upstream branches.
 
 --- a/Shared/Rendering/MewVG/MewVGGraphicsContext.Common.cs
 +++ b/Shared/Rendering/MewVG/MewVGGraphicsContext.Common.cs
-@@ -9,12 +9,17 @@
- internal sealed partial class MewVGMacOSGraphicsContext : GraphicsContextBase, ITransparentDirtyRectContext, IOpaqueDirtyRectContext
- #elif MEWUI_MEWVG_X11
+@@ -11,12 +11,17 @@
  internal sealed partial class MewVGX11GraphicsContext : GraphicsContextBase, ITransparentDirtyRectContext, IOpaqueDirtyRectContext, ISurfaceCopyContext
+ #elif MEWUI_MEWVG_FRAMEBUFFER
+ internal sealed partial class MewVGFramebufferGraphicsContext : GraphicsContextBase, ITransparentDirtyRectContext, IOpaqueDirtyRectContext, ISurfaceCopyContext
 +#elif MEWUI_MEWVG_MEWSTAGE
 +// MewStage vendor patch core-bridge/0001 (see third_party/NOTICE): a GPU-agnostic branch. No GL; Clear takes the fill path.
 +internal sealed partial class MewStageMewVGGraphicsContext : GraphicsContextBase, ITransparentDirtyRectContext, IOpaqueDirtyRectContext, IGroupOpacityContext
@@ -24,7 +24,7 @@ No behavioural change to the upstream branches.
  #else
      private MewVGGL _vg;
  #endif
-@@ -356,7 +361,7 @@
+@@ -379,7 +384,7 @@
  
      public override void Clear(Color color)
      {
@@ -33,7 +33,7 @@ No behavioural change to the upstream branches.
          ClearTargetPixels(new Rect(0, 0, _viewportWidthDip, _viewportHeightDip), ToNvgColor(color));
  #else
          _vg.Save();
-@@ -382,7 +387,7 @@
+@@ -405,7 +410,7 @@
  
      private void ClearRectangleCore(Rect rect, MewVGColor color)
      {
@@ -42,7 +42,7 @@ No behavioural change to the upstream branches.
          ClearTargetPixels(rect, color);
  #else
          _vg.Save();
-@@ -400,7 +405,7 @@
+@@ -423,7 +428,7 @@
  #endif
      }
  

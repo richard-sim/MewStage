@@ -30,6 +30,7 @@
 
     <!-- Shared MewVG files -->
     <Compile Include="..\MewUI\Shared\Rendering\MewVG\MewVGGraphicsContext.Common.cs" LinkBase="Rendering\MewVG" />
+    <Compile Include="..\MewUI\Shared\Rendering\MewVG\MewVGGraphicsContext.LinuxGL.cs" LinkBase="Rendering\MewVG" />
     <Compile Include="..\MewUI\Shared\Rendering\MewVG\MewVGGraphicsFactory.cs" LinkBase="Rendering\MewVG" />
     <Compile Include="..\MewUI\Shared\Rendering\MewVG\MewVGGraphicsFactory.X11.cs" LinkBase="Rendering\MewVG" />
     <Compile Include="..\MewUI\Shared\Rendering\MewVG\MewVGGLOffscreenSurfaceProvider.cs" LinkBase="Rendering\MewVG" />
@@ -57,7 +58,7 @@
 
     <Compile Include="..\MewUI\Shared\Native\Linux\X11\X11.cs" LinkBase="Native" />
     <Compile Include="..\MewUI\Shared\Native\Linux\X11\LibGL.cs" LinkBase="Native" />
-    <Compile Include="..\MewUI\Shared\Native\Linux\X11\LibEgl.X11.cs" LinkBase="Native" />
+    <Compile Include="..\MewUI\Shared\Native\Linux\Egl\LibEgl.cs" LinkBase="Native" />
     <Compile Include="..\MewUI\Shared\Native\Linux\X11\GL.X11.cs" LinkBase="Native" />
     <Compile Include="..\MewUI\Shared\Native\Linux\X11\OpenGLExt.X11.cs" LinkBase="Native" />
     <Compile Include="..\MewUI\Shared\Native\Linux\FreeType\**\*.cs" LinkBase="Native\FreeType" />

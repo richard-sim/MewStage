@@ -12,14 +12,15 @@ implements the same ones over the application's own resources.
 
 | MewUI contract | MewStage's implementation |
 | --- | --- |
-| `IWindowBackend` | `EmbeddedWindowBackend`: a non-OS backend with a non-zero handle (so layout runs), a client size, an invalidation counter, and `Close()`, which the host turns into a real close (below). Everything else is a no-op. |
+| `IWindowBackend` | `EmbeddedWindowBackend`: a non-OS backend with a unique non-zero handle (so layout runs), a client size, an invalidation counter, and `Close()`, which the host turns into a real close (below). Everything else is a no-op. |
 | `IGraphicsFactory` | `UiGraphicsFactory` over `IGraphicsDevice`: fonts, brushes, image decode, surfaces, contexts, readback. |
 | `IRenderSurface` | `UiRenderSurface`: the target texture plus a D24S8 stencil, the MewVG context, the glyph atlases. |
 | an image-source `IRenderSurface` (MewUI's caches) | `UiScratchSurface`: a color texture plus a D24S8 stencil, rendered inside the `ui` pass and sampled zero-copy ("Scratch surfaces" below). |
 | the MewVG `IGraphicsContext` bridge | upstream's shared bridge source compiled under a MewStage branch (vendor patch `core-bridge`), plus `MewStageMewVGGraphicsContext.Platform.cs` for the frame bracket, text and images. |
 | `MewVGContext` and the renderer behind it | `UiMewVGContext` and `NanoVgRenderer`, which records into the app's `IGraphicsRecorder` through one shader, `assets/shaders/ui.hlsl`. |
 | the text contract | `FontStashText`: FontStashSharp rasterizes glyphs with the face's real advances and metrics, so measurement and drawing agree and measuring never needs a GPU surface. |
-| the per-frame pulse | the host calls `AnimationManager.UpdateAt(timestamp)` once per frame; MewUI no longer ticks animations inside render. |
+| the per-frame pulse | the host opens `AnimationManager.BeginPulse(settings, timestamp)` once per frame and asks the pulse which window to render (`pulse.ShouldRender(window, needsRender)`), as upstream's Browser and Headless hosts do; MewUI does not tick animations inside render. |
+| a dispatcher (`IDispatcher`) | `EmbeddedDispatcher`: upstream's `ManagedUiDispatcher`, one per UI thread, bound through `Application.ThreadDispatcher` (vendor patch `multi-host/0003`, since no `Application` runs) and pumped by the host once per frame. It runs `DispatcherTimer` ticks, posted work and MewUI's merged layout and render passes. |
 
 MewUI has no public API for a third-party backend. `MewStage.Ui.Backend` compiles against MewUI and MewVG internals
 through `InternalsVisibleTo` grants kept in preserved files inside the vendored trees, the way upstream's own
@@ -52,10 +53,12 @@ pass.
 - `Resize(px, py, dpiScale)` recreates the surface and re-applies the metrics to every window. In design-space mode
   the render scale is `min(px / designW, py / designH)` and every window is laid out at the design size; otherwise the
   scale is the display scale and the DIP size is pixels over it.
-- `TickAndRender(graph, target, mode, clearBackground)` does the frame: bind the thread's graphics factory, refresh
-  command states (what MewUI's dispatcher would do after a drain), pulse the animation clocks, decide whether to render
-  (`Continuous`, an invalidated window, an animation with render demand, or the first frame; otherwise add nothing),
-  lay out every dirty window, and add the one `ui` pass. The pass writes the target (CLEAR or LOAD), reads every
+- `TickAndRender(graph, target, mode, clearBackground, animationTimestamp)` does the frame: bind the thread's graphics
+  factory and dispatcher, open the animation pulse at the frame's timestamp (it ticks the clocks; what they animate
+  invalidates), pump the dispatcher (posted work, due timers, the merged layout and render requests, then the
+  command-state refresh MewUI's dispatcher does after a drain), decide whether to render (`Continuous`, the first
+  frame, a window that asked for a redraw, or a pulse that renders the application as a whole because a clock with no
+  element runs; otherwise add nothing), lay out every dirty window, and add the one `ui` pass. The pass writes the target (CLEAR or LOAD), reads every
   texture declared through `AddSampledTexture`, creates a transient D24S8 stencil cleared once, and in its execute
   renders each window into the surface's kept context, uploads glyph-atlas changes before the render pass opens, and
   flushes the whole stack as one MewVG frame.
@@ -67,6 +70,30 @@ rather than drawn live.
 
 The embedded defaults every host sets: popups, dialogs and drag previews open in the window's own layers instead of
 OS windows (there are none), and the theme is pinned when no `Application` runs, because asking the OS theme throws.
+
+### The dispatcher and the pulse
+
+MewUI defers a lot of work to its dispatcher: `DispatcherTimer` (the TextBox caret blink, RepeatButton auto-repeat,
+the ScrollViewer idle timer, key-chord timeouts, toast expiry, long press), `BeginInvoke` jobs (deferred Tab focus
+into ListBox, TreeView and GridView rows, the hover re-check after a scroll) and the merged layout and render passes a
+window posts when something changes. MewUI's own hosts get the dispatcher from the running `Application`. An embedded
+host runs no `Application` (it is one per process, and MewStage runs several hosts on several threads), so the
+`multi-host/0003` patch adds a per-thread fallback, `Application.ThreadDispatcher`, and the host binds an
+`EmbeddedDispatcher` there. Without it every one of those features silently did nothing.
+
+The dispatcher is upstream's `ManagedUiDispatcher` used as the Browser and Headless hosts use it: no OS event source,
+pumped by the host, due timers run inline. There is one per UI thread, shared by the hosts on it (the main window's
+and its secondary windows'), and the last host disposed unbinds it, so jobs left queued by a disposed host's windows
+never run on a later host's frames. The first host on a thread also installs it as the thread's
+`SynchronizationContext` when the thread has none, so an `await` in a UI handler resumes on the UI thread at the next
+frame. Its clock is the frame's: a frame given an explicit timestamp (the tests' fixed timestamps) moves timers and
+animations together, and a frame without one runs on the wall clock.
+
+The pulse decides what renders. A clock attached to an element invalidates what it animates, and that invalidation is
+what makes its window render; an element the render pass culled invalidates nothing, so its window sleeps. Only a
+clock with no element (an application-wide animation) renders the whole stack through the pulse. Each frame the host
+opens the pulse first and then pumps the dispatcher, so the invalidations a tick posts reach the windows before the
+render decision.
 
 ### Scratch surfaces: SVGs and bitmap caches
 
