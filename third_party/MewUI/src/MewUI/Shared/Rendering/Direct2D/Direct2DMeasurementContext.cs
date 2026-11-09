@@ -1,0 +1,164 @@
+using System.Runtime.InteropServices;
+using Aprillz.MewUI.Native.Com;
+using Aprillz.MewUI.Native.DirectWrite;
+using Aprillz.MewUI.Text;
+using Aprillz.MewUI.Rendering.DirectWrite;
+
+namespace Aprillz.MewUI.Rendering.Direct2D;
+
+internal sealed unsafe class Direct2DMeasurementContext : MeasureGraphicsContextBase, ITextAdvanceSource
+{
+    private readonly nint _dwriteFactory;
+    private readonly DWriteTextFormatCache? _textFormatCache;
+
+    // Layout grid for the GDI-compatible metrics; sizes still come back in DIPs.
+    private readonly float _pixelsPerDip;
+
+    public override double DpiScale => 1.0;
+
+    public override double GetRasterBaseline(IFont font)
+        => ResolveRasterBaseline(font, _pixelsPerDip);
+
+    internal static double ResolveRasterBaseline(IFont font, double pixelsPerDip)
+        => Math.Round(font.Ascent * pixelsPerDip, MidpointRounding.AwayFromZero) / pixelsPerDip;
+
+    public Direct2DMeasurementContext(nint dwriteFactory, uint dpi = 96, DWriteTextFormatCache? textFormatCache = null)
+    {
+        _dwriteFactory = dwriteFactory;
+        _pixelsPerDip = dpi > 0 ? dpi / 96f : 1f;
+        _textFormatCache = textFormatCache;
+    }
+
+    private BackendTextLayout? CreateMeasurementLayout(ReadOnlySpan<char> text,
+        BackendTextFormat format, in BackendTextLayoutConstraints constraints)
+    {
+        if (text.IsEmpty) return null;
+
+        if (format.Font is not DirectWriteFont dwFont)
+            throw new ArgumentException("Font must be a DirectWriteFont", nameof(format));
+
+        var bounds = constraints.Bounds;
+        double maxWidth = double.IsPositiveInfinity(bounds.Width) ? float.MaxValue : Math.Max(0, bounds.Width);
+
+        nint textFormat = 0;
+        bool ownFormat = false;
+        nint textLayout = 0;
+        try
+        {
+            // Measurement: Left/Top only - alignment applied in render layout.
+            if (_textFormatCache != null)
+            {
+                textFormat = _textFormatCache.GetOrCreate(_dwriteFactory, dwFont,
+                    TextAlignment.Left, TextAlignment.Top, format.Wrapping);
+            }
+            else
+            {
+                var weight = (DWRITE_FONT_WEIGHT)(int)dwFont.Weight;
+                var style = dwFont.IsItalic ? DWRITE_FONT_STYLE.ITALIC : DWRITE_FONT_STYLE.NORMAL;
+                int hr2 = DWriteVTable.CreateTextFormat((IDWriteFactory*)_dwriteFactory, dwFont.Family, dwFont.PrivateFontCollection, weight, style, (float)dwFont.Size, out textFormat);
+                if (hr2 < 0 || textFormat == 0) return null;
+                DWriteVTable.SetWordWrapping(textFormat,
+                    format.Wrapping == TextWrapping.NoWrap ? DWRITE_WORD_WRAPPING.NO_WRAP : DWRITE_WORD_WRAPPING.WRAP);
+                ownFormat = true;
+            }
+            if (textFormat == 0) return null;
+
+            float w = maxWidth >= float.MaxValue ? float.MaxValue : (float)maxWidth;
+            int hr = DWriteVTable.CreateGdiCompatibleTextLayout(
+                (IDWriteFactory*)_dwriteFactory, text, textFormat, w, float.MaxValue, _pixelsPerDip, useGdiNatural: false, out textLayout);
+            if (hr < 0 || textLayout == 0) return null;
+
+            ApplyCustomFontFallback(textLayout, dwFont);
+
+            hr = DWriteVTable.GetMetrics(textLayout, out var metrics);
+            if (hr < 0) return null;
+
+            var height = metrics.height;
+            if (metrics.top < 0) height += -metrics.top;
+
+            var measured = new Size(metrics.widthIncludingTrailingWhitespace, height);
+            double effectiveMaxWidth = bounds.Width > 0 && !double.IsPositiveInfinity(bounds.Width) ? bounds.Width : measured.Width;
+
+            if (format.Trimming == TextTrimming.CharacterEllipsis)
+            {
+                DWriteVTable.CreateEllipsisTrimmingSign((IDWriteFactory*)_dwriteFactory, textFormat, out nint trimmingSign);
+                var dwriteTrimming = new DWRITE_TRIMMING { granularity = DWRITE_TRIMMING_GRANULARITY.CHARACTER };
+                DWriteVTable.SetTrimming(textLayout, dwriteTrimming, trimmingSign);
+                ComHelpers.Release(trimmingSign);
+            }
+
+            // Measurement only - native layout released immediately. No BackendHandle.
+            return new BackendTextLayout
+            {
+                MeasuredSize = measured,
+                EffectiveBounds = bounds,
+                EffectiveMaxWidth = effectiveMaxWidth,
+                ContentHeight = measured.Height,
+            };
+        }
+        finally
+        {
+            ComHelpers.Release(textLayout);
+            if (ownFormat) ComHelpers.Release(textFormat);
+        }
+    }
+
+    private void ApplyCustomFontFallback(nint textLayout, DirectWriteFont font)
+    {
+        if (textLayout == 0) return;
+        var fallback = DWriteFontFallbackHelper.GetOrCreate((IDWriteFactory*)_dwriteFactory, font);
+        if (fallback == 0) return;
+        _ = DWriteTextLayout2VTable.SetFontFallback(textLayout, fallback);
+    }
+
+    public override Size MeasureText(ReadOnlySpan<char> text, IFont font)
+        => MeasureText(text, font, double.PositiveInfinity);
+
+    public override Size MeasureText(ReadOnlySpan<char> text, IFont font, double maxWidth)
+    {
+        var format = new BackendTextFormat
+        {
+            Font = font,
+            HorizontalAlignment = TextAlignment.Left,
+            VerticalAlignment = TextAlignment.Top,
+            Wrapping = TextWrapping.NoWrap,
+            Trimming = TextTrimming.None
+        };
+        var constraints = new BackendTextLayoutConstraints(new Rect(0, 0, double.PositiveInfinity, 0));
+        var layout = CreateMeasurementLayout(text, format, in constraints);
+        return layout?.MeasuredSize ?? Size.Empty;
+    }
+
+    double[] ITextAdvanceSource.GetUtf16PrefixAdvances(ReadOnlySpan<char> text, IFont font)
+    {
+        if (text.IsEmpty)
+        {
+            return [];
+        }
+
+        var advances = new double[text.Length];
+        FillUtf16PrefixAdvances(text, font, advances);
+        return advances;
+    }
+
+    bool ITextAdvanceSource.TryGetUtf16PrefixAdvances(ReadOnlySpan<char> text, IFont font, Span<double> destination)
+    {
+        if (text.IsEmpty || destination.Length < text.Length)
+        {
+            return text.IsEmpty;
+        }
+
+        FillUtf16PrefixAdvances(text, font, destination);
+        return true;
+    }
+
+    private void FillUtf16PrefixAdvances(ReadOnlySpan<char> text, IFont font, Span<double> result)
+    {
+        if (font is not DirectWriteFont dwFont)
+        {
+            throw new ArgumentException("Font must be a DirectWriteFont.", nameof(font));
+        }
+
+        DirectWriteTextMeasure.FillPrefixAdvances(_dwriteFactory, dwFont, _textFormatCache, text, _pixelsPerDip, result);
+    }
+}

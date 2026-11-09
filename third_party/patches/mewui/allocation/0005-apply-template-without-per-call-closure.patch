@@ -1,0 +1,39 @@
+MewStage vendor patch allocation/0005 (third_party/NOTICE): Control.ApplyTemplate allocates nothing when no template
+is built. The presenter-wiring lambda captured the local `instance`, so the C# compiler allocated its display class
+at method entry - 32 B on every call - and Window.PerformLayout calls ApplyTemplate every frame, so every
+steady-state UI frame allocated 32 B. The walk moves to WirePresenters, which runs only when a template is built.
+Behaviour unchanged.
+
+--- a/Controls/Control.cs
++++ b/Controls/Control.cs
+@@ -368,6 +368,19 @@
+ 
+         // Wire presenters after the root is attached so projected content lands under a
+         // rooted presenter and picks up the correct inherited state.
++        WirePresenters(root, instance);
++
++        OnTemplateInstanceAttached();
++        OnApplyTemplate();
++        return true;
++    }
++
++    // MewStage vendor patch allocation/0005: the presenter walk lives in its own method so the closure it needs (instance + this) is
++    // allocated only when a template is actually built. Inline in ApplyTemplate, the compiler hoisted the captured
++    // `instance` into a display class allocated at method entry - 32 B on EVERY call, and Window.PerformLayout calls
++    // ApplyTemplate every frame even when nothing changed.
++    private void WirePresenters(Element root, ControlTemplateInstance instance)
++    {
+         VisualTree.Visit(root, element =>
+         {
+             if (element is ContentPresenter presenter && presenter.TemplatedParent == null)
+@@ -376,10 +389,6 @@
+                 presenter.AttachToTemplatedParent(this);
+             }
+         });
+-
+-        OnTemplateInstanceAttached();
+-        OnApplyTemplate();
+-        return true;
+     }
+ 
+     /// <summary>

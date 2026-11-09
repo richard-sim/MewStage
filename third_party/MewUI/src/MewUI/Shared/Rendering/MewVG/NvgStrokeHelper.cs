@@ -1,0 +1,756 @@
+using System.Numerics;
+using System.Runtime.CompilerServices;
+
+using Aprillz.MewVG;
+
+using static Aprillz.MewUI.Rendering.GradientBrushHelper;
+
+namespace Aprillz.MewUI.Rendering.MewVG;
+
+/// <summary>
+/// Shared helpers for mapping <see cref="StrokeStyle"/> and <see cref="Pen"/>
+/// to NanoVG stroke state, and gradient brushes to NanoVG paint.
+/// </summary>
+internal static class NvgStrokeHelper
+{
+    private const int GRADIENT_LUT_SIZE = 512;
+    private const int MAX_GRADIENT_LUT_ENTRIES = 128;
+
+    private static readonly ConditionalWeakTable<MewVGContext, GradientLutCache> GradientLutCaches = new();
+
+    public static void ApplyPenStyle(MewVGContext vg, Pen pen)
+    {
+        vg.StrokeWidth((float)pen.Thickness);
+
+        var style = pen.StrokeStyle;
+
+        vg.LineCap(style.LineCap switch
+        {
+            StrokeLineCap.Round => MewVGLineCap.Round,
+            StrokeLineCap.Square => MewVGLineCap.Square,
+            _ => MewVGLineCap.Butt,
+        });
+
+        vg.LineJoin(style.LineJoin switch
+        {
+            StrokeLineJoin.Round => MewVGLineJoin.Round,
+            StrokeLineJoin.Bevel => MewVGLineJoin.Bevel,
+            _ => MewVGLineJoin.Miter,
+        });
+
+        if (style.MiterLimit > 0)
+            vg.MiterLimit((float)style.MiterLimit);
+    }
+
+    /// <summary>
+    /// Applies stroke color or gradient paint to the current NanoVG state.
+    /// For gradient brushes, uses StrokePaint with a real gradient instead of a representative color.
+    /// </summary>
+    public static void ApplyStrokeBrush(MewVGContext vg, Pen pen, Rect strokeBounds)
+    {
+        if (pen.Brush is SolidColorBrush solid)
+        {
+            vg.StrokeColor(MewVGColor.RGBA(solid.Color.R, solid.Color.G, solid.Color.B, solid.Color.A));
+        }
+        else if (pen.Brush is GradientBrush gradient)
+        {
+            var paint = CreateGradientPaint(vg, gradient, strokeBounds);
+            if (paint.HasValue)
+                vg.StrokePaint(paint.Value);
+            else
+            {
+                var c = gradient.GetRepresentativeColor();
+                vg.StrokeColor(MewVGColor.RGBA(c.R, c.G, c.B, c.A));
+            }
+        }
+    }
+
+    /// <summary>
+    /// Creates a MewVGPaint for a gradient brush. Used for both fill and stroke.
+    /// </summary>
+    private static MewVGPaint? CreateGradientPaint(MewVGContext vg, GradientBrush gradient, Rect objectBounds)
+    {
+        var stops = gradient.Stops;
+        var startColor = ToNvgColor(GradientBrushHelper.Sample(stops, 0));
+        var endColor = ToNvgColor(GradientBrushHelper.Sample(stops, 1));
+
+        if (gradient is LinearGradientBrush linear)
+        {
+            var start = ResolveGradientPoint(linear.StartPoint, linear.GradientUnits, objectBounds);
+            var end = ResolveGradientPoint(linear.EndPoint, linear.GradientUnits, objectBounds);
+            var gradientTransform = linear.GradientTransform ?? Matrix3x2.Identity;
+            var image = GetOrCreateGradientLut(vg, linear.Stops);
+            if (image == 0)
+            {
+                return null;
+            }
+
+            return vg.GradientLinear(
+                in gradientTransform,
+                (float)start.X,
+                (float)start.Y,
+                (float)end.X,
+                (float)end.Y,
+                (int)linear.SpreadMethod,
+                image);
+        }
+
+        if (gradient is RadialGradientBrush radial)
+        {
+            var center = ResolveGradientPoint(radial.Center, radial.GradientUnits, objectBounds);
+            var origin = ResolveGradientPoint(radial.GradientOrigin, radial.GradientUnits, objectBounds);
+            var radiusX = ResolveGradientLength(radial.RadiusX, radial.GradientUnits, objectBounds.Width);
+            var radiusY = ResolveGradientLength(radial.RadiusY, radial.GradientUnits, objectBounds.Height);
+            if (radiusX <= 1e-6 || radiusY <= 1e-6)
+            {
+                return null;
+            }
+
+            var gradientTransform = radial.GradientTransform ?? Matrix3x2.Identity;
+            var image = GetOrCreateGradientLut(vg, radial.Stops);
+            if (image == 0)
+            {
+                return null;
+            }
+
+            return vg.GradientRadial(
+                in gradientTransform,
+                (float)center.X,
+                (float)center.Y,
+                (float)origin.X,
+                (float)origin.Y,
+                (float)radiusX,
+                (float)radiusY,
+                (int)radial.SpreadMethod,
+                image);
+        }
+
+        return null;
+    }
+
+    public static void ApplyGradientPaint(MewVGContext vg, GradientBrush gradient, Rect objectBounds)
+    {
+        var paint = CreateGradientPaint(vg, gradient, objectBounds);
+        if (paint.HasValue)
+            vg.FillPaint(paint.Value);
+        else
+            vg.FillColor(ToNvgColor(gradient.GetRepresentativeColor()));
+    }
+
+    /// <summary>
+    /// Draws a stroke with software dashing. NanoVG has no native dash support,
+    /// so we flatten the path to line segments and draw each dash individually.
+    /// </summary>
+    public static void DrawDashedStroke(MewVGContext vg, PathGeometry path, Pen pen, Rect strokeBounds)
+    {
+        var style = pen.StrokeStyle;
+        if (style.DashArray is not { Count: > 0 } dashes)
+            return;
+
+        // MewStage vendor patch allocation/0006: the flattened segments go into a reused per-thread list (no List per stroke).
+        var segments = t_segments ??= new List<DashSegment>();
+        FlattenPath(path, segments);
+        if (segments.Count == 0)
+            return;
+
+        float thickness = (float)pen.Thickness;
+        float dashOffset = (float)style.DashOffset * thickness;
+
+        // Build dash pattern in absolute units (multiply by stroke width, like SVG/WPF)
+        int dashCount = dashes.Count;
+        Span<float> pattern = stackalloc float[dashCount];
+        float patternLen = 0;
+        for (int i = 0; i < dashCount; i++)
+        {
+            pattern[i] = (float)dashes[i] * thickness;
+            patternLen += pattern[i];
+        }
+        if (patternLen <= 0)
+            return;
+
+        // Apply pen style (cap, join, etc.)
+        ApplyPenStyle(vg, pen);
+        ApplyStrokeBrush(vg, pen, strokeBounds);
+
+        // Walk segments, emitting dash sub-paths
+        int dashIndex = 0;
+        float dashRemain = pattern[0];
+        bool drawing = true; // starts with dash (not gap)
+
+        // Consume offset
+        if (dashOffset > 0)
+        {
+            float off = dashOffset % patternLen;
+            while (off > 0)
+            {
+                if (off >= dashRemain)
+                {
+                    off -= dashRemain;
+                    drawing = !drawing;
+                    dashIndex = (dashIndex + 1) % pattern.Length;
+                    dashRemain = pattern[dashIndex];
+                }
+                else
+                {
+                    dashRemain -= off;
+                    off = 0;
+                }
+            }
+        }
+
+        bool inPath = false;
+
+        foreach (var seg in segments)
+        {
+            if (seg.IsMoveTo)
+            {
+                // New subpath: flush previous dash stroke and reset
+                if (inPath)
+                {
+                    vg.Stroke();
+                    inPath = false;
+                }
+                // Reset dash state at each subpath start
+                dashIndex = 0;
+                dashRemain = pattern[0];
+                drawing = true;
+                if (dashOffset > 0)
+                {
+                    float off = dashOffset % patternLen;
+                    while (off > 0)
+                    {
+                        if (off >= dashRemain)
+                        {
+                            off -= dashRemain;
+                            drawing = !drawing;
+                            dashIndex = (dashIndex + 1) % pattern.Length;
+                            dashRemain = pattern[dashIndex];
+                        }
+                        else
+                        {
+                            dashRemain -= off;
+                            off = 0;
+                        }
+                    }
+                }
+                continue;
+            }
+
+            float x0 = seg.X0, y0 = seg.Y0, x1 = seg.X1, y1 = seg.Y1;
+            float segDx = x1 - x0, segDy = y1 - y0;
+            float segLen = MathF.Sqrt(segDx * segDx + segDy * segDy);
+            if (segLen <= 0)
+                continue;
+
+            float consumed = 0;
+            while (consumed < segLen)
+            {
+                float remain = segLen - consumed;
+                float take = MathF.Min(dashRemain, remain);
+                float t0 = consumed / segLen;
+                float t1 = (consumed + take) / segLen;
+                float px0 = x0 + segDx * t0, py0 = y0 + segDy * t0;
+                float px1 = x0 + segDx * t1, py1 = y0 + segDy * t1;
+
+                if (drawing)
+                {
+                    if (!inPath)
+                    {
+                        vg.BeginPath();
+                        vg.MoveTo(px0, py0);
+                        inPath = true;
+                    }
+                    vg.LineTo(px1, py1);
+                }
+                else
+                {
+                    if (inPath)
+                    {
+                        vg.Stroke();
+                        inPath = false;
+                    }
+                }
+
+                consumed += take;
+                dashRemain -= take;
+                if (dashRemain <= 0.001f)
+                {
+                    if (inPath && drawing)
+                    {
+                        vg.Stroke();
+                        inPath = false;
+                    }
+                    drawing = !drawing;
+                    dashIndex = (dashIndex + 1) % pattern.Length;
+                    dashRemain = pattern[dashIndex];
+                }
+            }
+        }
+
+        if (inPath)
+        {
+            vg.Stroke();
+        }
+    }
+
+    /// <summary>
+    /// Draws a dashed stroke for simple line segments (no PathGeometry).
+    /// </summary>
+    public static void DrawDashedLine(MewVGContext vg, float x0, float y0, float x1, float y1, Pen pen, Rect strokeBounds)
+    {
+        var path = ScratchPath();
+        path.MoveTo(x0, y0);
+        path.LineTo(x1, y1);
+        DrawDashedStroke(vg, path, pen, strokeBounds);
+    }
+
+    /// <summary>
+    /// Draws a dashed stroke for a rectangle.
+    /// </summary>
+    public static void DrawDashedRect(MewVGContext vg, float x, float y, float w, float h, Pen pen, Rect strokeBounds)
+    {
+        var path = ScratchPath();
+        path.MoveTo(x, y);
+        path.LineTo(x + w, y);
+        path.LineTo(x + w, y + h);
+        path.LineTo(x, y + h);
+        path.Close();
+        DrawDashedStroke(vg, path, pen, strokeBounds);
+    }
+
+    /// <summary>
+    /// Draws a dashed stroke for a rounded rectangle.
+    /// </summary>
+    public static void DrawDashedRoundedRect(MewVGContext vg, float x, float y, float w, float h, float r, Pen pen, Rect strokeBounds)
+    {
+        // MewStage vendor patch allocation/0006: the rounded-rect path is cached per thread by its geometry (a steady UI redraws the same
+        // rectangles every frame); the cache is bounded and starts over when full.
+        var cache = t_roundedRects ??= new Dictionary<(float, float, float, float, float), PathGeometry>();
+        var key = (x, y, w, h, r);
+        if (!cache.TryGetValue(key, out var path))
+        {
+            if (cache.Count >= MaxCachedRoundedRects)
+                cache.Clear();
+            path = PathGeometry.FromRoundedRect(new Rect(x, y, w, h), r);
+            cache[key] = path;
+        }
+        DrawDashedStroke(vg, path, pen, strokeBounds);
+    }
+
+    /// <summary>
+    /// Draws a dashed stroke for an ellipse.
+    /// </summary>
+    public static void DrawDashedEllipse(MewVGContext vg, float cx, float cy, float rx, float ry, Pen pen, Rect strokeBounds)
+    {
+        var path = ScratchPath();
+        // Approximate ellipse with 4 bezier curves (standard approach)
+        const float kappa = 0.5522847498f;
+        float ox = rx * kappa, oy = ry * kappa;
+        path.MoveTo(cx - rx, cy);
+        path.BezierTo(cx - rx, cy - oy, cx - ox, cy - ry, cx, cy - ry);
+        path.BezierTo(cx + ox, cy - ry, cx + rx, cy - oy, cx + rx, cy);
+        path.BezierTo(cx + rx, cy + oy, cx + ox, cy + ry, cx, cy + ry);
+        path.BezierTo(cx - ox, cy + ry, cx - rx, cy + oy, cx - rx, cy);
+        path.Close();
+        DrawDashedStroke(vg, path, pen, strokeBounds);
+    }
+
+    /// <summary>
+    /// Flattens a PathGeometry into line segments for dash computation.
+    /// Bezier curves are subdivided into line approximations.
+    /// </summary>
+    // MewStage vendor patch allocation/0006 (third_party/NOTICE): per-thread scratch so a dashed stroke allocates nothing per draw (the
+    // editor redraws its dashed MOCK outlines and drop targets every frame: 1144 B per frame measured before).
+    [ThreadStatic] private static List<DashSegment>? t_segments;
+    [ThreadStatic] private static PathGeometry? t_path;
+    [ThreadStatic] private static Dictionary<(float, float, float, float, float), PathGeometry>? t_roundedRects;
+    private const int MaxCachedRoundedRects = 256;
+
+    private static PathGeometry ScratchPath()
+    {
+        var p = t_path ??= new PathGeometry();
+        p.Clear();
+        return p;
+    }
+
+    private static void FlattenPath(PathGeometry path, List<DashSegment> result)
+    {
+        result.Clear();
+        float curX = 0, curY = 0;
+        float moveX = 0, moveY = 0;
+
+        foreach (var cmd in path.Commands)
+        {
+            switch (cmd.Type)
+            {
+                case PathCommandType.MoveTo:
+                    curX = (float)cmd.X0;
+                    curY = (float)cmd.Y0;
+                    moveX = curX;
+                    moveY = curY;
+                    result.Add(new DashSegment(curX, curY, curX, curY, true));
+                    break;
+
+                case PathCommandType.LineTo:
+                {
+                    float x = (float)cmd.X0, y = (float)cmd.Y0;
+                    result.Add(new DashSegment(curX, curY, x, y, false));
+                    curX = x;
+                    curY = y;
+                    break;
+                }
+
+                case PathCommandType.BezierTo:
+                {
+                    float c1x = (float)cmd.X0, c1y = (float)cmd.Y0;
+                    float c2x = (float)cmd.X1, c2y = (float)cmd.Y1;
+                    float ex = (float)cmd.X2, ey = (float)cmd.Y2;
+                    FlattenBezier(result, curX, curY, c1x, c1y, c2x, c2y, ex, ey, 0);
+                    curX = ex;
+                    curY = ey;
+                    break;
+                }
+
+                case PathCommandType.Close:
+                    if (MathF.Abs(curX - moveX) > 0.001f || MathF.Abs(curY - moveY) > 0.001f)
+                        result.Add(new DashSegment(curX, curY, moveX, moveY, false));
+                    curX = moveX;
+                    curY = moveY;
+                    break;
+            }
+        }
+    }
+
+    private static void FlattenBezier(List<DashSegment> result,
+        float x0, float y0, float c1x, float c1y, float c2x, float c2y, float x3, float y3, int depth)
+    {
+        if (depth > 8)
+        {
+            result.Add(new DashSegment(x0, y0, x3, y3, false));
+            return;
+        }
+
+        // Check flatness: distance from control points to the line (x0,y0)→(x3,y3)
+        float dx = x3 - x0, dy = y3 - y0;
+        float d1 = MathF.Abs((c1x - x3) * dy - (c1y - y3) * dx);
+        float d2 = MathF.Abs((c2x - x3) * dy - (c2y - y3) * dx);
+        float lenSq = dx * dx + dy * dy;
+        float threshold = 0.5f; // pixel tolerance
+        if ((d1 + d2) * (d1 + d2) <= threshold * threshold * lenSq)
+        {
+            result.Add(new DashSegment(x0, y0, x3, y3, false));
+            return;
+        }
+
+        // de Casteljau subdivision at t=0.5
+        float m01x = (x0 + c1x) * 0.5f, m01y = (y0 + c1y) * 0.5f;
+        float m12x = (c1x + c2x) * 0.5f, m12y = (c1y + c2y) * 0.5f;
+        float m23x = (c2x + x3) * 0.5f, m23y = (c2y + y3) * 0.5f;
+        float m012x = (m01x + m12x) * 0.5f, m012y = (m01y + m12y) * 0.5f;
+        float m123x = (m12x + m23x) * 0.5f, m123y = (m12y + m23y) * 0.5f;
+        float mx = (m012x + m123x) * 0.5f, my = (m012y + m123y) * 0.5f;
+
+        FlattenBezier(result, x0, y0, m01x, m01y, m012x, m012y, mx, my, depth + 1);
+        FlattenBezier(result, mx, my, m123x, m123y, m23x, m23y, x3, y3, depth + 1);
+    }
+
+    private readonly struct DashSegment
+    {
+        public readonly float X0, Y0, X1, Y1;
+        public readonly bool IsMoveTo;
+
+        public DashSegment(float x0, float y0, float x1, float y1, bool isMoveTo)
+        {
+            X0 = x0;
+            Y0 = y0;
+            X1 = x1;
+            Y1 = y1;
+            IsMoveTo = isMoveTo;
+        }
+    }
+
+    public static Rect ComputePathBounds(PathGeometry path)
+    {
+        double minX = double.MaxValue, minY = double.MaxValue;
+        double maxX = double.MinValue, maxY = double.MinValue;
+        foreach (var cmd in path.Commands)
+        {
+            if (cmd.Type == PathCommandType.Close)
+                continue;
+            Update(cmd.X0, cmd.Y0, ref minX, ref minY, ref maxX, ref maxY);
+            if (cmd.Type == PathCommandType.BezierTo)
+            {
+                Update(cmd.X1, cmd.Y1, ref minX, ref minY, ref maxX, ref maxY);
+                Update(cmd.X2, cmd.Y2, ref minX, ref minY, ref maxX, ref maxY);
+            }
+        }
+        if (minX > maxX)
+            return default;
+        return new Rect(minX, minY, maxX - minX, maxY - minY);
+
+        static void Update(double x, double y, ref double minX, ref double minY, ref double maxX, ref double maxY)
+        {
+            if (x < minX)
+                minX = x;
+            if (y < minY)
+                minY = y;
+            if (x > maxX)
+                maxX = x;
+            if (y > maxY)
+                maxY = y;
+        }
+    }
+
+    private static MewVGColor ToNvgColor(Color c) => MewVGColor.RGBA(c.R, c.G, c.B, c.A);
+
+    private static int GetOrCreateGradientLut(MewVGContext vg, IReadOnlyList<GradientStop> stops)
+    {
+        var cache = GradientLutCaches.GetOrCreateValue(vg);
+
+        // MewStage vendor patch allocation/0002: a brush's stops are its own immutable array, so the same brush drawn again finds
+        // its LUT by reference without building a key (a key allocates its fingerprint array, every draw).
+        if (cache.TryGetByIdentity(stops, out int byIdentity))
+        {
+            return byIdentity;
+        }
+
+        var key = new GradientLutKey(stops);
+        if (cache.TryGet(key, out int existingImage))
+        {
+            cache.RememberIdentity(stops, key);
+            return existingImage;
+        }
+
+        var pixels = BuildGradientLutPixels(stops, GRADIENT_LUT_SIZE);
+        int imageId = vg.CreateOwnedImageRGBA(GRADIENT_LUT_SIZE, 1, MewVGImageFlags.Premultiplied, pixels);
+        if (imageId != 0)
+        {
+            cache.Add(key, imageId);
+            cache.RememberIdentity(stops, key);
+        }
+
+        return imageId;
+    }
+
+    /// <summary>
+    /// Value-equality key for a gradient's stop set, used instead of a formatted string so
+    /// repeated (even animated) gradients with identical stops hit the LUT cache without a
+    /// StringBuilder/culture-format allocation per call.
+    /// </summary>
+    private readonly struct GradientLutKey : IEquatable<GradientLutKey>
+    {
+        private readonly StopFingerprint[] _stops;
+        private readonly int _hashCode;
+
+        public GradientLutKey(IReadOnlyList<GradientStop> stops)
+        {
+            var fingerprints = new StopFingerprint[stops.Count];
+            var hash = new HashCode();
+            for (var i = 0; i < stops.Count; i++)
+            {
+                var stop = stops[i];
+                long offsetBits = BitConverter.DoubleToInt64Bits(stop.Offset);
+                uint argb = ((uint)stop.Color.A << 24) | ((uint)stop.Color.R << 16) | ((uint)stop.Color.G << 8) | stop.Color.B;
+                fingerprints[i] = new StopFingerprint(offsetBits, argb);
+                hash.Add(offsetBits);
+                hash.Add(argb);
+            }
+
+            _stops = fingerprints;
+            _hashCode = hash.ToHashCode();
+        }
+
+        public bool Equals(GradientLutKey other)
+        {
+            if (_hashCode != other._hashCode || _stops.Length != other._stops.Length)
+            {
+                return false;
+            }
+
+            for (var i = 0; i < _stops.Length; i++)
+            {
+                if (!_stops[i].Equals(other._stops[i]))
+                {
+                    return false;
+                }
+            }
+
+            return true;
+        }
+
+        public override bool Equals(object? obj) => obj is GradientLutKey other && Equals(other);
+
+        public override int GetHashCode() => _hashCode;
+
+        private readonly struct StopFingerprint(long offsetBits, uint argb) : IEquatable<StopFingerprint>
+        {
+            private readonly long _offsetBits = offsetBits;
+            private readonly uint _argb = argb;
+
+            public bool Equals(StopFingerprint other) => _offsetBits == other._offsetBits && _argb == other._argb;
+
+            public override bool Equals(object? obj) => obj is StopFingerprint other && Equals(other);
+
+            public override int GetHashCode() => HashCode.Combine(_offsetBits, _argb);
+        }
+    }
+
+    /// <summary>
+    /// Per-NanoVG bounded cache of gradient LUT textures. Without a cap, an animated
+    /// gradient (color changing every frame) mints a fresh stop set - and thus a fresh
+    /// 512x1 GL texture - every frame forever.
+    /// </summary>
+    /// <remarks>
+    /// Guarded by <see cref="_syncRoot"/>: unlike <c>MewVGMetalTextCache</c> (owned
+    /// exclusively by the frame session that created it), a gradient brush can be painted
+    /// from more than one thread against the same NanoVG instance (e.g. a nested/offscreen
+    /// pass sharing the outer pass's NVG). The sibling per-NVG cache in
+    /// <c>MewVGMetalOffscreenSurfaceProvider._pendingImageDisposal</c> takes the same lock
+    /// for the same reason. Previously this cache was a <c>ConcurrentDictionary</c>, which
+    /// gave the same safety implicitly.
+    /// </remarks>
+    private sealed class GradientLutCache
+    {
+        private readonly object _syncRoot = new();
+        private readonly Dictionary<GradientLutKey, LinkedListNode<Entry>> _map = new();
+        private readonly LinkedList<Entry> _lru = new();
+        private readonly Queue<int> _pendingDeletes = new();
+
+        // MewStage vendor patch allocation/0002: stop list -> its LRU node. A node evicted from the LRU has no list, so a stale
+        // entry here is a miss, never a deleted image.
+        private readonly ConditionalWeakTable<IReadOnlyList<GradientStop>, LinkedListNode<Entry>> _byIdentity = new();
+
+        public bool TryGetByIdentity(IReadOnlyList<GradientStop> stops, out int imageId)
+        {
+            lock (_syncRoot)
+            {
+                if (_byIdentity.TryGetValue(stops, out var node) && ReferenceEquals(node.List, _lru))
+                {
+                    if (!ReferenceEquals(_lru.First, node))
+                    {
+                        _lru.Remove(node);
+                        _lru.AddFirst(node);
+                    }
+
+                    imageId = node.Value.ImageId;
+                    return true;
+                }
+
+                imageId = 0;
+                return false;
+            }
+        }
+
+        public void RememberIdentity(IReadOnlyList<GradientStop> stops, GradientLutKey key)
+        {
+            lock (_syncRoot)
+            {
+                if (_map.TryGetValue(key, out var node))
+                {
+                    _byIdentity.AddOrUpdate(stops, node);
+                }
+            }
+        }
+
+        public bool TryGet(GradientLutKey key, out int imageId)
+        {
+            lock (_syncRoot)
+            {
+                if (_map.TryGetValue(key, out var node))
+                {
+                    _lru.Remove(node);
+                    _lru.AddFirst(node);
+                    imageId = node.Value.ImageId;
+                    return true;
+                }
+
+                imageId = 0;
+                return false;
+            }
+        }
+
+        public void Add(GradientLutKey key, int imageId)
+        {
+            lock (_syncRoot)
+            {
+                var node = new LinkedListNode<Entry>(new Entry(key, imageId));
+                _lru.AddFirst(node);
+                _map[key] = node;
+
+                // Evicted textures are NOT deleted here: the frame's buffered draw calls may
+                // still reference them until the owning NanoVG flushes. They queue up and are
+                // released by the context's post-Flush drain (ReleasePendingGradientLutDeletes),
+                // mirroring MewVGTextCache's pending-delete pattern.
+                while (_map.Count > MAX_GRADIENT_LUT_ENTRIES && _lru.Last is LinkedListNode<Entry> last)
+                {
+                    _lru.RemoveLast();
+                    _map.Remove(last.Value.Key);
+                    if (last.Value.ImageId != 0)
+                    {
+                        _pendingDeletes.Enqueue(last.Value.ImageId);
+                    }
+                }
+            }
+        }
+
+        /// <summary>
+        /// Deletes textures queued by a prior eviction. Only safe after the owning NanoVG's
+        /// EndFrame/Flush, when no buffered draw call still references the queued image ids.
+        /// Called via <see cref="ReleasePendingGradientLutDeletes"/> from each frame session's
+        /// post-Flush drain point (alongside its text cache's <c>ReleasePendingDeletes</c>).
+        /// </summary>
+        public void DrainPendingDeletes(MewVGContext vg)
+        {
+            while (true)
+            {
+                int imageId;
+                lock (_syncRoot)
+                {
+                    if (_pendingDeletes.Count == 0)
+                    {
+                        return;
+                    }
+
+                    imageId = _pendingDeletes.Dequeue();
+                }
+
+                if (imageId != 0)
+                {
+                    vg.DeleteImage(imageId);
+                }
+            }
+        }
+
+        private readonly record struct Entry(GradientLutKey Key, int ImageId);
+    }
+
+    /// <summary>
+    /// Releases gradient LUT textures queued for deletion by LRU eviction. Intended to be
+    /// called from a NanoVG instance's post-Flush drain point, mirroring
+    /// <c>MewVGTextCache.ReleasePendingDeletes</c>.
+    /// </summary>
+    internal static void ReleasePendingGradientLutDeletes(MewVGContext vg)
+    {
+        if (GradientLutCaches.TryGetValue(vg, out var cache))
+        {
+            cache.DrainPendingDeletes(vg);
+        }
+    }
+
+    private static byte[] BuildGradientLutPixels(IReadOnlyList<GradientStop> stops, int lutSize)
+    {
+        var pixels = new byte[lutSize * 4];
+        for (var i = 0; i < lutSize; i++)
+        {
+            var t = lutSize == 1 ? 0.0 : i / (double)(lutSize - 1);
+            var c = Sample(stops, t);
+            var a = c.A / 255.0;
+            pixels[i * 4 + 0] = (byte)Math.Clamp((int)Math.Round(c.R * a), 0, 255);
+            pixels[i * 4 + 1] = (byte)Math.Clamp((int)Math.Round(c.G * a), 0, 255);
+            pixels[i * 4 + 2] = (byte)Math.Clamp((int)Math.Round(c.B * a), 0, 255);
+            pixels[i * 4 + 3] = c.A;
+        }
+
+        return pixels;
+    }
+}

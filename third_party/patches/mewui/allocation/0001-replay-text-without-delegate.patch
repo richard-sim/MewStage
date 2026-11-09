@@ -1,0 +1,97 @@
+MewStage vendor patch allocation/0001 (third_party/NOTICE): RenderDataReplayer replays a recorded text command by
+switching on its kind instead of passing an instance method group (text.Draw) as a delegate, which allocated one
+delegate per replayed text run per frame. No behavioural change.
+
+--- a/Rendering/Retained/RenderDataReplayer.cs
++++ b/Rendering/Retained/RenderDataReplayer.cs
+@@ -186,18 +186,42 @@
+ 
+     private static void ReplayAnyText(IGraphicsContext context, in RenderCommand command, double[] values, object?[] resources, double placedOffsetX, double placedOffsetY)
+     {
+-        var text = context.Text;
+-        if (command.Kind == RenderCommandKind.DrawTextBackground)
++        // MewStage vendor patch allocation/0001: the kind picks the draw call here, rather than passing text.Draw (an instance
++        // method group) as a delegate, which allocated a delegate for every text command replayed, every frame.
++        var layout = Require<ITextLayout>(in command, resources);
++        var options = (TextDrawOptions)resources[command.PaintIndex]!;
++        if (placedOffsetX == 0 && placedOffsetY == 0)
++        {
++            DrawText(context.Text, command.Kind, layout, new Point(command.Bounds.X, command.Bounds.Y), in options);
++            return;
++        }
++
++        context.Save();
++        try
++        {
++            // Negating the same float the caller translated by cancels it exactly.
++            context.Translate(-placedOffsetX, -placedOffsetY);
++            DrawText(context.Text, command.Kind, layout, new Point(command.Bounds.X + placedOffsetX, command.Bounds.Y + placedOffsetY), in options);
++        }
++        finally
++        {
++            context.Restore();
++        }
++    }
++
++    private static void DrawText(ITextRenderContext text, RenderCommandKind kind, ITextLayout layout, Point origin, in TextDrawOptions options)
++    {
++        if (kind == RenderCommandKind.DrawTextBackground)
+         {
+-            ReplayText(context, text.DrawBackground, in command, resources, placedOffsetX, placedOffsetY);
++            text.DrawBackground(layout, origin, in options);
+         }
+-        else if (command.Kind == RenderCommandKind.DrawTextForeground)
++        else if (kind == RenderCommandKind.DrawTextForeground)
+         {
+-            ReplayText(context, text.DrawForeground, in command, resources, placedOffsetX, placedOffsetY);
++            text.DrawForeground(layout, origin, in options);
+         }
+         else
+         {
+-            ReplayText(context, text.Draw, in command, resources, placedOffsetX, placedOffsetY);
++            text.Draw(layout, origin, in options);
+         }
+     }
+ 
+@@ -375,35 +399,6 @@
+         }
+     }
+ 
+-    private static void ReplayText(
+-        IGraphicsContext context,
+-        TextReplay replay,
+-        in RenderCommand command,
+-        object?[] resources,
+-        double placedOffsetX,
+-        double placedOffsetY)
+-    {
+-        var layout = Require<ITextLayout>(in command, resources);
+-        var options = (TextDrawOptions)resources[command.PaintIndex]!;
+-        if (placedOffsetX == 0 && placedOffsetY == 0)
+-        {
+-            replay(layout, new Point(command.Bounds.X, command.Bounds.Y), in options);
+-            return;
+-        }
+-
+-        context.Save();
+-        try
+-        {
+-            // Negating the same float the caller translated by cancels it exactly.
+-            context.Translate(-placedOffsetX, -placedOffsetY);
+-            replay(layout, new Point(command.Bounds.X + placedOffsetX, command.Bounds.Y + placedOffsetY), in options);
+-        }
+-        finally
+-        {
+-            context.Restore();
+-        }
+-    }
+-
+     [ThreadStatic]
+     private static int _replayPass;
+ 
+@@ -427,5 +422,4 @@
+             ?? throw new InvalidOperationException(
+                 $"The recorded command {command.Kind} has no {typeof(T).Name} resource.");
+ 
+-    private delegate void TextReplay(ITextLayout layout, Point origin, in TextDrawOptions options);
+ }

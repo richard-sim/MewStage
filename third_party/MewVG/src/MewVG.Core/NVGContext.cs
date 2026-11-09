@@ -1,0 +1,4392 @@
+﻿// MewVGContext Internal Context
+// Ported from nanovg.c
+// This file contains the core path rendering, state management, and tessellation logic
+
+using System.Runtime.CompilerServices;
+using System.Runtime.InteropServices;
+using System.Numerics;
+
+using Aprillz.MewVG.Tess;
+
+using static Aprillz.MewVG.NVGMath;
+
+namespace Aprillz.MewVG;
+
+#region Internal Types
+
+/// <summary>
+/// Path command types
+/// </summary>
+internal enum NVGcommands
+{
+    MoveTo = 0,
+    LineTo = 1,
+    BezierTo = 2,
+    Close = 3,
+    Winding = 4,
+}
+
+/// <summary>
+/// Point flags
+/// </summary>
+[Flags]
+internal enum NVGpointFlags : byte
+{
+    Corner = 0x01,
+    Left = 0x02,
+    Bevel = 0x04,
+    InnerBevel = 0x08,
+}
+
+/// <summary>
+/// Internal point structure for path tessellation
+/// </summary>
+[StructLayout(LayoutKind.Sequential)]
+internal struct NVGpoint
+{
+    public float X, Y;
+    public float DX, DY;
+    public float Len;
+    public float DMX, DMY;
+    public NVGpointFlags Flags;
+}
+
+/// <summary>
+/// Internal state structure
+/// </summary>
+internal struct NVGstate
+{
+    public NVGcompositeOperationState CompositeOperation;
+    public bool ShapeAntiAlias;
+    public MewVGFillRule FillRule;
+    public MewVGPaint Fill;
+    public MewVGPaint Stroke;
+    public float StrokeWidth;
+    public float MiterLimit;
+    public MewVGLineCap LineCap;
+    public MewVGLineJoin LineJoin;
+    public float Alpha;
+    public Buffer6<float> Xform; // [6]
+    public NVGscissorState Scissor;
+    public int ClipDepth;
+}
+
+[InlineArray(12)]
+internal struct Buffer12<T>
+{
+    private T _element0;
+}
+
+[InlineArray(2)]
+internal struct Buffer2<T>
+{
+    private T _element0;
+}
+
+[InlineArray(6)]
+internal struct Buffer6<T>
+{
+    private T _element0;
+}
+
+/// <summary>
+/// Internal scissor state
+/// </summary>
+internal struct NVGscissorState
+{
+    public Buffer6<float> Xform; // [6]
+    public Buffer2<float> Extent; // [2]
+
+    public NVGscissorState()
+    {
+        Xform = default;
+        Extent = default;
+        Extent[0] = -1.0f;
+        Extent[1] = -1.0f;
+    }
+}
+
+/// <summary>
+/// Internal path cache for tessellation
+/// </summary>
+internal class NVGpathCache
+{
+    public NVGpoint[] Points;
+    public int NPoints;
+    public int CPoints;
+
+    public NVGpathData[] Paths;
+    public int NPaths;
+    public int CPaths;
+
+    public NVGvertex[] Verts;
+    public int NVerts;
+    public int CVerts;
+
+    public float[] Bounds; // [4]
+
+    public NVGpathCache()
+    {
+        Points = new NVGpoint[128];
+        CPoints = 128;
+        NPoints = 0;
+
+        Paths = new NVGpathData[16];
+        CPaths = 16;
+        NPaths = 0;
+
+        Verts = new NVGvertex[256];
+        CVerts = 256;
+        NVerts = 0;
+
+        Bounds = new float[4];
+    }
+}
+
+/// <summary>
+/// Internal path data structure
+/// </summary>
+internal struct NVGpathData
+{
+    public int First;
+    public int Count;
+    public bool Closed;
+    public int NBevel;
+    public int FillOffset;
+    public int NFill;
+    public int StrokeOffset;
+    public int NStroke;
+    public MewVGWinding Winding;
+    public bool Convex;
+}
+
+#endregion
+
+/// <summary>
+/// Internal NanoVG context that implements path rendering from nanovg.c
+/// </summary>
+internal sealed class NVGContext
+{
+    private const int NVG_MAX_STATES = 32;
+    private const int NVG_INIT_COMMANDS_SIZE = 256;
+    private const float EDGE_AA_FRINGE_PX = 1f;
+
+    // miterLimit 4.0 (SVG default) keeps ~36 degree tips on miter instead of beveling.
+    // Bevel at a sharp convex tip emits outside-normal vertices that poke past
+    // the tip along both edge normals, producing visible 1-2px spikes at the
+    // corner in the fringe strip. Miter collapses those two vertices to a
+    // single point on the bisector, inside the fill body's coverage. Used
+    // consistently by Clip/Fill/BuildFillCache/FillFromCache so cached and
+    // live fill tessellation make the same join decisions.
+    private const float FillExpandMiterLimit = 4.0f;
+
+    // Render backend
+    private readonly INVGRenderer _renderer;
+
+    // Coverage-mask fill (agent/coverage-mask-fill/plan.md). A fill whose boundaries interact
+    // takes this path instead of winding resolution plus tessellation when its clipped device
+    // area per flattened point is small: mask cost scales with area, tessellation cost with
+    // points. The leave threshold sits above the enter threshold so a frozen geometry zooming
+    // around the switch point keeps one path.
+    private const float MASK_ENTER_AREA_PER_POINT = 500f;
+    private const float MASK_LEAVE_AREA_PER_POINT = 1000f;
+    private const int MASK_MAX_EXTENT = 8192;
+    // Below this the resolution sweep is already sub-millisecond, and a per-draw texture
+    // upload would cost more than it saves (a 2,000-point star measured 9.9ms against 8.6ms).
+    private const int MASK_MIN_POINTS = 2000;
+    // One mask is at most a 4K frame's worth of pixels; a frozen cache keeps a CPU copy and
+    // the renderer a device copy, so this bounds both. Unfrozen fills upload a fresh mask every
+    // draw, and a frame stops taking that route once its uploads reach the transient budget.
+    private const long MASK_MAX_BYTES = 16L * 1024 * 1024;
+    private const long MASK_TRANSIENT_FRAME_BUDGET_BYTES = 32L * 1024 * 1024;
+
+    private readonly CoverageRasterizer _maskRasterizer = new();
+    private float _frameWidth;
+    private float _frameHeight;
+    private bool _lastFillUsedMask;
+    private int _maskOriginPxX;
+    private int _maskOriginPxY;
+    private readonly float[] _maskBounds = new float[4];
+    private readonly float[] _maskGeometryPx = new float[4];
+    private long _maskTransientBytesThisFrame;
+
+    // Commands
+    private float[] _commands;
+
+    private int _ncommands;
+    private int _ccommands;
+    private float _commandx, _commandy;
+
+    // State stack
+    private readonly NVGstate[] _states;
+
+    private int _nstates;
+
+    // Path cache
+    private readonly NVGpathCache _cache;
+    private readonly Tessellator _fillTessellator = new();
+    private readonly TessResultBuffer _fillTessResultBuffer = new();
+    private readonly Tessellator _fillBoundaryTessellator = new();
+    private readonly TessResultBuffer _fillBoundaryResultBuffer = new();
+
+    // Set by ExpandFill: whether the last fill went through winding boundary
+    // resolution (used to decide device-snapshot caching in FillFromCache).
+    private bool _lastFillUsedBoundaryResolution;
+
+    // Reusable uniform grid over the current fill contours. Each segment
+    // registers its inflated bounding box, so proximity queries stay linear in
+    // boundary points (see BuildFillSegmentGrid).
+    private sealed class FillSegmentGrid
+    {
+        public int Cols;
+        public int Rows;
+        public int CellCount;
+        public int TotalEntries;
+        public float MinX;
+        public float MinY;
+        public float InvCellX;
+        public float InvCellY;
+        public int[] CellStarts = Array.Empty<int>();
+        public int[] CellCursor = Array.Empty<int>();
+        public int[] EntryPaths = Array.Empty<int>();
+        public int[] EntrySegments = Array.Empty<int>();
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public int Column(float x) => Math.Clamp((int)((x - MinX) * InvCellX), 0, Cols - 1);
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public int Row(float y) => Math.Clamp((int)((y - MinY) * InvCellY), 0, Rows - 1);
+    }
+
+    private readonly FillSegmentGrid _fillSegmentGrid = new();
+
+    private void BuildFillSegmentGrid(int pathCount, float inflate)
+    {
+        var grid = _fillSegmentGrid;
+        grid.MinX = _cache.Bounds[0];
+        grid.MinY = _cache.Bounds[1];
+        var extentX = Maxf(_cache.Bounds[2] - grid.MinX, 1e-3f);
+        var extentY = Maxf(_cache.Bounds[3] - grid.MinY, 1e-3f);
+        var cellSize = Maxf(inflate * 8f, Maxf(extentX, extentY) / 128f);
+        grid.Cols = Math.Clamp((int)(extentX / cellSize) + 1, 1, 129);
+        grid.Rows = Math.Clamp((int)(extentY / cellSize) + 1, 1, 129);
+        grid.InvCellX = grid.Cols / (extentX + 1e-3f);
+        grid.InvCellY = grid.Rows / (extentY + 1e-3f);
+        grid.CellCount = grid.Cols * grid.Rows;
+
+        if (grid.CellStarts.Length < grid.CellCount + 1)
+        {
+            grid.CellStarts = new int[grid.CellCount + 1];
+            grid.CellCursor = new int[grid.CellCount];
+        }
+
+        Array.Clear(grid.CellStarts, 0, grid.CellCount + 1);
+
+        // Pass 1: count segment entries per cell (inflated segment bbox).
+        for (var pathIndex = 0; pathIndex < pathCount; pathIndex++)
+        {
+            ref readonly var path = ref _cache.Paths[pathIndex];
+            var points = _cache.Points.AsSpan(path.First, path.Count);
+            for (var segmentIndex = 0; segmentIndex < path.Count; segmentIndex++)
+            {
+                ref readonly var segmentStart = ref points[segmentIndex];
+                ref readonly var segmentEnd = ref points[(segmentIndex + 1) % path.Count];
+                var col0 = grid.Column(Minf(segmentStart.X, segmentEnd.X) - inflate);
+                var col1 = grid.Column(Maxf(segmentStart.X, segmentEnd.X) + inflate);
+                var row0 = grid.Row(Minf(segmentStart.Y, segmentEnd.Y) - inflate);
+                var row1 = grid.Row(Maxf(segmentStart.Y, segmentEnd.Y) + inflate);
+                for (var row = row0; row <= row1; row++)
+                {
+                    for (var col = col0; col <= col1; col++)
+                    {
+                        grid.CellStarts[row * grid.Cols + col + 1]++;
+                    }
+                }
+            }
+        }
+
+        for (var cell = 0; cell < grid.CellCount; cell++)
+        {
+            grid.CellStarts[cell + 1] += grid.CellStarts[cell];
+        }
+
+        grid.TotalEntries = grid.CellStarts[grid.CellCount];
+        if (grid.EntryPaths.Length < grid.TotalEntries)
+        {
+            var capacity = (grid.TotalEntries + 0xff) & ~0xff;
+            grid.EntryPaths = new int[capacity];
+            grid.EntrySegments = new int[capacity];
+        }
+
+        Array.Copy(grid.CellStarts, grid.CellCursor, grid.CellCount);
+
+        // Pass 2: fill entries.
+        for (var pathIndex = 0; pathIndex < pathCount; pathIndex++)
+        {
+            ref readonly var path = ref _cache.Paths[pathIndex];
+            var points = _cache.Points.AsSpan(path.First, path.Count);
+            for (var segmentIndex = 0; segmentIndex < path.Count; segmentIndex++)
+            {
+                ref readonly var segmentStart = ref points[segmentIndex];
+                ref readonly var segmentEnd = ref points[(segmentIndex + 1) % path.Count];
+                var col0 = grid.Column(Minf(segmentStart.X, segmentEnd.X) - inflate);
+                var col1 = grid.Column(Maxf(segmentStart.X, segmentEnd.X) + inflate);
+                var row0 = grid.Row(Minf(segmentStart.Y, segmentEnd.Y) - inflate);
+                var row1 = grid.Row(Maxf(segmentStart.Y, segmentEnd.Y) + inflate);
+                for (var row = row0; row <= row1; row++)
+                {
+                    for (var col = col0; col <= col1; col++)
+                    {
+                        var slot = grid.CellCursor[row * grid.Cols + col]++;
+                        grid.EntryPaths[slot] = pathIndex;
+                        grid.EntrySegments[slot] = segmentIndex;
+                    }
+                }
+            }
+        }
+    }
+
+    private static float SegmentSegmentDistanceSquared(
+        float ax, float ay, float bx, float by,
+        float cx, float cy, float dx, float dy)
+    {
+        var d1 = Cross(cx, cy, dx, dy, ax, ay);
+        var d2 = Cross(cx, cy, dx, dy, bx, by);
+        var d3 = Cross(ax, ay, bx, by, cx, cy);
+        var d4 = Cross(ax, ay, bx, by, dx, dy);
+        if (((d1 > 0 && d2 < 0) || (d1 < 0 && d2 > 0)) &&
+            ((d3 > 0 && d4 < 0) || (d3 < 0 && d4 > 0)))
+        {
+            return 0f;
+        }
+
+        var best = PointSegmentDistanceSq(ax, ay, cx, cy, dx, dy);
+        best = Minf(best, PointSegmentDistanceSq(bx, by, cx, cy, dx, dy));
+        best = Minf(best, PointSegmentDistanceSq(cx, cy, ax, ay, bx, by));
+        return Minf(best, PointSegmentDistanceSq(dx, dy, ax, ay, bx, by));
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        static float Cross(float ox, float oy, float px, float py, float qx, float qy)
+            => (px - ox) * (qy - oy) - (py - oy) * (qx - ox);
+
+        static float PointSegmentDistanceSq(float px, float py, float sx, float sy, float ex, float ey)
+        {
+            var segX = ex - sx;
+            var segY = ey - sy;
+            var lengthSq = segX * segX + segY * segY;
+            var t = lengthSq > 0f ? ((px - sx) * segX + (py - sy) * segY) / lengthSq : 0f;
+            t = Clampf(t, 0f, 1f);
+            var distX = px - (sx + segX * t);
+            var distY = py - (sy + segY * t);
+            return distX * distX + distY * distY;
+        }
+    }
+
+    private readonly List<NVGClipPath> _clipStack = new();
+
+    // Grow-only buffer pool indexed by clip depth. _clipStack is always a prefix of
+    // this pool (_clipStack[i] is the same instance as _clipBufferPool[i]), so a
+    // buffer popped off _clipStack (Restore's RemoveRange) stays alive here for
+    // reuse the next time that depth is captured again - no per-Clip() allocation.
+    private readonly List<NVGClipPath> _clipBufferPool = new();
+
+    // Tolerances
+    private float _tessTol;
+
+    private float _distTol;
+    private float _fringeWidth;
+    private float _devicePxRatio;
+
+    /// <summary>Current bezier flatten tolerance (depends on devicePxRatio).</summary>
+    public float TessTol => _tessTol;
+
+    // Statistics
+    public int DrawCallCount;
+
+    public int FillTriCount;
+    public int StrokeTriCount;
+    public int TextTriCount;
+
+    // Mutable, reference type on purpose: instances are reused across Clip() calls
+    // (grow-only Paths/Verts arrays) instead of being reallocated every time.
+    private sealed class NVGClipPath
+    {
+        public NVGscissorState Scissor;
+        public float Fringe;
+        public readonly float[] Bounds = new float[4];
+        public NVGpathData[] Paths = Array.Empty<NVGpathData>();
+        public NVGvertex[] Verts = Array.Empty<NVGvertex>();
+        public int PathCount;
+        public int VertCount;
+    }
+
+    public NVGContext(INVGRenderer renderer)
+    {
+        _renderer = renderer;
+
+        _commands = new float[NVG_INIT_COMMANDS_SIZE];
+        _ccommands = NVG_INIT_COMMANDS_SIZE;
+        _ncommands = 0;
+
+        _states = new NVGstate[NVG_MAX_STATES];
+        for (var i = 0; i < NVG_MAX_STATES; i++)
+        {
+            _states[i].Scissor = new NVGscissorState();
+        }
+        _nstates = 0;
+
+        _cache = new NVGpathCache();
+
+        SetDevicePixelRatio(1.0f);
+
+        Save();
+        Reset();
+    }
+
+    #region Device Pixel Ratio
+
+    private void RefreshTolerances(float ratio)
+    {
+        _tessTol = 0.25f / ratio;
+        _distTol = 0.01f / ratio;
+        _fringeWidth = EDGE_AA_FRINGE_PX / ratio;
+    }
+
+    private void SetDevicePixelRatio(float ratio)
+    {
+        RefreshTolerances(ratio);
+        _devicePxRatio = ratio;
+    }
+
+    #endregion
+
+    #region State Management
+
+    private ref NVGstate GetState() => ref _states[_nstates - 1];
+
+    public void Save()
+    {
+        if (_nstates >= NVG_MAX_STATES)
+        {
+            return;
+        }
+
+        if (_nstates > 0)
+        {
+            // NVGstate is a plain value type (InlineArray fields included), so this
+            // struct assignment already copies Xform/Scissor/Fill/Stroke/ClipDepth.
+            _states[_nstates] = _states[_nstates - 1];
+        }
+        _nstates++;
+    }
+
+    public void Restore()
+    {
+        if (_nstates <= 1)
+        {
+            return;
+        }
+
+        _nstates--;
+
+        var desiredClipDepth = _states[_nstates - 1].ClipDepth;
+        if (_clipStack.Count > desiredClipDepth)
+        {
+            _clipStack.RemoveRange(desiredClipDepth, _clipStack.Count - desiredClipDepth);
+            _renderer.ResetClip();
+            for (var i = 0; i < _clipStack.Count; i++)
+            {
+                var clip = _clipStack[i];
+                var scissor = clip.Scissor;
+                _renderer.RenderClip(ref scissor, clip.Fringe, clip.Bounds,
+                    clip.Paths.AsSpan(0, clip.PathCount), clip.Verts.AsSpan(0, clip.VertCount));
+            }
+        }
+    }
+
+    public void Reset()
+    {
+        ref var state = ref GetState();
+
+        state.Fill = default;
+        SetPaintColor(ref state.Fill, MewVGColor.RGBA(255, 255, 255, 255));
+
+        state.Stroke = default;
+        SetPaintColor(ref state.Stroke, MewVGColor.RGBA(0, 0, 0, 255));
+
+        state.CompositeOperation = CompositeOperationState(MewVGCompositeOperation.SourceOver);
+        state.ShapeAntiAlias = true;
+        state.FillRule = MewVGFillRule.NonZero;
+        state.StrokeWidth = 1.0f;
+        state.MiterLimit = 10.0f;
+        state.LineCap = MewVGLineCap.Butt;
+        state.LineJoin = MewVGLineJoin.Miter;
+        state.Alpha = 1.0f;
+
+        TransformIdentity(state.Xform);
+
+        state.Scissor.Extent[0] = -1.0f;
+        state.Scissor.Extent[1] = -1.0f;
+
+        state.ClipDepth = 0;
+
+        if (_clipStack.Count > 0)
+        {
+            _renderer.ResetClip();
+            _clipStack.Clear();
+        }
+    }
+
+    private static void SetPaintColor(ref MewVGPaint p, MewVGColor color)
+    {
+        p = default;
+        TransformIdentity(p.Xform);
+        p.Radius = 0.0f;
+        p.Feather = 1.0f;
+        p.InnerColor = color;
+        p.OuterColor = color;
+    }
+
+    private static NVGcompositeOperationState CompositeOperationState(MewVGCompositeOperation op)
+    {
+        int sfactor, dfactor;
+
+        switch (op)
+        {
+            case MewVGCompositeOperation.SourceOver:
+                sfactor = (int)NVGblendFactor.One;
+                dfactor = (int)NVGblendFactor.OneMinusSrcAlpha;
+                break;
+
+            case MewVGCompositeOperation.SourceIn:
+                sfactor = (int)NVGblendFactor.DstAlpha;
+                dfactor = (int)NVGblendFactor.Zero;
+                break;
+
+            case MewVGCompositeOperation.SourceOut:
+                sfactor = (int)NVGblendFactor.OneMinusDstAlpha;
+                dfactor = (int)NVGblendFactor.Zero;
+                break;
+
+            case MewVGCompositeOperation.Atop:
+                sfactor = (int)NVGblendFactor.DstAlpha;
+                dfactor = (int)NVGblendFactor.OneMinusSrcAlpha;
+                break;
+
+            case MewVGCompositeOperation.DestinationOver:
+                sfactor = (int)NVGblendFactor.OneMinusDstAlpha;
+                dfactor = (int)NVGblendFactor.One;
+                break;
+
+            case MewVGCompositeOperation.DestinationIn:
+                sfactor = (int)NVGblendFactor.Zero;
+                dfactor = (int)NVGblendFactor.SrcAlpha;
+                break;
+
+            case MewVGCompositeOperation.DestinationOut:
+                sfactor = (int)NVGblendFactor.Zero;
+                dfactor = (int)NVGblendFactor.OneMinusSrcAlpha;
+                break;
+
+            case MewVGCompositeOperation.DestinationAtop:
+                sfactor = (int)NVGblendFactor.OneMinusDstAlpha;
+                dfactor = (int)NVGblendFactor.SrcAlpha;
+                break;
+
+            case MewVGCompositeOperation.Lighter:
+                sfactor = (int)NVGblendFactor.One;
+                dfactor = (int)NVGblendFactor.One;
+                break;
+
+            case MewVGCompositeOperation.Copy:
+                sfactor = (int)NVGblendFactor.One;
+                dfactor = (int)NVGblendFactor.Zero;
+                break;
+
+            case MewVGCompositeOperation.Xor:
+                sfactor = (int)NVGblendFactor.OneMinusDstAlpha;
+                dfactor = (int)NVGblendFactor.OneMinusSrcAlpha;
+                break;
+
+            default:
+                sfactor = (int)NVGblendFactor.One;
+                dfactor = (int)NVGblendFactor.Zero;
+                break;
+        }
+
+        return new NVGcompositeOperationState
+        {
+            SrcRGB = sfactor,
+            DstRGB = dfactor,
+            SrcAlpha = sfactor,
+            DstAlpha = dfactor
+        };
+    }
+
+    #endregion
+
+    #region State Setters
+
+    public void ShapeAntiAlias(bool enabled)
+    {
+        ref var state = ref GetState();
+        state.ShapeAntiAlias = enabled;
+    }
+
+    public void FillRule(MewVGFillRule rule)
+    {
+        ref var state = ref GetState();
+        state.FillRule = rule;
+    }
+
+    public void StrokeWidth(float width)
+    {
+        ref var state = ref GetState();
+        state.StrokeWidth = width;
+    }
+
+    public void MiterLimit(float limit)
+    {
+        ref var state = ref GetState();
+        state.MiterLimit = limit;
+    }
+
+    public void LineCap(MewVGLineCap cap)
+    {
+        ref var state = ref GetState();
+        state.LineCap = cap;
+    }
+
+    public void LineJoin(MewVGLineJoin join)
+    {
+        ref var state = ref GetState();
+        state.LineJoin = join;
+    }
+
+    public void GlobalAlpha(float alpha)
+    {
+        ref var state = ref GetState();
+        state.Alpha = alpha;
+    }
+
+    public void GlobalCompositeOperation(MewVGCompositeOperation op)
+    {
+        ref var state = ref GetState();
+        state.CompositeOperation = CompositeOperationState(op);
+    }
+
+    public void GlobalCompositeBlendFunc(int sfactor, int dfactor) => GlobalCompositeBlendFuncSeparate(sfactor, dfactor, sfactor, dfactor);
+
+    public void GlobalCompositeBlendFuncSeparate(int srcRGB, int dstRGB, int srcAlpha, int dstAlpha)
+    {
+        ref var state = ref GetState();
+        state.CompositeOperation = new NVGcompositeOperationState
+        {
+            SrcRGB = srcRGB,
+            DstRGB = dstRGB,
+            SrcAlpha = srcAlpha,
+            DstAlpha = dstAlpha
+        };
+    }
+
+    #endregion
+
+    #region Transform
+
+    public void ResetTransform()
+    {
+        ref var state = ref GetState();
+        TransformIdentity(state.Xform);
+    }
+
+    public void Transform(float a, float b, float c, float d, float e, float f)
+    {
+        ref var state = ref GetState();
+        Span<float> t = stackalloc float[6] { a, b, c, d, e, f };
+        TransformPremultiply(state.Xform, t);
+    }
+
+    public void Translate(float x, float y)
+    {
+        ref var state = ref GetState();
+        Span<float> t = stackalloc float[6];
+        TransformTranslate(t, x, y);
+        TransformPremultiply(state.Xform, t);
+    }
+
+    public void Rotate(float angle)
+    {
+        ref var state = ref GetState();
+        Span<float> t = stackalloc float[6];
+        TransformRotate(t, angle);
+        TransformPremultiply(state.Xform, t);
+    }
+
+    public void SkewX(float angle)
+    {
+        ref var state = ref GetState();
+        Span<float> t = stackalloc float[6];
+        TransformSkewX(t, angle);
+        TransformPremultiply(state.Xform, t);
+    }
+
+    public void SkewY(float angle)
+    {
+        ref var state = ref GetState();
+        Span<float> t = stackalloc float[6];
+        TransformSkewY(t, angle);
+        TransformPremultiply(state.Xform, t);
+    }
+
+    public void Scale(float x, float y)
+    {
+        ref var state = ref GetState();
+        Span<float> t = stackalloc float[6];
+        TransformScale(t, x, y);
+        TransformPremultiply(state.Xform, t);
+    }
+
+    public Matrix3x2 GetTransformMatrix()
+    {
+        ref readonly var state = ref GetState();
+        var x = state.Xform;
+        return new Matrix3x2(x[0], x[1], x[2], x[3], x[4], x[5]);
+    }
+
+    public void SetTransformMatrix(in Matrix3x2 matrix)
+    {
+        ref var state = ref GetState();
+        state.Xform[0] = matrix.M11;
+        state.Xform[1] = matrix.M12;
+        state.Xform[2] = matrix.M21;
+        state.Xform[3] = matrix.M22;
+        state.Xform[4] = matrix.M31;
+        state.Xform[5] = matrix.M32;
+    }
+
+    #endregion
+
+    #region Fill & Stroke Style
+
+    public void StrokeColor(MewVGColor color)
+    {
+        ref var state = ref GetState();
+        SetPaintColor(ref state.Stroke, color);
+    }
+
+    public void StrokePaint(MewVGPaint paint)
+    {
+        ref var state = ref GetState();
+        state.Stroke = paint;
+        TransformMultiply(state.Stroke.Xform, state.Xform);
+    }
+
+    public void FillColor(MewVGColor color)
+    {
+        ref var state = ref GetState();
+        SetPaintColor(ref state.Fill, color);
+    }
+
+    public void FillPaint(MewVGPaint paint)
+    {
+        ref var state = ref GetState();
+        state.Fill = paint;
+        TransformMultiply(state.Fill.Xform, state.Xform);
+    }
+
+    #endregion
+
+    #region Scissor
+
+    public void Scissor(float x, float y, float w, float h)
+    {
+        ref var state = ref GetState();
+
+        w = Maxf(0.0f, w);
+        h = Maxf(0.0f, h);
+
+        TransformIdentity(state.Scissor.Xform);
+        state.Scissor.Xform[4] = x + w * 0.5f;
+        state.Scissor.Xform[5] = y + h * 0.5f;
+        TransformMultiply(state.Scissor.Xform, state.Xform);
+
+        state.Scissor.Extent[0] = w * 0.5f;
+        state.Scissor.Extent[1] = h * 0.5f;
+    }
+
+    public void IntersectScissor(float x, float y, float w, float h)
+    {
+        ref var state = ref GetState();
+
+        // If no previous scissor has been set, set the scissor as current scissor.
+        if (state.Scissor.Extent[0] < 0)
+        {
+            Scissor(x, y, w, h);
+            return;
+        }
+
+        // Transform the current scissor rect into current transform space.
+        Span<float> pxform = stackalloc float[6];
+        Span<float> invxform = stackalloc float[6];
+        for (var i = 0; i < 6; i++)
+        {
+            pxform[i] = state.Scissor.Xform[i];
+        }
+
+        var ex = state.Scissor.Extent[0];
+        var ey = state.Scissor.Extent[1];
+        TransformInverse(invxform, state.Xform);
+        TransformMultiply(pxform, invxform);
+        var tex = ex * Absf(pxform[0]) + ey * Absf(pxform[2]);
+        var tey = ex * Absf(pxform[1]) + ey * Absf(pxform[3]);
+
+        // Intersect rects.
+        Span<float> rect = stackalloc float[4];
+        IsectRects(rect, pxform[4] - tex, pxform[5] - tey, tex * 2, tey * 2, x, y, w, h);
+
+        Scissor(rect[0], rect[1], rect[2], rect[3]);
+    }
+
+    private static void IsectRects(Span<float> dst, float ax, float ay, float aw, float ah,
+                                   float bx, float by, float bw, float bh)
+    {
+        var minx = Maxf(ax, bx);
+        var miny = Maxf(ay, by);
+        var maxx = Minf(ax + aw, bx + bw);
+        var maxy = Minf(ay + ah, by + bh);
+        dst[0] = minx;
+        dst[1] = miny;
+        dst[2] = Maxf(0.0f, maxx - minx);
+        dst[3] = Maxf(0.0f, maxy - miny);
+    }
+
+    public void ResetScissor()
+    {
+        ref var state = ref GetState();
+        state.Scissor.Xform = default;
+        state.Scissor.Extent[0] = -1.0f;
+        state.Scissor.Extent[1] = -1.0f;
+    }
+
+    #endregion
+
+    #region Clip Path
+
+    public void Clip()
+    {
+        ref var state = ref GetState();
+
+        ApplyPathTolerances();
+        FlattenPaths(enforceWinding: false);
+        if (_cache.NPaths == 0)
+        {
+            return;
+        }
+
+        var fillFringe = _fringeWidth;
+
+        // The clip becomes a coverage mask, so it takes the same inset body and AA fringe as a
+        // fill. The renderer needs geometry here, never a CPU mask in its place.
+        ExpandFill(fillFringe, MewVGLineJoin.Miter, FillExpandMiterLimit, MapFillRuleToTess(state.FillRule), allowMask: false);
+
+        var clip = RentClipBuffer(_clipStack.Count);
+        CaptureClipSnapshot(clip, state.Scissor, fillFringe);
+        _clipStack.Add(clip);
+        state.ClipDepth = _clipStack.Count;
+
+        var scissor = clip.Scissor;
+        _renderer.RenderClip(ref scissor, clip.Fringe, clip.Bounds,
+            clip.Paths.AsSpan(0, clip.PathCount), clip.Verts.AsSpan(0, clip.VertCount));
+
+        // ExpandFill destructively rewrites the path cache (fill body, forced Closed,
+        // in-place point edits), so a following Stroke() must re-flatten from commands.
+        ClearPathCache();
+    }
+
+    public void ResetClip()
+    {
+        ref var state = ref GetState();
+        state.ClipDepth = 0;
+        _clipStack.Clear();
+        _renderer.ResetClip();
+    }
+
+    // _clipStack[depth] and _clipBufferPool[depth] are always the same instance
+    // while depth < _clipStack.Count, so a slot beyond the current stack depth
+    // (either never used, or vacated by Restore()'s RemoveRange) is safe to reuse.
+    private NVGClipPath RentClipBuffer(int depth)
+    {
+        if (depth < _clipBufferPool.Count)
+        {
+            return _clipBufferPool[depth];
+        }
+
+        var buffer = new NVGClipPath();
+        _clipBufferPool.Add(buffer);
+        return buffer;
+    }
+
+    private void CaptureClipSnapshot(NVGClipPath clip, NVGscissorState scissor, float fringe)
+    {
+        clip.Scissor = scissor;
+        clip.Fringe = fringe;
+
+        // Body and fringe both go to the renderer: the mask takes the fringe's coverage ramp.
+        int totalVerts = 0;
+        for (var i = 0; i < _cache.NPaths; i++)
+        {
+            totalVerts += _cache.Paths[i].NFill + _cache.Paths[i].NStroke;
+        }
+
+        if (clip.Verts.Length < totalVerts)
+        {
+            clip.Verts = new NVGvertex[totalVerts];
+        }
+        if (clip.Paths.Length < _cache.NPaths)
+        {
+            clip.Paths = new NVGpathData[_cache.NPaths];
+        }
+
+        int vertOffset = 0;
+        for (var i = 0; i < _cache.NPaths; i++)
+        {
+            ref var srcPath = ref _cache.Paths[i];
+            var dstPath = srcPath;
+
+            dstPath.FillOffset = vertOffset;
+            if (srcPath.NFill > 0)
+            {
+                _cache.Verts.AsSpan(srcPath.FillOffset, srcPath.NFill)
+                    .CopyTo(clip.Verts.AsSpan(vertOffset));
+                vertOffset += srcPath.NFill;
+            }
+
+            dstPath.StrokeOffset = vertOffset;
+            if (srcPath.NStroke > 0)
+            {
+                _cache.Verts.AsSpan(srcPath.StrokeOffset, srcPath.NStroke)
+                    .CopyTo(clip.Verts.AsSpan(vertOffset));
+                vertOffset += srcPath.NStroke;
+            }
+
+            clip.Paths[i] = dstPath;
+        }
+
+        clip.PathCount = _cache.NPaths;
+        clip.VertCount = totalVerts;
+
+        Array.Copy(_cache.Bounds, clip.Bounds, 4);
+    }
+
+    #endregion
+
+    #region Frame Management
+
+    public void BeginFrame(float windowWidth, float windowHeight, float devicePixelRatio)
+    {
+        _nstates = 0;
+        Save();
+        Reset();
+
+        SetDevicePixelRatio(devicePixelRatio);
+        _frameWidth = windowWidth;
+        _frameHeight = windowHeight;
+
+        _renderer.BeginFrame(windowWidth, windowHeight, devicePixelRatio);
+        _maskTransientBytesThisFrame = 0;
+
+        DrawCallCount = 0;
+        FillTriCount = 0;
+        StrokeTriCount = 0;
+        TextTriCount = 0;
+    }
+
+    public void CancelFrame() => _renderer.Cancel();
+
+    public void EndFrame() => _renderer.Flush();
+
+    #endregion
+
+    #region Path Commands
+
+    private void AppendCommands(Span<float> vals)
+    {
+        ref var state = ref GetState();
+
+        var nvals = vals.Length;
+
+        if (_ncommands + nvals > _ccommands)
+        {
+            var ccommands = _ncommands + nvals + _ccommands / 2;
+            Array.Resize(ref _commands, ccommands);
+            _ccommands = ccommands;
+        }
+
+        if ((int)vals[0] != (int)NVGcommands.Close && (int)vals[0] != (int)NVGcommands.Winding)
+        {
+            _commandx = vals[nvals - 2];
+            _commandy = vals[nvals - 1];
+        }
+
+        // Transform commands
+        var i = 0;
+        while (i < nvals)
+        {
+            var cmd = (int)vals[i];
+            switch ((NVGcommands)cmd)
+            {
+                case NVGcommands.MoveTo:
+                    TransformPoint(out vals[i + 1], out vals[i + 2], state.Xform, vals[i + 1], vals[i + 2]);
+                    i += 3;
+                    break;
+
+                case NVGcommands.LineTo:
+                    TransformPoint(out vals[i + 1], out vals[i + 2], state.Xform, vals[i + 1], vals[i + 2]);
+                    i += 3;
+                    break;
+
+                case NVGcommands.BezierTo:
+                    TransformPoint(out vals[i + 1], out vals[i + 2], state.Xform, vals[i + 1], vals[i + 2]);
+                    TransformPoint(out vals[i + 3], out vals[i + 4], state.Xform, vals[i + 3], vals[i + 4]);
+                    TransformPoint(out vals[i + 5], out vals[i + 6], state.Xform, vals[i + 5], vals[i + 6]);
+                    i += 7;
+                    break;
+
+                case NVGcommands.Close:
+                    i++;
+                    break;
+
+                case NVGcommands.Winding:
+                    i += 2;
+                    break;
+
+                default:
+                    i++;
+                    break;
+            }
+        }
+
+        vals.CopyTo(_commands.AsSpan(_ncommands));
+        _ncommands += nvals;
+    }
+
+    public void BeginPath()
+    {
+        _ncommands = 0;
+        ClearPathCache();
+    }
+
+    public void MoveTo(float x, float y)
+    {
+        Span<float> vals = stackalloc float[] { (float)NVGcommands.MoveTo, x, y };
+        AppendCommands(vals);
+    }
+
+    public void LineTo(float x, float y)
+    {
+        Span<float> vals = stackalloc float[] { (float)NVGcommands.LineTo, x, y };
+        AppendCommands(vals);
+    }
+
+    public void BezierTo(float c1x, float c1y, float c2x, float c2y, float x, float y)
+    {
+        Span<float> vals = stackalloc float[] { (float)NVGcommands.BezierTo, c1x, c1y, c2x, c2y, x, y };
+        AppendCommands(vals);
+    }
+
+    public void QuadTo(float cx, float cy, float x, float y)
+    {
+        var x0 = _commandx;
+        var y0 = _commandy;
+        Span<float> vals = stackalloc float[]
+        {
+            (float)NVGcommands.BezierTo,
+            x0 + 2.0f / 3.0f * (cx - x0), y0 + 2.0f / 3.0f * (cy - y0),
+            x + 2.0f / 3.0f * (cx - x), y + 2.0f / 3.0f * (cy - y),
+            x, y
+        };
+        AppendCommands(vals);
+    }
+
+    public void ArcTo(float x1, float y1, float x2, float y2, float radius)
+    {
+        var x0 = _commandx;
+        var y0 = _commandy;
+
+        if (_ncommands == 0)
+        {
+            return;
+        }
+
+        // Handle degenerate cases
+        if (PtEquals(x0, y0, x1, y1, _distTol) ||
+            PtEquals(x1, y1, x2, y2, _distTol) ||
+            DistPtSeg(x1, y1, x0, y0, x2, y2) < _distTol * _distTol ||
+            radius < _distTol)
+        {
+            LineTo(x1, y1);
+            return;
+        }
+
+        // Calculate tangential circle to lines (x0,y0)-(x1,y1) and (x1,y1)-(x2,y2).
+        var dx0 = x0 - x1;
+        var dy0 = y0 - y1;
+        var dx1 = x2 - x1;
+        var dy1 = y2 - y1;
+        Normalize(ref dx0, ref dy0);
+        Normalize(ref dx1, ref dy1);
+        var a = Acosf(dx0 * dx1 + dy0 * dy1);
+        var d = radius / Tanf(a / 2.0f);
+
+        if (d > 10000.0f)
+        {
+            LineTo(x1, y1);
+            return;
+        }
+
+        float cx, cy, a0, a1;
+        MewVGWinding dir;
+
+        if (Cross(dx0, dy0, dx1, dy1) > 0.0f)
+        {
+            cx = x1 + dx0 * d + dy0 * radius;
+            cy = y1 + dy0 * d + -dx0 * radius;
+            a0 = Atan2f(dx0, -dy0);
+            a1 = Atan2f(-dx1, dy1);
+            dir = MewVGWinding.CW;
+        }
+        else
+        {
+            cx = x1 + dx0 * d + -dy0 * radius;
+            cy = y1 + dy0 * d + dx0 * radius;
+            a0 = Atan2f(-dx0, dy0);
+            a1 = Atan2f(dx1, -dy1);
+            dir = MewVGWinding.CCW;
+        }
+
+        Arc(cx, cy, radius, a0, a1, dir);
+    }
+
+    public void ClosePath()
+    {
+        Span<float> vals = stackalloc float[] { (float)NVGcommands.Close };
+        AppendCommands(vals);
+    }
+
+    public void PathWinding(MewVGWinding dir)
+    {
+        Span<float> vals = stackalloc float[] { (float)NVGcommands.Winding, (float)dir };
+        AppendCommands(vals);
+    }
+
+    public void Arc(float cx, float cy, float r, float a0, float a1, MewVGWinding dir)
+    {
+        var da = a1 - a0;
+        if (dir == MewVGWinding.CW)
+        {
+            if (Absf(da) >= NVG_PI * 2)
+            {
+                da = NVG_PI * 2;
+            }
+            else
+            {
+                while (da < 0.0f)
+                {
+                    da += NVG_PI * 2;
+                }
+            }
+        }
+        else
+        {
+            if (Absf(da) >= NVG_PI * 2)
+            {
+                da = -NVG_PI * 2;
+            }
+            else
+            {
+                while (da > 0.0f)
+                {
+                    da -= NVG_PI * 2;
+                }
+            }
+        }
+
+        // Split arc into max 90 degree segments.
+        var ndivs = Maxi(1, Mini((int)(Absf(da) / (NVG_PI * 0.5f) + 0.5f), 5));
+        var hda = da / (float)ndivs / 2.0f;
+        var kappa = Absf(4.0f / 3.0f * (1.0f - Cosf(hda)) / Sinf(hda));
+
+        if (dir == MewVGWinding.CCW)
+        {
+            kappa = -kappa;
+        }
+
+        // ndivs is clamped to 5 above: 1 MoveTo/LineTo triple + up to 5 BezierTo septuples.
+        const int maxArcVals = 3 + 5 * 7;
+        Span<float> vals = stackalloc float[maxArcVals];
+        var nvals = 0;
+
+        var move = _ncommands > 0 ? (int)NVGcommands.LineTo : (int)NVGcommands.MoveTo;
+
+        float px = 0, py = 0, ptanx = 0, ptany = 0;
+        for (var i = 0; i <= ndivs; i++)
+        {
+            var a = a0 + da * (i / (float)ndivs);
+            var dx = Cosf(a);
+            var dy = Sinf(a);
+            var x = cx + dx * r;
+            var y = cy + dy * r;
+            var tanx = -dy * r * kappa;
+            var tany = dx * r * kappa;
+
+            if (i == 0)
+            {
+                vals[nvals++] = (float)move;
+                vals[nvals++] = x;
+                vals[nvals++] = y;
+            }
+            else
+            {
+                vals[nvals++] = (float)NVGcommands.BezierTo;
+                vals[nvals++] = px + ptanx;
+                vals[nvals++] = py + ptany;
+                vals[nvals++] = x - tanx;
+                vals[nvals++] = y - tany;
+                vals[nvals++] = x;
+                vals[nvals++] = y;
+            }
+            px = x;
+            py = y;
+            ptanx = tanx;
+            ptany = tany;
+        }
+
+        AppendCommands(vals.Slice(0, nvals));
+    }
+
+    public void Rect(float x, float y, float w, float h)
+    {
+        Span<float> vals = stackalloc float[]
+        {
+            (float)NVGcommands.MoveTo, x, y,
+            (float)NVGcommands.LineTo, x, y + h,
+            (float)NVGcommands.LineTo, x + w, y + h,
+            (float)NVGcommands.LineTo, x + w, y,
+            (float)NVGcommands.Close
+        };
+        AppendCommands(vals);
+    }
+
+    public void RoundedRect(float x, float y, float w, float h, float r) => RoundedRectVarying(x, y, w, h, r, r, r, r);
+
+    public void RoundedRectVarying(float x, float y, float w, float h,
+        float radTopLeft, float radTopRight, float radBottomRight, float radBottomLeft)
+    {
+        if (radTopLeft < 0.1f && radTopRight < 0.1f && radBottomRight < 0.1f && radBottomLeft < 0.1f)
+        {
+            Rect(x, y, w, h);
+            return;
+        }
+
+        var halfw = Absf(w) * 0.5f;
+        var halfh = Absf(h) * 0.5f;
+        var rxBL = Minf(radBottomLeft, halfw) * Signf(w);
+        var ryBL = Minf(radBottomLeft, halfh) * Signf(h);
+        var rxBR = Minf(radBottomRight, halfw) * Signf(w);
+        var ryBR = Minf(radBottomRight, halfh) * Signf(h);
+        var rxTR = Minf(radTopRight, halfw) * Signf(w);
+        var ryTR = Minf(radTopRight, halfh) * Signf(h);
+        var rxTL = Minf(radTopLeft, halfw) * Signf(w);
+        var ryTL = Minf(radTopLeft, halfh) * Signf(h);
+
+        Span<float> vals = stackalloc float[]
+        {
+            (float)NVGcommands.MoveTo, x, y + ryTL,
+            (float)NVGcommands.LineTo, x, y + h - ryBL,
+            (float)NVGcommands.BezierTo, x, y + h - ryBL * (1 - NVG_KAPPA90), x + rxBL * (1 - NVG_KAPPA90), y + h, x + rxBL, y + h,
+            (float)NVGcommands.LineTo, x + w - rxBR, y + h,
+            (float)NVGcommands.BezierTo, x + w - rxBR * (1 - NVG_KAPPA90), y + h, x + w, y + h - ryBR * (1 - NVG_KAPPA90), x + w, y + h - ryBR,
+            (float)NVGcommands.LineTo, x + w, y + ryTR,
+            (float)NVGcommands.BezierTo, x + w, y + ryTR * (1 - NVG_KAPPA90), x + w - rxTR * (1 - NVG_KAPPA90), y, x + w - rxTR, y,
+            (float)NVGcommands.LineTo, x + rxTL, y,
+            (float)NVGcommands.BezierTo, x + rxTL * (1 - NVG_KAPPA90), y, x, y + ryTL * (1 - NVG_KAPPA90), x, y + ryTL,
+            (float)NVGcommands.Close
+        };
+        AppendCommands(vals);
+    }
+
+    public void Ellipse(float cx, float cy, float rx, float ry)
+    {
+        Span<float> vals = stackalloc float[]
+        {
+            (float)NVGcommands.MoveTo, cx - rx, cy,
+            (float)NVGcommands.BezierTo, cx - rx, cy + ry * NVG_KAPPA90, cx - rx * NVG_KAPPA90, cy + ry, cx, cy + ry,
+            (float)NVGcommands.BezierTo, cx + rx * NVG_KAPPA90, cy + ry, cx + rx, cy + ry * NVG_KAPPA90, cx + rx, cy,
+            (float)NVGcommands.BezierTo, cx + rx, cy - ry * NVG_KAPPA90, cx + rx * NVG_KAPPA90, cy - ry, cx, cy - ry,
+            (float)NVGcommands.BezierTo, cx - rx * NVG_KAPPA90, cy - ry, cx - rx, cy - ry * NVG_KAPPA90, cx - rx, cy,
+            (float)NVGcommands.Close
+        };
+        AppendCommands(vals);
+    }
+
+    public void Circle(float cx, float cy, float r) => Ellipse(cx, cy, r, r);
+
+    #endregion
+
+    #region Path Cache Operations
+
+    private void ClearPathCache()
+    {
+        _cache.NPoints = 0;
+        _cache.NPaths = 0;
+    }
+
+    #region Coverage mask fill
+
+    /// <summary>Rasterizes the current device-space contours into a coverage mask when the
+    /// area-per-point gate favours it over winding resolution. Leaves the mask in
+    /// <see cref="_maskRasterizer"/> and its placement in the mask fields.</summary>
+    private bool TryRasterizeCoverageMask(TessWindingRule windingRule, FrozenFillCache? tessCache)
+    {
+        if (_cache.NPoints < MASK_MIN_POINTS)
+        {
+            if (tessCache != null) tessCache.LastUsedMask = false;
+            return false;
+        }
+
+        float minX = float.MaxValue, minY = float.MaxValue, maxX = float.MinValue, maxY = float.MinValue;
+        for (var i = 0; i < _cache.NPaths; i++)
+        {
+            ref readonly var path = ref _cache.Paths[i];
+            var points = _cache.Points.AsSpan(path.First, path.Count);
+            for (var j = 0; j < points.Length; j++)
+            {
+                ref readonly var point = ref points[j];
+                if (point.X < minX) minX = point.X;
+                if (point.X > maxX) maxX = point.X;
+                if (point.Y < minY) minY = point.Y;
+                if (point.Y > maxY) maxY = point.Y;
+            }
+        }
+
+        // The unclipped extent decides later whether a cached mask still covers what is visible.
+        var scale = _devicePxRatio;
+        _maskGeometryPx[0] = minX * scale;
+        _maskGeometryPx[1] = minY * scale;
+        _maskGeometryPx[2] = maxX * scale;
+        _maskGeometryPx[3] = maxY * scale;
+
+        // Clip to the frame and the scissor: the mask only has to cover what can show, and the
+        // gate compares visible area, not the geometry's full extent.
+        minX = MathF.Max(minX, 0f);
+        minY = MathF.Max(minY, 0f);
+        maxX = MathF.Min(maxX, _frameWidth);
+        maxY = MathF.Min(maxY, _frameHeight);
+        ref var state = ref GetState();
+        if (state.Scissor.Extent[0] >= 0f && state.Scissor.Extent[1] >= 0f)
+        {
+            ScissorDeviceBounds(ref state.Scissor, out var sx0, out var sy0, out var sx1, out var sy1);
+            minX = MathF.Max(minX, sx0);
+            minY = MathF.Max(minY, sy0);
+            maxX = MathF.Min(maxX, sx1);
+            maxY = MathF.Min(maxY, sy1);
+        }
+        if (maxX <= minX || maxY <= minY)
+        {
+            return false;
+        }
+
+        var originPxX = (int)MathF.Floor(minX * scale);
+        var originPxY = (int)MathF.Floor(minY * scale);
+        var width = (int)MathF.Ceiling(maxX * scale) - originPxX;
+        var height = (int)MathF.Ceiling(maxY * scale) - originPxY;
+        if (width < 1 || height < 1 || width > MASK_MAX_EXTENT || height > MASK_MAX_EXTENT
+            || (long)width * height > MASK_MAX_BYTES)
+        {
+            if (tessCache != null) tessCache.LastUsedMask = false;
+            return false;
+        }
+
+        // A frozen mask is uploaded once and reused; an unfrozen one is uploaded per draw and
+        // counts against this frame's transient budget.
+        if (tessCache == null && _maskTransientBytesThisFrame + (long)width * height > MASK_TRANSIENT_FRAME_BUDGET_BYTES)
+        {
+            return false;
+        }
+
+        var areaPerPoint = (float)width * height / _cache.NPoints;
+        var threshold = tessCache is { LastUsedMask: true } ? MASK_LEAVE_AREA_PER_POINT : MASK_ENTER_AREA_PER_POINT;
+        if (areaPerPoint > threshold)
+        {
+            if (tessCache != null) tessCache.LastUsedMask = false;
+            return false;
+        }
+
+        var originX = originPxX / scale;
+        var originY = originPxY / scale;
+        _maskRasterizer.Clear();
+        for (var i = 0; i < _cache.NPaths; i++)
+        {
+            ref readonly var path = ref _cache.Paths[i];
+            if (path.Count < 3)
+            {
+                continue;
+            }
+
+            var points = _cache.Points.AsSpan(path.First, path.Count);
+            if (scale == 1f)
+            {
+                _maskRasterizer.AddContour(points, originX, originY);
+            }
+            else
+            {
+                AddScaledContour(points, originX, originY, scale);
+            }
+        }
+        _maskRasterizer.Rasterize(width, height, windingRule);
+
+        _maskOriginPxX = originPxX;
+        _maskOriginPxY = originPxY;
+        _maskBounds[0] = originX;
+        _maskBounds[1] = originY;
+        _maskBounds[2] = (originPxX + width) / scale;
+        _maskBounds[3] = (originPxY + height) / scale;
+        _lastFillUsedMask = true;
+        if (tessCache != null) tessCache.LastUsedMask = true;
+        return true;
+    }
+
+    private NVGpoint[] _maskScaledPoints = Array.Empty<NVGpoint>();
+
+    private void AddScaledContour(ReadOnlySpan<NVGpoint> points, float originX, float originY, float scale)
+    {
+        if (_maskScaledPoints.Length < points.Length)
+        {
+            _maskScaledPoints = new NVGpoint[Math.Max(points.Length, _maskScaledPoints.Length * 2)];
+        }
+
+        var scaled = _maskScaledPoints.AsSpan(0, points.Length);
+        for (var i = 0; i < points.Length; i++)
+        {
+            scaled[i].X = (points[i].X - originX) * scale;
+            scaled[i].Y = (points[i].Y - originY) * scale;
+        }
+        _maskRasterizer.AddContour(scaled, 0f, 0f);
+    }
+
+    private static void ScissorDeviceBounds(ref NVGscissorState scissor, out float x0, out float y0, out float x1, out float y1)
+    {
+        // Axis-aligned bounds of the rotated scissor rectangle: centre plus the transformed
+        // half-extents, each axis taking the absolute contributions of both basis vectors.
+        var halfW = MathF.Abs(scissor.Xform[0]) * scissor.Extent[0] + MathF.Abs(scissor.Xform[2]) * scissor.Extent[1];
+        var halfH = MathF.Abs(scissor.Xform[1]) * scissor.Extent[0] + MathF.Abs(scissor.Xform[3]) * scissor.Extent[1];
+        x0 = scissor.Xform[4] - halfW;
+        x1 = scissor.Xform[4] + halfW;
+        y0 = scissor.Xform[5] - halfH;
+        y1 = scissor.Xform[5] + halfH;
+    }
+
+    private void SubmitMaskFill(
+        ref MewVGPaint paint,
+        ref NVGstate state,
+        ReadOnlySpan<byte> coverage,
+        int maskWidth,
+        int maskHeight,
+        ReadOnlySpan<float> bounds,
+        float maskOriginPxX,
+        float maskOriginPxY,
+        object? cacheKey,
+        int cacheVersion)
+    {
+        paint.InnerColor.A *= state.Alpha;
+        paint.OuterColor.A *= state.Alpha;
+        // The mask lives in device pixels while bounds and the origin handed to the renderer
+        // are in the frame's units; the renderer maps between them with the pixel ratio.
+        _renderer.RenderMaskFill(
+            ref paint,
+            state.CompositeOperation,
+            ref state.Scissor,
+            _fringeWidth,
+            bounds,
+            coverage,
+            maskWidth,
+            maskHeight,
+            maskOriginPxX / _devicePxRatio,
+            maskOriginPxY / _devicePxRatio,
+            cacheKey,
+            cacheVersion);
+        DrawCallCount++;
+        FillTriCount += 2;
+    }
+
+    /// <summary>Whether the cached mask still contains everything of the geometry that can show:
+    /// the mask was cut to the frame and scissor of its build, and a wider frame or scissor since
+    /// then would expose the cut edge.</summary>
+    private bool MaskCoversVisible(FrozenFillCache cache, ref NVGstate state)
+    {
+        var scale = _devicePxRatio;
+        var visibleX0 = MathF.Max(cache.MaskGeometryPx[0], 0f);
+        var visibleY0 = MathF.Max(cache.MaskGeometryPx[1], 0f);
+        var visibleX1 = MathF.Min(cache.MaskGeometryPx[2], _frameWidth * scale);
+        var visibleY1 = MathF.Min(cache.MaskGeometryPx[3], _frameHeight * scale);
+        if (state.Scissor.Extent[0] >= 0f && state.Scissor.Extent[1] >= 0f)
+        {
+            ScissorDeviceBounds(ref state.Scissor, out var sx0, out var sy0, out var sx1, out var sy1);
+            visibleX0 = MathF.Max(visibleX0, sx0 * scale);
+            visibleY0 = MathF.Max(visibleY0, sy0 * scale);
+            visibleX1 = MathF.Min(visibleX1, sx1 * scale);
+            visibleY1 = MathF.Min(visibleY1, sy1 * scale);
+        }
+        if (visibleX1 <= visibleX0 || visibleY1 <= visibleY0)
+        {
+            return true;
+        }
+
+        return visibleX0 >= cache.MaskOriginX
+            && visibleY0 >= cache.MaskOriginY
+            && visibleX1 <= cache.MaskOriginX + cache.MaskWidth
+            && visibleY1 <= cache.MaskOriginY + cache.MaskHeight;
+    }
+
+    private void StoreMaskInCache(FrozenFillCache cache, TessWindingRule windingRule, float fringe, Buffer6<float> xform)
+    {
+        var width = _maskRasterizer.Width;
+        var height = _maskRasterizer.Height;
+        var coverage = _maskRasterizer.Mask.AsSpan(0, width * height);
+
+        if (cache.MaskPixels.Length < coverage.Length)
+        {
+            cache.MaskPixels = new byte[coverage.Length];
+        }
+        coverage.CopyTo(cache.MaskPixels);
+        cache.MaskVersion++;
+
+        cache.MaskWidth = width;
+        cache.MaskHeight = height;
+        cache.MaskOriginX = _maskOriginPxX;
+        cache.MaskOriginY = _maskOriginPxY;
+        _maskBounds.CopyTo(cache.MaskBounds, 0);
+        _maskGeometryPx.CopyTo(cache.MaskGeometryPx, 0);
+        for (var i = 0; i < 6; i++)
+        {
+            cache.MaskXform[i] = xform[i];
+        }
+        cache.MaskFringe = fringe;
+        cache.MaskWindingRule = windingRule;
+        cache.MaskValid = true;
+        // One device-space replay per cache: the tessellation snapshot answers the same
+        // (transform, fringe, rule) key, so it would only duplicate memory here.
+        cache.SnapshotValid = false;
+    }
+
+    private static bool XformEquals(float[] stored, Buffer6<float> current)
+    {
+        for (var i = 0; i < 6; i++)
+        {
+            if (stored[i] != current[i])
+            {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    #endregion
+
+    private void AddPath()
+    {
+        if (_cache.NPaths + 1 > _cache.CPaths)
+        {
+            var cpaths = _cache.NPaths + 1 + _cache.CPaths / 2;
+            Array.Resize(ref _cache.Paths, cpaths);
+            _cache.CPaths = cpaths;
+        }
+
+        _cache.Paths[_cache.NPaths] = new NVGpathData
+        {
+            First = _cache.NPoints,
+            Winding = MewVGWinding.CCW
+        };
+        _cache.NPaths++;
+    }
+
+    private ref NVGpoint LastPoint()
+    {
+        if (_cache.NPoints > 0)
+        {
+            return ref _cache.Points[_cache.NPoints - 1];
+        }
+
+        throw new InvalidOperationException("No points in cache");
+    }
+
+    private void AddPoint(float x, float y, NVGpointFlags flags)
+    {
+        if (_cache.NPaths <= 0)
+        {
+            return;
+        }
+
+        ref var path = ref _cache.Paths[_cache.NPaths - 1];
+
+        if (path.Count > 0 && _cache.NPoints > 0)
+        {
+            ref var pt = ref LastPoint();
+            if (PtEquals(pt.X, pt.Y, x, y, _distTol))
+            {
+                pt.Flags |= flags;
+                return;
+            }
+        }
+
+        if (_cache.NPoints + 1 > _cache.CPoints)
+        {
+            var cpoints = _cache.NPoints + 1 + _cache.CPoints / 2;
+            Array.Resize(ref _cache.Points, cpoints);
+            _cache.CPoints = cpoints;
+        }
+
+        _cache.Points[_cache.NPoints] = new NVGpoint
+        {
+            X = x,
+            Y = y,
+            Flags = flags
+        };
+        _cache.NPoints++;
+        path.Count++;
+    }
+
+    private void ClosePathInternal()
+    {
+        if (_cache.NPaths <= 0)
+        {
+            return;
+        }
+
+        ref var path = ref _cache.Paths[_cache.NPaths - 1];
+        path.Closed = true;
+    }
+
+    private void PathWindingInternal(MewVGWinding winding)
+    {
+        if (_cache.NPaths <= 0)
+        {
+            return;
+        }
+
+        ref var path = ref _cache.Paths[_cache.NPaths - 1];
+        path.Winding = winding;
+    }
+
+    #endregion
+
+    #region Path Tessellation
+
+    private void TesselateBezier(float x1, float y1, float x2, float y2,
+                                 float x3, float y3, float x4, float y4,
+                                 int level, NVGpointFlags type)
+    {
+        if (level > 14)
+        {
+            return;
+        }
+
+        var x12 = (x1 + x2) * 0.5f;
+        var y12 = (y1 + y2) * 0.5f;
+        var x23 = (x2 + x3) * 0.5f;
+        var y23 = (y2 + y3) * 0.5f;
+        var x34 = (x3 + x4) * 0.5f;
+        var y34 = (y3 + y4) * 0.5f;
+        var x123 = (x12 + x23) * 0.5f;
+        var y123 = (y12 + y23) * 0.5f;
+
+        var dx = x4 - x1;
+        var dy = y4 - y1;
+        var d2 = Absf((x2 - x4) * dy - (y2 - y4) * dx);
+        var d3 = Absf((x3 - x4) * dy - (y3 - y4) * dx);
+
+        // Absolute flatness: d2/|chord| is the control point's distance from
+        // the chord, so this bounds the real deviation by _tessTol device
+        // pixels regardless of chord length. The classic NanoVG form
+        // ((d2+d3)^2 < tol * chord^2) allows error proportional to the chord,
+        // which keeps the segment count constant across sizes and turns large
+        // curves visibly faceted.
+        if ((d2 + d3) * (d2 + d3) < _tessTol * _tessTol * (dx * dx + dy * dy))
+        {
+            AddPoint(x4, y4, type);
+            return;
+        }
+
+        var x234 = (x23 + x34) * 0.5f;
+        var y234 = (y23 + y34) * 0.5f;
+        var x1234 = (x123 + x234) * 0.5f;
+        var y1234 = (y123 + y234) * 0.5f;
+
+        TesselateBezier(x1, y1, x12, y12, x123, y123, x1234, y1234, level + 1, 0);
+        TesselateBezier(x1234, y1234, x234, y234, x34, y34, x4, y4, level + 1, type);
+    }
+
+    private void FlattenPaths(bool enforceWinding = true)
+    {
+        if (_cache.NPaths > 0)
+        {
+            return;
+        }
+
+        // Flatten
+        var i = 0;
+        while (i < _ncommands)
+        {
+            var cmd = (int)_commands[i];
+            switch ((NVGcommands)cmd)
+            {
+                case NVGcommands.MoveTo:
+                    AddPath();
+                    AddPoint(_commands[i + 1], _commands[i + 2], NVGpointFlags.Corner);
+                    i += 3;
+                    break;
+
+                case NVGcommands.LineTo:
+                    AddPoint(_commands[i + 1], _commands[i + 2], NVGpointFlags.Corner);
+                    i += 3;
+                    break;
+
+                case NVGcommands.BezierTo:
+                    if (_cache.NPoints > 0)
+                    {
+                        ref var last = ref LastPoint();
+                        TesselateBezier(last.X, last.Y,
+                            _commands[i + 1], _commands[i + 2],
+                            _commands[i + 3], _commands[i + 4],
+                            _commands[i + 5], _commands[i + 6], 0, NVGpointFlags.Corner);
+                    }
+                    i += 7;
+                    break;
+
+                case NVGcommands.Close:
+                    ClosePathInternal();
+                    i++;
+                    break;
+
+                case NVGcommands.Winding:
+                    PathWindingInternal((MewVGWinding)(int)_commands[i + 1]);
+                    i += 2;
+                    break;
+
+                default:
+                    i++;
+                    break;
+            }
+        }
+
+        _cache.Bounds[0] = _cache.Bounds[1] = 1e6f;
+        _cache.Bounds[2] = _cache.Bounds[3] = -1e6f;
+
+        // Calculate the direction and length of line segments.
+        for (var j = 0; j < _cache.NPaths; j++)
+        {
+            ref var path = ref _cache.Paths[j];
+            var pts = _cache.Points.AsSpan(path.First, path.Count);
+
+            // If the first and last points are the same, remove the last, mark as closed path.
+            if (path.Count > 0)
+            {
+                ref var p0 = ref pts[path.Count - 1];
+                ref var p1 = ref pts[0];
+                if (PtEquals(p0.X, p0.Y, p1.X, p1.Y, _distTol))
+                {
+                    path.Count--;
+                    path.Closed = true;
+                }
+            }
+
+            if (path.Count < 1)
+            {
+                continue;
+            }
+
+            pts = _cache.Points.AsSpan(path.First, path.Count);
+
+            // Legacy NanoVG winding normalization is optional for CPU-resolved fills.
+            if (enforceWinding && path.Count > 2)
+            {
+                var area = PolyArea(pts);
+                if (path.Winding == MewVGWinding.CCW && area < 0.0f)
+                {
+                    PolyReverse(pts);
+                }
+
+                if (path.Winding == MewVGWinding.CW && area > 0.0f)
+                {
+                    PolyReverse(pts);
+                }
+            }
+
+            for (var k = 0; k < path.Count; k++)
+            {
+                ref var p0 = ref pts[k];
+                ref var p1 = ref pts[(k + 1) % path.Count];
+
+                // Calculate segment direction and length
+                p0.DX = p1.X - p0.X;
+                p0.DY = p1.Y - p0.Y;
+                p0.Len = Normalize(ref p0.DX, ref p0.DY);
+
+                // Update bounds
+                _cache.Bounds[0] = Minf(_cache.Bounds[0], p0.X);
+                _cache.Bounds[1] = Minf(_cache.Bounds[1], p0.Y);
+                _cache.Bounds[2] = Maxf(_cache.Bounds[2], p0.X);
+                _cache.Bounds[3] = Maxf(_cache.Bounds[3], p0.Y);
+            }
+        }
+    }
+
+    private static float PolyArea(Span<NVGpoint> pts)
+    {
+        float area = 0;
+        for (var i = 2; i < pts.Length; i++)
+        {
+            ref var a = ref pts[0];
+            ref var b = ref pts[i - 1];
+            ref var c = ref pts[i];
+            area += TriArea2(a.X, a.Y, b.X, b.Y, c.X, c.Y);
+        }
+        return area * 0.5f;
+    }
+
+    private static bool IsConvexContour(ReadOnlySpan<NVGpoint> pts)
+    {
+        if (pts.Length < 3)
+        {
+            return false;
+        }
+
+        // Skia-style convex test: consecutive turns must have the same sign AND
+        // the total signed turn angle must equal ±2π (exactly one revolution).
+        // The first condition alone is necessary but not sufficient - a self-
+        // intersecting pentagram has all turns in one direction but winds ±4π.
+        float sign = 0f;
+        float turnSum = 0f;
+        for (var i = 0; i < pts.Length; i++)
+        {
+            ref readonly var a = ref pts[i];
+            ref readonly var b = ref pts[(i + 1) % pts.Length];
+            ref readonly var c = ref pts[(i + 2) % pts.Length];
+
+            var abx = b.X - a.X;
+            var aby = b.Y - a.Y;
+            var bcx = c.X - b.X;
+            var bcy = c.Y - b.Y;
+            var cross = abx * bcy - aby * bcx;
+            if (MathF.Abs(cross) <= 1e-8f)
+            {
+                continue;
+            }
+
+            if (sign == 0f)
+            {
+                sign = cross;
+            }
+            else if (cross * sign < 0f)
+            {
+                return false;
+            }
+
+            var dot = abx * bcx + aby * bcy;
+            turnSum += MathF.Atan2(cross, dot);
+        }
+
+        if (sign == 0f)
+        {
+            return false;
+        }
+
+        // Allow small numerical slack; a simple convex polygon winds once (±2π),
+        // self-intersecting contours wind ±4π or more.
+        const float revolution = MathF.PI * 2f;
+        return MathF.Abs(MathF.Abs(turnSum) - revolution) <= 1e-3f;
+    }
+
+    // Simple (non-self-intersecting) polygon test: sign of turn may flip (concave
+    // ok), but total turn angle must equal ±2π. Self-intersecting contours wind
+    // ±4π or more. Used to decide whether per-contour fringe AA is safe - the
+    // NanoVG-style fringe strip assumes a simple boundary; along a pentagram's
+    // self-intersecting edges the strip would cross itself at inner vertices
+    // and leave visible seams across the fill interior.
+    private static bool IsSimpleContour(ReadOnlySpan<NVGpoint> pts)
+    {
+        if (pts.Length < 3)
+        {
+            return false;
+        }
+
+        float turnSum = 0f;
+        for (var i = 0; i < pts.Length; i++)
+        {
+            ref readonly var a = ref pts[i];
+            ref readonly var b = ref pts[(i + 1) % pts.Length];
+            ref readonly var c = ref pts[(i + 2) % pts.Length];
+
+            var abx = b.X - a.X;
+            var aby = b.Y - a.Y;
+            var bcx = c.X - b.X;
+            var bcy = c.Y - b.Y;
+            var cross = abx * bcy - aby * bcx;
+            var dot = abx * bcx + aby * bcy;
+            turnSum += MathF.Atan2(cross, dot);
+        }
+
+        const float revolution = MathF.PI * 2f;
+        return MathF.Abs(MathF.Abs(turnSum) - revolution) <= 1e-3f;
+    }
+
+    private static void PolyReverse(Span<NVGpoint> pts)
+    {
+        int i = 0, j = pts.Length - 1;
+        while (i < j)
+        {
+            (pts[i], pts[j]) = (pts[j], pts[i]);
+            i++;
+            j--;
+        }
+    }
+
+    #endregion
+
+    #region Fill & Stroke Rendering
+
+    private void ApplyPathTolerances() => RefreshTolerances(Maxf(_devicePxRatio, 0.0001f));
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    internal static TessWindingRule MapFillRuleToTess(MewVGFillRule rule)
+        => rule == MewVGFillRule.EvenOdd ? TessWindingRule.Odd : TessWindingRule.NonZero;
+
+    public void Fill()
+    {
+        ref var state = ref GetState();
+        var fillPaint = state.Fill;
+
+        ApplyPathTolerances();
+        FlattenPaths(enforceWinding: false);
+
+        var useFringeAa = state.ShapeAntiAlias;
+        if (useFringeAa)
+        {
+            var fillFringe = _fringeWidth;
+            ExpandFill(fillFringe, MewVGLineJoin.Miter, FillExpandMiterLimit, MapFillRuleToTess(state.FillRule));
+        }
+        else
+        {
+            ExpandFill(0.0f, MewVGLineJoin.Miter, FillExpandMiterLimit, MapFillRuleToTess(state.FillRule));
+        }
+
+        if (_lastFillUsedMask)
+        {
+            // Nothing caches an unfrozen fill: the renderer gets a one-draw mask.
+            var width = _maskRasterizer.Width;
+            var height = _maskRasterizer.Height;
+            _maskTransientBytesThisFrame += (long)width * height;
+            SubmitMaskFill(ref fillPaint, ref state, _maskRasterizer.Mask.AsSpan(0, width * height), width, height,
+                _maskBounds, _maskOriginPxX, _maskOriginPxY, cacheKey: null, cacheVersion: 0);
+            ClearPathCache();
+            return;
+        }
+
+        // Apply global alpha
+        fillPaint.InnerColor.A *= state.Alpha;
+        fillPaint.OuterColor.A *= state.Alpha;
+
+        // Submit to renderer
+        _renderer.RenderFill(
+            ref fillPaint,
+            state.CompositeOperation,
+            ref state.Scissor,
+            useFringeAa ? _fringeWidth : 0.0f,
+            _cache.Bounds,
+            _cache.Paths.AsSpan(0, _cache.NPaths),
+            _cache.Verts);
+
+        // Count triangles. Fill body is a triangle list (NFill/3); fringe is a
+        // triangle strip (NStroke-2). A given path row carries exactly one of
+        // the two, so skip the zero side to avoid an erroneous -2.
+        for (var i = 0; i < _cache.NPaths; i++)
+        {
+            ref var path = ref _cache.Paths[i];
+            if (path.NFill > 0)
+            {
+                FillTriCount += path.NFill / 3;
+            }
+            if (path.NStroke > 0)
+            {
+                FillTriCount += path.NStroke - 2;
+            }
+            DrawCallCount += 2;
+        }
+
+        // ExpandFill destructively rewrites the path cache (fill body, forced Closed,
+        // in-place point edits), so a following Stroke() must re-flatten from commands.
+        ClearPathCache();
+    }
+
+    /// <summary>
+    /// Flatten + tessellate current path commands in object-space (identity transform).
+    /// Call after BeginPath + path commands with identity transform active.
+    /// The returned cache can be reused across frames via <see cref="FillFromCache"/>.
+    /// </summary>
+    public FrozenFillCache BuildFillCache(TessWindingRule windingRule)
+    {
+        ref var state = ref GetState();
+        ApplyPathTolerances();
+
+        var cache = new FrozenFillCache();
+        cache.TessTol = _tessTol;
+        cache.WindingRule = windingRule;
+
+        // Commands are in object-space (identity transform) but tolerances are
+        // calibrated for screen-space. Compensate by the current transform's
+        // scale factor so bezier subdivision matches screen-space visual quality.
+        var xf = state.Xform;
+        var sx = MathF.Sqrt(xf[0] * xf[0] + xf[1] * xf[1]);
+        var sy = MathF.Sqrt(xf[2] * xf[2] + xf[3] * xf[3]);
+        var scale = Maxf(Maxf(sx, sy), 0.0001f);
+        var fringeWidthObj = _fringeWidth / scale;
+
+        // The tessellation/inset baked into this cache is calibrated for this scale;
+        // FillFromCache at a larger scale would reuse bezier flattening that's too
+        // coarse for the finer screen-space tessellation tolerance (see IsStale).
+        cache.BuildScale = scale;
+
+        var savedTessTol = _tessTol;
+        var savedDistTol = _distTol;
+        var savedFringeWidth = _fringeWidth;
+        if (scale > 1.0f)
+        {
+            _tessTol /= scale;
+            _distTol /= scale;
+        }
+
+        FlattenPaths(enforceWinding: false);
+
+        // Restore standard tolerances (compensated values only needed for flattening)
+        _tessTol = savedTessTol;
+        _distTol = savedDistTol;
+        _fringeWidth = savedFringeWidth;
+
+        // Check for single convex contour (directConvexFill fast path)
+        if (_cache.NPaths == 1)
+        {
+            ref var onlyPath = ref _cache.Paths[0];
+            if (onlyPath.Count >= 3)
+            {
+                var pts = _cache.Points.AsSpan(onlyPath.First, onlyPath.Count);
+                if (IsConvexContour(pts))
+                {
+                    cache.IsDirectConvex = true;
+                    onlyPath.Closed = true;
+                    onlyPath.Winding = PolyArea(pts) >= 0.0f ? MewVGWinding.CCW : MewVGWinding.CW;
+                }
+            }
+        }
+
+        if (!cache.IsDirectConvex)
+        {
+            NormalizeContoursForFill(_distTol / (scale > 1.0f ? scale : 1.0f), 0.0f);
+        }
+
+        if (_cache.NPaths == 0)
+        {
+            ClearPathCache();
+            return cache;
+        }
+
+        if (!cache.IsDirectConvex)
+        {
+            // Geometry whose boundaries interact is re-resolved in device space at render
+            // time, and ExpandFill ignores a cached tessellation on that path, so building
+            // one here would only be thrown away. The gate reads the same topology in object
+            // space, with the fringe margin scaled to match. It runs before the joins and
+            // fringe signs because those are recomputed in device space anyway, and the
+            // fringe-sign probe is quadratic in the contour count (2.3s on 25,575 contours
+            // that the resolution then collapses to 1,565).
+            _fringeWidth = fringeWidthObj;
+            var boundariesInteract = FillNeedsBoundaryResolution(fringeWidthObj);
+            _fringeWidth = savedFringeWidth;
+            if (boundariesInteract)
+            {
+                cache.NContourPaths = _cache.NPaths;
+                cache.ContourPaths = _cache.Paths.AsSpan(0, _cache.NPaths).ToArray();
+                cache.NContourPoints = _cache.NPoints;
+                cache.ContourPoints = _cache.Points.AsSpan(0, _cache.NPoints).ToArray();
+                ClearPathCache();
+                return cache;
+            }
+
+            // Compute joins + fringe signs in object-space for inset tessellation.
+            // fringeSigns are topology-dependent (inside/outside), transform-invariant.
+            CalculateJoins(fringeWidthObj, MewVGLineJoin.Miter, FillExpandMiterLimit);
+
+            var sourcePathCount = _cache.NPaths;
+            Span<float> fringeSigns = sourcePathCount <= 128
+                ? stackalloc float[sourcePathCount]
+                : new float[sourcePathCount];
+
+            _fringeWidth = fringeWidthObj;
+            ComputeFillFringeSigns(fringeSigns, sourcePathCount, windingRule);
+            _fringeWidth = savedFringeWidth;
+
+            // Snapshot contour data (after CalculateJoins - DM vectors included)
+            cache.NContourPaths = _cache.NPaths;
+            cache.ContourPaths = _cache.Paths.AsSpan(0, _cache.NPaths).ToArray();
+            cache.NContourPoints = _cache.NPoints;
+            cache.ContourPoints = _cache.Points.AsSpan(0, _cache.NPoints).ToArray();
+
+            // Tessellate with fringe inset in object-space.
+            // Inset = fringeWidthObj * 0.5 * fringeSign. After uniform scale S at
+            // render time this becomes _fringeWidth * 0.5 * fringeSign, matching
+            // the screen-space fringe strip inner edge exactly.
+            _fillTessellator.Clear();
+            Span<Vector2> stackContour = stackalloc Vector2[128];
+            Vector2[]? rentedContour = null;
+            try
+            {
+                for (var i = 0; i < sourcePathCount; i++)
+                {
+                    ref var path = ref _cache.Paths[i];
+                    if (path.Count < 3) continue;
+                    var pts = _cache.Points.AsSpan(path.First, path.Count);
+                    var woff = fringeWidthObj * 0.5f * fringeSigns[i];
+
+                    var contour = path.Count <= stackContour.Length
+                        ? stackContour.Slice(0, path.Count)
+                        : (rentedContour = NvgScratchPool<Vector2>.Shared.Rent(path.Count)).AsSpan(0, path.Count);
+
+                    for (var j = 0; j < path.Count; j++)
+                        InsetPoint(ref contour[j], in pts[j], woff);
+                    _fillTessellator.AddContour(contour);
+
+                    if (rentedContour is not null)
+                    {
+                        NvgScratchPool<Vector2>.Shared.Return(rentedContour, clearArray: false);
+                        rentedContour = null;
+                    }
+                }
+            }
+            finally
+            {
+                if (rentedContour is not null)
+                {
+                    NvgScratchPool<Vector2>.Shared.Return(rentedContour, clearArray: false);
+                }
+            }
+
+            var tessResult = _fillTessellator.Tessellate(windingRule, TessElementType.Polygons, 3);
+            if (tessResult.Status == TessStatus.Ok)
+            {
+                cache.TessVertices = tessResult.Vertices;
+                cache.TessIndices = tessResult.Indices;
+                cache.TriangleCount = tessResult.Indices.Length / 3;
+            }
+        }
+        else
+        {
+            // Convex: just snapshot contour data (fan is computed at render time)
+            cache.NContourPaths = _cache.NPaths;
+            cache.ContourPaths = _cache.Paths.AsSpan(0, _cache.NPaths).ToArray();
+            cache.NContourPoints = _cache.NPoints;
+            cache.ContourPoints = _cache.Points.AsSpan(0, _cache.NPoints).ToArray();
+        }
+
+        ClearPathCache();
+        return cache;
+    }
+
+    /// <summary>
+    /// Render a fill using cached object-space tessellation + current transform.
+    /// Restores cached contour points, transforms to screen-space, generates fringe,
+    /// and submits to the renderer.
+    /// </summary>
+    public void FillFromCache(FrozenFillCache cache, TessWindingRule windingRule)
+    {
+        if (cache.NContourPaths == 0) return;
+
+        ref var state = ref GetState();
+        var fillPaint = state.Fill;
+        ApplyPathTolerances();
+
+        var useFringeAa = state.ShapeAntiAlias;
+        var fringe = useFringeAa ? _fringeWidth : 0.0f;
+
+        if (cache.MaskValid && cache.MaskFringe == fringe && cache.MaskWindingRule == windingRule &&
+            XformEquals(cache.MaskXform, state.Xform) && MaskCoversVisible(cache, ref state))
+        {
+            SubmitMaskFill(ref fillPaint, ref state, cache.MaskPixels.AsSpan(0, cache.MaskWidth * cache.MaskHeight),
+                cache.MaskWidth, cache.MaskHeight, cache.MaskBounds, cache.MaskOriginX, cache.MaskOriginY, cache, cache.MaskVersion);
+            return;
+        }
+
+        if (TryFillFromDeviceSnapshot(cache, windingRule, fringe, ref state, fillPaint))
+        {
+            return;
+        }
+
+        // Restore contour points and transform to screen-space
+        RestoreAndTransformContours(cache, state.Xform);
+
+        // Run ExpandFill with cached tessellation (skips NormalizeContoursForFill + tessellation)
+        if (useFringeAa)
+        {
+            ExpandFill(_fringeWidth, MewVGLineJoin.Miter, FillExpandMiterLimit, windingRule, tessCache: cache);
+        }
+        else
+        {
+            ExpandFill(0.0f, MewVGLineJoin.Miter, FillExpandMiterLimit, windingRule, tessCache: cache);
+        }
+
+        if (_lastFillUsedMask)
+        {
+            StoreMaskInCache(cache, windingRule, fringe, state.Xform);
+            SubmitMaskFill(ref fillPaint, ref state, cache.MaskPixels.AsSpan(0, cache.MaskWidth * cache.MaskHeight),
+                cache.MaskWidth, cache.MaskHeight, cache.MaskBounds, cache.MaskOriginX, cache.MaskOriginY, cache, cache.MaskVersion);
+            ClearPathCache();
+            return;
+        }
+
+        if (_lastFillUsedBoundaryResolution)
+        {
+            StoreDeviceSnapshot(cache, windingRule, fringe, state.Xform);
+        }
+
+        // Submit to renderer
+        fillPaint.InnerColor.A *= state.Alpha;
+        fillPaint.OuterColor.A *= state.Alpha;
+
+        _renderer.RenderFill(
+            ref fillPaint,
+            state.CompositeOperation,
+            ref state.Scissor,
+            useFringeAa ? _fringeWidth : 0.0f,
+            _cache.Bounds,
+            _cache.Paths.AsSpan(0, _cache.NPaths),
+            _cache.Verts);
+
+        // See Fill() for why NFill uses /3 and NStroke uses -2, each guarded on > 0.
+        for (var i = 0; i < _cache.NPaths; i++)
+        {
+            ref var path = ref _cache.Paths[i];
+            if (path.NFill > 0)
+            {
+                FillTriCount += path.NFill / 3;
+            }
+            if (path.NStroke > 0)
+            {
+                FillTriCount += path.NStroke - 2;
+            }
+            DrawCallCount += 2;
+        }
+
+        // ExpandFill destructively rewrites the path cache (fill body, forced Closed,
+        // in-place point edits), so a following Stroke() must re-flatten from commands.
+        ClearPathCache();
+    }
+
+    // Scratch for replaying a device snapshot at a translated position; per context, so a
+    // replay never mutates the snapshot another context may be reading.
+    private NVGvertex[] _snapshotShiftVerts = Array.Empty<NVGvertex>();
+    private readonly float[] _snapshotShiftBounds = new float[4];
+
+    private bool TryFillFromDeviceSnapshot(
+        FrozenFillCache cache,
+        TessWindingRule windingRule,
+        float fringe,
+        ref NVGstate state,
+        MewVGPaint fillPaint)
+    {
+        if (!cache.SnapshotValid ||
+            cache.SnapshotFringe != fringe ||
+            cache.SnapshotWindingRule != windingRule)
+        {
+            return false;
+        }
+
+        // Translation does not change winding resolution, tessellation topology or the AA
+        // fringe shape, so only the linear part has to match; a scroll replays the snapshot
+        // shifted by the translation delta. The linear part stays an exact comparison: a
+        // scale that differs even by an ulp falls back to the full device-space path.
+        for (var i = 0; i < 4; i++)
+        {
+            if (cache.SnapshotXform[i] != state.Xform[i])
+            {
+                return false;
+            }
+        }
+
+        float shiftX = state.Xform[4] - cache.SnapshotXform[4];
+        float shiftY = state.Xform[5] - cache.SnapshotXform[5];
+
+        fillPaint.InnerColor.A *= state.Alpha;
+        fillPaint.OuterColor.A *= state.Alpha;
+
+        ReadOnlySpan<NVGvertex> verts = cache.SnapshotVerts.AsSpan(0, cache.SnapshotNVerts);
+        ReadOnlySpan<float> bounds = cache.SnapshotBounds;
+        if (shiftX != 0f || shiftY != 0f)
+        {
+            // The stored snapshot stays untouched and every replay shifts from it, so the
+            // rounding error is a single step and never accumulates across scroll ticks.
+            if (_snapshotShiftVerts.Length < cache.SnapshotNVerts)
+            {
+                _snapshotShiftVerts = new NVGvertex[cache.SnapshotVerts.Length];
+            }
+            var shifted = _snapshotShiftVerts.AsSpan(0, cache.SnapshotNVerts);
+            verts.CopyTo(shifted);
+            for (var i = 0; i < shifted.Length; i++)
+            {
+                shifted[i].X += shiftX;
+                shifted[i].Y += shiftY;
+            }
+            _snapshotShiftBounds[0] = cache.SnapshotBounds[0] + shiftX;
+            _snapshotShiftBounds[1] = cache.SnapshotBounds[1] + shiftY;
+            _snapshotShiftBounds[2] = cache.SnapshotBounds[2] + shiftX;
+            _snapshotShiftBounds[3] = cache.SnapshotBounds[3] + shiftY;
+            verts = shifted;
+            bounds = _snapshotShiftBounds;
+        }
+
+        _renderer.RenderFill(
+            ref fillPaint,
+            state.CompositeOperation,
+            ref state.Scissor,
+            fringe,
+            bounds,
+            cache.SnapshotPaths.AsSpan(0, cache.SnapshotNPaths),
+            verts);
+
+        for (var i = 0; i < cache.SnapshotNPaths; i++)
+        {
+            ref readonly var path = ref cache.SnapshotPaths[i];
+            if (path.NFill > 0)
+            {
+                FillTriCount += path.NFill / 3;
+            }
+            if (path.NStroke > 0)
+            {
+                FillTriCount += path.NStroke - 2;
+            }
+            DrawCallCount += 2;
+        }
+
+        ClearPathCache();
+        return true;
+    }
+
+    private void StoreDeviceSnapshot(
+        FrozenFillCache cache,
+        TessWindingRule windingRule,
+        float fringe,
+        Buffer6<float> xform)
+    {
+        // Same reasoning as StoreMaskInCache: one device-space replay per cache.
+        cache.MaskValid = false;
+
+        if (cache.SnapshotPaths.Length < _cache.NPaths)
+        {
+            cache.SnapshotPaths = new NVGpathData[_cache.NPaths];
+        }
+
+        if (cache.SnapshotVerts.Length < _cache.NVerts)
+        {
+            cache.SnapshotVerts = new NVGvertex[_cache.NVerts];
+        }
+
+        _cache.Paths.AsSpan(0, _cache.NPaths).CopyTo(cache.SnapshotPaths);
+        _cache.Verts.AsSpan(0, _cache.NVerts).CopyTo(cache.SnapshotVerts);
+        Array.Copy(_cache.Bounds, cache.SnapshotBounds, 4);
+        for (var i = 0; i < 6; i++)
+        {
+            cache.SnapshotXform[i] = xform[i];
+        }
+
+        cache.SnapshotNPaths = _cache.NPaths;
+        cache.SnapshotNVerts = _cache.NVerts;
+        cache.SnapshotFringe = fringe;
+        cache.SnapshotWindingRule = windingRule;
+        cache.SnapshotValid = true;
+    }
+
+    private void RestoreAndTransformContours(FrozenFillCache cache, Buffer6<float> xform)
+    {
+        // Ensure capacity
+        EnsurePathCapacity(cache.NContourPaths);
+        if (cache.NContourPoints > _cache.CPoints)
+        {
+            var cpoints = (cache.NContourPoints + 0x7f) & ~0x7f;
+            Array.Resize(ref _cache.Points, cpoints);
+            _cache.CPoints = cpoints;
+        }
+
+        _cache.NPaths = cache.NContourPaths;
+        _cache.NPoints = cache.NContourPoints;
+
+        // Copy path metadata
+        cache.ContourPaths.AsSpan(0, cache.NContourPaths).CopyTo(_cache.Paths);
+
+        // Copy and transform points
+        for (var i = 0; i < cache.NContourPoints; i++)
+        {
+            ref var src = ref cache.ContourPoints[i];
+            ref var dst = ref _cache.Points[i];
+            dst = src; // copy all fields (flags etc.)
+            TransformPoint(out dst.X, out dst.Y, xform, src.X, src.Y);
+        }
+
+        // Recalculate edge directions + lengths (screen-space)
+        for (var i = 0; i < _cache.NPaths; i++)
+        {
+            ref var path = ref _cache.Paths[i];
+            var pts = _cache.Points.AsSpan(path.First, path.Count);
+            for (var k = 0; k < path.Count; k++)
+            {
+                ref var p0 = ref pts[k];
+                ref var p1 = ref pts[(k + 1) % path.Count];
+                p0.DX = p1.X - p0.X;
+                p0.DY = p1.Y - p0.Y;
+                p0.Len = Normalize(ref p0.DX, ref p0.DY);
+            }
+        }
+
+        // Recompute bounds
+        _cache.Bounds[0] = _cache.Bounds[1] = 1e6f;
+        _cache.Bounds[2] = _cache.Bounds[3] = -1e6f;
+        for (var i = 0; i < _cache.NPoints; i++)
+        {
+            var x = _cache.Points[i].X;
+            var y = _cache.Points[i].Y;
+            _cache.Bounds[0] = Math.Min(_cache.Bounds[0], x);
+            _cache.Bounds[1] = Math.Min(_cache.Bounds[1], y);
+            _cache.Bounds[2] = Math.Max(_cache.Bounds[2], x);
+            _cache.Bounds[3] = Math.Max(_cache.Bounds[3], y);
+        }
+    }
+
+    public void Stroke()
+    {
+        ref var state = ref GetState();
+        var scale = GetAverageScale(state.Xform);
+        var strokeWidth = Clampf(state.StrokeWidth * scale, 0.0f, 200.0f);
+        var strokePaint = state.Stroke;
+
+        if (strokeWidth < _fringeWidth)
+        {
+            // If the stroke width is less than pixel size, use alpha to emulate
+            // coverage. Linear alpha matches the physical coverage (a 0.3px
+            // stroke covers 30% of the pixel row); the classic quadratic form
+            // made sub-pixel hairlines nearly invisible next to Direct2D.
+            var alpha = Clampf(strokeWidth / _fringeWidth, 0.0f, 1.0f);
+            strokePaint.InnerColor.A *= alpha;
+            strokePaint.OuterColor.A *= alpha;
+            strokeWidth = _fringeWidth;
+        }
+
+        // Apply global alpha
+        strokePaint.InnerColor.A *= state.Alpha;
+        strokePaint.OuterColor.A *= state.Alpha;
+
+        ApplyPathTolerances();
+        FlattenPaths();
+
+        if (state.ShapeAntiAlias)
+        {
+            ExpandStroke(strokeWidth * 0.5f, _fringeWidth, state.LineCap, state.LineJoin, state.MiterLimit);
+        }
+        else
+        {
+            ExpandStroke(strokeWidth * 0.5f, 0.0f, state.LineCap, state.LineJoin, state.MiterLimit);
+        }
+
+        // Submit to renderer
+        _renderer.RenderStroke(
+            ref strokePaint,
+            state.CompositeOperation,
+            ref state.Scissor,
+            _fringeWidth,
+            strokeWidth,
+            _cache.Paths.AsSpan(0, _cache.NPaths),
+            _cache.Verts);
+
+        // Count triangles
+        for (var i = 0; i < _cache.NPaths; i++)
+        {
+            ref var path = ref _cache.Paths[i];
+            StrokeTriCount += path.NStroke - 2;
+            DrawCallCount++;
+        }
+    }
+
+    #endregion
+
+    #region Expand Fill/Stroke (Simplified)
+
+    private void ExpandFill(float w, MewVGLineJoin lineJoin, float miterLimit, TessWindingRule tessWindingRule,
+        FrozenFillCache? tessCache = null, bool allowMask = true)
+    {
+        var fastSingleConvex = false;
+        if (_cache.NPaths == 1)
+        {
+            ref var onlyPath = ref _cache.Paths[0];
+            if (onlyPath.Count >= 3)
+            {
+                var pts = _cache.Points.AsSpan(onlyPath.First, onlyPath.Count);
+                // Convexity is affine-invariant, so a cached tessCache verdict (computed
+                // in BuildFillCache from the same object-space contour) is still valid
+                // here after the render-time transform - no need to re-run the atan2 sweep.
+                var isConvex = tessCache != null ? tessCache.IsDirectConvex : IsConvexContour(pts);
+                if (isConvex)
+                {
+                    // Keep original flattened contour as SSOT for the common UI case
+                    // (single convex shape), skipping normalization+tessellation work.
+                    fastSingleConvex = true;
+                    onlyPath.Closed = true;
+                    onlyPath.Winding = PolyArea(pts) >= 0.0f ? MewVGWinding.CCW : MewVGWinding.CW;
+                }
+            }
+        }
+
+        if (!fastSingleConvex && tessCache == null)
+        {
+            NormalizeContoursForFill(_distTol, 0.0f);
+        }
+        var resolvedFillBoundary = false;
+        _lastFillUsedMask = false;
+        if (!fastSingleConvex && w > 0.0f && _cache.NPaths >= 1 &&
+            FillNeedsBoundaryResolution(_fringeWidth))
+        {
+            if (allowMask && TryRasterizeCoverageMask(tessWindingRule, tessCache))
+            {
+                // The mask carries both fill and anti-aliasing; the caller submits it in
+                // place of the vertex output.
+                _lastFillUsedBoundaryResolution = false;
+                _cache.NPaths = 0;
+                _cache.NVerts = 0;
+                return;
+            }
+
+            // Resolve winding and coincident edges before building either the opaque
+            // fill body or its AA fringe. This runs on the current device-space
+            // contours, including contours restored from an object-space cache.
+            // Single contours qualify too: a stroke-outline peak is a sub-fringe
+            // wedge whose fill needs the thin-coverage fade, and a contour can
+            // fold back over itself.
+            resolvedFillBoundary = ResolveFillBoundaryContours(tessWindingRule);
+        }
+        _lastFillUsedBoundaryResolution = resolvedFillBoundary;
+        if (_cache.NPaths == 0)
+        {
+            _cache.NVerts = 0;
+            return;
+        }
+
+        CalculateJoins(w, lineJoin, miterLimit);
+
+        var aa = _fringeWidth;
+        var fringe = w > 0.0f;
+        var sourcePathCount = _cache.NPaths;
+        bool directConvexFill = false;
+        int directFirst = 0;
+        int directCount = 0;
+        ReadOnlySpan<Vector2> tessVertices = default;
+        ReadOnlySpan<int> tessIndices = default;
+        int triangleCount;
+        bool tessNeedsTransform = false;
+
+        if (fastSingleConvex)
+        {
+            // Same single contour already confirmed convex above (normalization is
+            // skipped whenever fastSingleConvex is set, so sourcePathCount is still 1
+            // and the data is unchanged) - reuse that verdict instead of re-testing it.
+            ref readonly var onlyPath = ref _cache.Paths[0];
+            directConvexFill = true;
+            directFirst = onlyPath.First;
+            directCount = onlyPath.Count;
+        }
+        else if (sourcePathCount == 1)
+        {
+            ref readonly var onlyPath = ref _cache.Paths[0];
+            if (onlyPath.Count >= 3)
+            {
+                var pts = _cache.Points.AsSpan(onlyPath.First, onlyPath.Count);
+                if (IsConvexContour(pts))
+                {
+                    directConvexFill = true;
+                    directFirst = onlyPath.First;
+                    directCount = onlyPath.Count;
+                }
+            }
+        }
+
+        // Compute fringe signs early so tessellator contours can be inset to match fringe.
+        Span<float> fringeSigns = sourcePathCount <= 128
+            ? stackalloc float[sourcePathCount]
+            : new float[sourcePathCount];
+        Span<float> fringeCoverages = _cache.NPoints <= 512
+            ? stackalloc float[_cache.NPoints]
+            : new float[_cache.NPoints];
+        if (fringe)
+        {
+            if (!directConvexFill)
+            {
+                ComputeFillFringeSigns(fringeSigns, sourcePathCount, tessWindingRule);
+            }
+
+            // A resolved boundary can collapse to one convex contour, whose fringe also reads these.
+            fringeCoverages.Fill(1f);
+            if (resolvedFillBoundary)
+            {
+                ComputeThinBoundaryCoverages(fringeCoverages, sourcePathCount, aa);
+            }
+        }
+
+        if (!directConvexFill)
+        {
+            if (!resolvedFillBoundary && tessCache is { TessVertices: not null, TessIndices: not null })
+            {
+                // Use cached object-space tessellation (will be transformed during fill body emit)
+                tessVertices = tessCache.TessVertices;
+                tessIndices = tessCache.TessIndices;
+                triangleCount = tessCache.TriangleCount;
+                tessNeedsTransform = true;
+            }
+            else
+            {
+                _fillTessellator.Clear();
+                Span<Vector2> stackContour = stackalloc Vector2[128];
+                Vector2[]? rentedContour = null;
+                try
+                {
+                    for (var i = 0; i < sourcePathCount; i++)
+                    {
+                        ref var path = ref _cache.Paths[i];
+                        if (path.Count < 3)
+                        {
+                            continue;
+                        }
+
+                        var pts = _cache.Points.AsSpan(path.First, path.Count);
+                        var woff = fringe ? aa * 0.5f * fringeSigns[i] : 0.0f;
+                        if (path.Count <= stackContour.Length)
+                        {
+                            var contour = stackContour.Slice(0, path.Count);
+                            for (var j = 0; j < path.Count; j++)
+                            {
+                                // Clamp the inset to half the local feature thickness
+                                // (collapse-style): in a sub-fringe band both insets meet
+                                // at the medial line, so the opaque body vanishes there
+                                // and the fringe alone carries the tapering coverage. The
+                                // clamp is per boundary point, so it cannot bleed across
+                                // large tessellation triangles the way a per-vertex
+                                // coverage attribute would.
+                                var pointWoff = resolvedFillBoundary
+                                    ? woff * fringeCoverages[path.First + j]
+                                    : woff;
+                                InsetPoint(ref contour[j], in pts[j], pointWoff);
+                            }
+
+                            _fillTessellator.AddContour(contour);
+                        }
+                        else
+                        {
+                            rentedContour = NvgScratchPool<Vector2>.Shared.Rent(path.Count);
+                            var contour = rentedContour.AsSpan(0, path.Count);
+                            for (var j = 0; j < path.Count; j++)
+                            {
+                                var pointWoff = resolvedFillBoundary
+                                    ? woff * fringeCoverages[path.First + j]
+                                    : woff;
+                                InsetPoint(ref contour[j], in pts[j], pointWoff);
+                            }
+
+                            _fillTessellator.AddContour(contour);
+                            NvgScratchPool<Vector2>.Shared.Return(rentedContour, clearArray: false);
+                            rentedContour = null;
+                        }
+                    }
+                }
+                finally
+                {
+                    if (rentedContour is not null)
+                    {
+                        NvgScratchPool<Vector2>.Shared.Return(rentedContour, clearArray: false);
+                    }
+                }
+
+                var tessResult = _fillTessellator.Tessellate(
+                    tessWindingRule,
+                    _fillTessResultBuffer,
+                    TessElementType.Polygons,
+                    3);
+                if (tessResult.Status != TessStatus.Ok)
+                {
+                    _cache.NPaths = 0;
+                    _cache.NVerts = 0;
+                    return;
+                }
+
+                tessVertices = tessResult.Vertices.Span;
+                tessIndices = tessResult.Indices.Span;
+                triangleCount = tessIndices.Length / 3;
+            }
+        }
+        else
+        {
+            triangleCount = directCount - 2;
+        }
+
+        if (triangleCount == 0)
+        {
+            _cache.NPaths = 0;
+            _cache.NVerts = 0;
+            return;
+        }
+
+        var fringePathCount = 0;
+        if (fringe)
+        {
+            for (var i = 0; i < sourcePathCount; i++)
+            {
+                if (_cache.Paths[i].Count > 0)
+                {
+                    fringePathCount++;
+                }
+            }
+        }
+        var fillPathCount = triangleCount > 0 ? 1 : 0;
+        var finalPathCount = fringePathCount + fillPathCount;
+        EnsurePathCapacity(finalPathCount);
+
+        var cverts = triangleCount * 3;
+        if (directConvexFill && fringe)
+        {
+            // Bevel vertices split into 2 fan vertices (DL0 + DL1), adding 1 extra triangle each
+            cverts += _cache.Paths[0].NBevel * 3;
+        }
+        if (fringe)
+        {
+            for (var i = 0; i < sourcePathCount; i++)
+            {
+                ref var path = ref _cache.Paths[i];
+                if (path.Count > 0)
+                {
+                    cverts += (path.Count + path.NBevel * 7 + 1) * 2;
+                }
+            }
+        }
+
+        EnsureVerts(cverts);
+
+        if (fringe && directConvexFill)
+        {
+            ComputeFillFringeSigns(fringeSigns, sourcePathCount, tessWindingRule);
+        }
+
+        var vertOffset = 0;
+        var pathOffset = 0;
+
+        // Flag fills that need the coverage-AA pipeline instead of the stencil-
+        // fill + fringe-overlay pipeline. A self-intersecting source contour
+        // (pentagram) - its fringe strip crosses itself at inner vertices and
+        // leaves seams across the fill; coverage AA's MAX-blended accumulation
+        // collapses those overlaps to a clean boundary.
+        bool sourceHasNonSimple = false;
+        var probeCount = resolvedFillBoundary && fringe ? sourcePathCount : 0;
+        Span<float> notchMinY = probeCount <= 128 ? stackalloc float[probeCount] : new float[probeCount];
+        Span<float> notchMaxY = probeCount <= 128 ? stackalloc float[probeCount] : new float[probeCount];
+        Span<float> notchMaxX = probeCount <= 128 ? stackalloc float[probeCount] : new float[probeCount];
+        if (probeCount > 0)
+        {
+            ComputeFillProbeBounds(notchMinY, notchMaxY, notchMaxX, sourcePathCount);
+        }
+
+        if (fringe)
+        {
+            for (var i = 0; i < sourcePathCount; i++)
+            {
+                ref var srcPath = ref _cache.Paths[i];
+                if (srcPath.Count <= 0)
+                {
+                    continue;
+                }
+
+                var pts = _cache.Points.AsSpan(srcPath.First, srcPath.Count);
+                // A convex contour is always simple (single revolution, consistent turn
+                // direction is a strictly stronger condition), and directConvexFill implies
+                // sourcePathCount == 1 so this is the same contour tested above - skip the
+                // redundant atan2 sweep instead of re-deriving a result we already know.
+                if (!directConvexFill && !IsSimpleContour(pts))
+                {
+                    sourceHasNonSimple = true;
+                }
+
+                var outPath = srcPath;
+                outPath.FillOffset = 0;
+                outPath.NFill = 0;
+                outPath.Convex = false;
+                outPath.StrokeOffset = vertOffset;
+
+                var woff = aa * 0.5f;
+                float ru = -0.5f;
+
+                for (var j = 0; j < srcPath.Count; j++)
+                {
+                    ref var p0 = ref pts[(j + srcPath.Count - 1) % srcPath.Count];
+                    ref var p1 = ref pts[j];
+
+                    if (resolvedFillBoundary && IsAaBoundaryReversal(in p0, in p1))
+                    {
+                        SetVert(ref _cache.Verts[vertOffset++], p1.X, p1.Y, ru, 1);
+                        SetVert(ref _cache.Verts[vertOffset++], p1.X, p1.Y, ru, 1);
+                        continue;
+                    }
+
+                    var fringeDir = fringeSigns[i];
+                    var coverage = resolvedFillBoundary
+                        ? fringeCoverages[srcPath.First + j]
+                        : 1f;
+                    var lw = woff * fringeDir;
+                    var rw = woff * fringeDir;
+                    var lu = coverage - 0.5f;
+
+                    // Ignore InnerBevel for fill fringe. InnerBevel is set in
+                    // CalculateJoins to protect strokes from miter overlap at
+                    // interior corners, but for a thin filled rect its bevel
+                    // corners leave a small triangle at the original vertex
+                    // that's covered by neither the tess inset (which places
+                    // the boundary further inward along DM) nor the fringe
+                    // strip (which only fills between bevel corners and outside
+                    // vertices). The uncovered triangle flips to alpha<1 after
+                    // pixel-grid snapping and appears as a 1px speckle at the
+                    // contour's start vertex. The simple miter path gives a
+                    // vertex coincident with the tess inset and closes the gap.
+                    // Outer Bevel (at sharp convex corners) is still honored.
+                    var joinFlags = p1.Flags & ~NVGpointFlags.InnerBevel;
+                    if ((joinFlags & NVGpointFlags.Bevel) != 0)
+                    {
+                        // Reach the fill body first: the body inset uses the
+                        // capped miter direction (InsetPoint), which at an acute
+                        // concave corner sits deeper than the bevel points below.
+                        // Without this pair the strip starts at the bevel points
+                        // and the sliver between them and the body edge is
+                        // covered by neither (a white pixel at a notch apex).
+                        var dmSq = p1.DMX * p1.DMX + p1.DMY * p1.DMY;
+                        var cross = p0.DX * p1.DY - p0.DY * p1.DX;
+                        var isSolidNotch = false;
+                        if (resolvedFillBoundary && dmSq > 2.0f && cross * fringeDir > 0f)
+                        {
+                            // Distinguish a notch apex (solid interior beyond
+                            // the corner) from a sharp corner of a thin hole
+                            // (background beyond a thin rim): probe a little
+                            // past the miter reach and only cover the sliver
+                            // when the probe stays inside the fill.
+                            var probeInv = 1.0f / MathF.Sqrt(dmSq);
+                            var probeX = p1.X + p1.DMX * probeInv * lw * 3f;
+                            var probeY = p1.Y + p1.DMY * probeInv * lw * 3f;
+                            isSolidNotch = IsPointInsideFill(
+                                probeX, probeY, sourcePathCount, tessWindingRule, notchMinY, notchMaxY, notchMaxX);
+                        }
+
+                        if (isSolidNotch)
+                        {
+                            // A sharp concave corner: the body inset digs to the
+                            // capped miter point, deeper than the bevel points
+                            // the strip uses, and the sliver between them is
+                            // solid interior. Cover it with a full-coverage pair
+                            // regardless of the thin-fade (the fade reacts to
+                            // the opposite notch edge, but the material above a
+                            // notch apex is solid). Ordinary rounded corners and
+                            // convex corners must not emit these pairs, or they
+                            // bridge thin background slits such as an icon's
+                            // knockout halo.
+                            var invLen = 1.0f / MathF.Sqrt(dmSq);
+                            var dmx = p1.DMX * invLen;
+                            var dmy = p1.DMY * invLen;
+                            SetVert(ref _cache.Verts[vertOffset++], p1.X + dmx * lw, p1.Y + dmy * lw, 0.5f, 1);
+                            SetVert(ref _cache.Verts[vertOffset++], p1.X - dmx * rw, p1.Y - dmy * rw, ru, 1);
+                            BevelJoin(ref vertOffset, ref p0, ref p1, lw, rw, lu, ru);
+                            // And again after the bevel pair, closing the sliver
+                            // on the outgoing side of the corner as well.
+                            SetVert(ref _cache.Verts[vertOffset++], p1.X + dmx * lw, p1.Y + dmy * lw, 0.5f, 1);
+                            SetVert(ref _cache.Verts[vertOffset++], p1.X - dmx * rw, p1.Y - dmy * rw, ru, 1);
+                        }
+                        else
+                        {
+                            BevelJoin(ref vertOffset, ref p0, ref p1, lw, rw, lu, ru);
+                        }
+                    }
+                    else
+                    {
+                        SetVert(ref _cache.Verts[vertOffset++], p1.X + p1.DMX * lw, p1.Y + p1.DMY * lw, lu, 1);
+                        SetVert(ref _cache.Verts[vertOffset++], p1.X - p1.DMX * rw, p1.Y - p1.DMY * rw, ru, 1);
+                    }
+                }
+
+                ref readonly var firstInner = ref _cache.Verts[outPath.StrokeOffset];
+                ref readonly var firstOuter = ref _cache.Verts[outPath.StrokeOffset + 1];
+                SetVert(ref _cache.Verts[vertOffset++], firstInner.X, firstInner.Y, firstInner.U, firstInner.V);
+                SetVert(ref _cache.Verts[vertOffset++], firstOuter.X, firstOuter.Y, firstOuter.U, firstOuter.V);
+
+                outPath.NStroke = vertOffset - outPath.StrokeOffset;
+                _cache.Paths[pathOffset++] = outPath;
+            }
+        }
+
+        if (triangleCount > 0)
+        {
+            ref var outPath = ref _cache.Paths[pathOffset++];
+            outPath = default;
+            outPath.FillOffset = vertOffset;
+            outPath.StrokeOffset = 0;
+            outPath.NStroke = 0;
+            // A winding-resolved boundary, or a non-simple source, produces a
+            // tessellated body that is not a single convex fan. Route it through
+            // the backend coverage-AA path so overlapping fringe triangles are
+            // accumulated once instead of darkening each other.
+            outPath.Convex = !resolvedFillBoundary && !sourceHasNonSimple;
+
+            if (directConvexFill)
+            {
+                var pts = _cache.Points.AsSpan(directFirst, directCount);
+                if (fringe)
+                {
+                    // Bevel-aware inset fan (mirrors NanoVG's nvg__expandFill fill fan).
+                    // At sharp corners (bevel), DM magnitude >> 1 causes overshoot.
+                    // Split to two edge normals (DL, magnitude=1) to match fringe's BevelJoin.
+                    var woff = aa * 0.5f * fringeSigns[0];
+                    float cx = 0, cy = 0;
+                    float px = 0, py = 0;
+                    var fanIdx = 0;
+
+                    for (var j = 0; j < directCount; j++)
+                    {
+                        ref var p1 = ref pts[j];
+
+                        // Mirror the fringe exactly: BevelJoin (ChooseBevel) is used ONLY when the Bevel flag
+                        // is set; InnerBevel-only and smooth joins use the plain miter inset (the else branch).
+                        if ((p1.Flags & NVGpointFlags.Bevel) != 0)
+                        {
+                            ref var p0 = ref pts[j > 0 ? j - 1 : directCount - 1];
+                            // Use the EXACT inner points the fringe strip uses at this join (same ChooseBevel,
+                            // same InnerBevel flag, same inset), so the fill-body edge and the fringe inner edge
+                            // are coincident - no sub-pixel seam. Raw edge normals only match ChooseBevel's
+                            // InnerBevel branch; at an outer convex bevel the fringe uses the miter point, so the
+                            // old code left a thin seam that showed as interior zigzag on thin fills.
+                            ChooseBevel((p1.Flags & NVGpointFlags.InnerBevel) != 0, ref p0, ref p1, woff,
+                                out var bx0, out var by0, out var bx1, out var by1);
+
+                            // First inner vertex
+                            if (fanIdx == 0) { cx = bx0; cy = by0; }
+                            else if (fanIdx == 1) { px = bx0; py = by0; }
+                            else
+                            {
+                                SetVert(ref _cache.Verts[vertOffset++], cx, cy, 0.5f, 1);
+                                SetVert(ref _cache.Verts[vertOffset++], px, py, 0.5f, 1);
+                                SetVert(ref _cache.Verts[vertOffset++], bx0, by0, 0.5f, 1);
+                                px = bx0; py = by0;
+                            }
+                            fanIdx++;
+
+                            // Second inner vertex
+                            if (fanIdx == 1) { px = bx1; py = by1; }
+                            else
+                            {
+                                SetVert(ref _cache.Verts[vertOffset++], cx, cy, 0.5f, 1);
+                                SetVert(ref _cache.Verts[vertOffset++], px, py, 0.5f, 1);
+                                SetVert(ref _cache.Verts[vertOffset++], bx1, by1, 0.5f, 1);
+                                px = bx1; py = by1;
+                            }
+                            fanIdx++;
+                        }
+                        else
+                        {
+                            // Smooth vertex: DM magnitude ≈ 1, safe to use.
+                            var fx = p1.X + p1.DMX * woff;
+                            var fy = p1.Y + p1.DMY * woff;
+                            if (fanIdx == 0) { cx = fx; cy = fy; }
+                            else if (fanIdx == 1) { px = fx; py = fy; }
+                            else
+                            {
+                                SetVert(ref _cache.Verts[vertOffset++], cx, cy, 0.5f, 1);
+                                SetVert(ref _cache.Verts[vertOffset++], px, py, 0.5f, 1);
+                                SetVert(ref _cache.Verts[vertOffset++], fx, fy, 0.5f, 1);
+                                px = fx; py = fy;
+                            }
+                            fanIdx++;
+                        }
+                    }
+                }
+                else
+                {
+                    // No fringe: simple fan without inset
+                    for (var i = 1; i < directCount - 1; i++)
+                    {
+                        SetVert(ref _cache.Verts[vertOffset++], pts[0].X, pts[0].Y, 0.5f, 1);
+                        SetVert(ref _cache.Verts[vertOffset++], pts[i].X, pts[i].Y, 0.5f, 1);
+                        SetVert(ref _cache.Verts[vertOffset++], pts[i + 1].X, pts[i + 1].Y, 0.5f, 1);
+                    }
+                }
+            }
+            else
+            {
+                if (tessNeedsTransform)
+                {
+                    // Cached object-space tessellation: transform to screen-space
+                    ref readonly var xform = ref GetState().Xform;
+                    for (var i = 0; i < triangleCount; i++)
+                    {
+                        var i0 = tessIndices[i * 3];
+                        var i1 = tessIndices[i * 3 + 1];
+                        var i2 = tessIndices[i * 3 + 2];
+
+                        TransformPoint(out var x0, out var y0, xform, tessVertices[i0].X, tessVertices[i0].Y);
+                        TransformPoint(out var x1, out var y1, xform, tessVertices[i1].X, tessVertices[i1].Y);
+                        TransformPoint(out var x2, out var y2, xform, tessVertices[i2].X, tessVertices[i2].Y);
+
+                        SetVert(ref _cache.Verts[vertOffset++], x0, y0, 0.5f, 1);
+                        SetVert(ref _cache.Verts[vertOffset++], x1, y1, 0.5f, 1);
+                        SetVert(ref _cache.Verts[vertOffset++], x2, y2, 0.5f, 1);
+                    }
+                }
+                else
+                {
+                    for (var i = 0; i < triangleCount; i++)
+                    {
+                        var i0 = tessIndices[i * 3];
+                        var i1 = tessIndices[i * 3 + 1];
+                        var i2 = tessIndices[i * 3 + 2];
+
+                        var v0 = tessVertices[i0];
+                        var v1 = tessVertices[i1];
+                        var v2 = tessVertices[i2];
+
+                        SetVert(ref _cache.Verts[vertOffset++], v0.X, v0.Y, 0.5f, 1);
+                        SetVert(ref _cache.Verts[vertOffset++], v1.X, v1.Y, 0.5f, 1);
+                        SetVert(ref _cache.Verts[vertOffset++], v2.X, v2.Y, 0.5f, 1);
+                    }
+                }
+            }
+
+            outPath.NFill = vertOffset - outPath.FillOffset;
+        }
+
+        _cache.NPaths = finalPathCount;
+        _cache.NVerts = vertOffset;
+    }
+
+    private bool FillNeedsBoundaryResolution(float margin)
+    {
+        var pathCount = _cache.NPaths;
+
+        // Winding resolution is only needed where boundary runs interact:
+        // contours of the fill crossing, touching, or sitting within a fringe
+        // of each other, or one contour folding back over itself (an arrow
+        // whose shaft doubles back across its head). Well-separated boundaries
+        // (a uniform-thickness border ring, disjoint shapes) render correctly
+        // through the ordinary cache-friendly fill path.
+        BuildFillSegmentGrid(pathCount, margin);
+        var grid = _fillSegmentGrid;
+
+        // Prefix arc lengths per point: two segments of the same contour that
+        // are close in space but adjacent along the contour (flattened tight
+        // arcs, end caps) are normal geometry, not a fold-over. Only pairs far
+        // apart along the contour count as self-overlap.
+        var pool = NvgScratchPool<float>.Shared;
+        var arcPrefix = pool.Rent(_cache.NPoints);
+        var arcTotals = pool.Rent(pathCount);
+        for (var i = 0; i < pathCount; i++)
+        {
+            ref readonly var path = ref _cache.Paths[i];
+            var points = _cache.Points.AsSpan(path.First, path.Count);
+            var running = 0f;
+            for (var j = 0; j < path.Count; j++)
+            {
+                arcPrefix[path.First + j] = running;
+                running += points[j].Len;
+            }
+
+            arcTotals[i] = running;
+        }
+
+        var interacts = false;
+        var marginSquared = margin * margin;
+        var minimumFoldSeparation = margin * 4f;
+        for (var cell = 0; cell < grid.CellCount && !interacts; cell++)
+        {
+            var first = grid.CellStarts[cell];
+            var last = grid.CellStarts[cell + 1];
+            for (var a = first; a < last && !interacts; a++)
+            {
+                var pathA = grid.EntryPaths[a];
+                ref readonly var contourA = ref _cache.Paths[pathA];
+                var pointsA = _cache.Points.AsSpan(contourA.First, contourA.Count);
+                var segA = grid.EntrySegments[a];
+                ref readonly var a0 = ref pointsA[segA];
+                ref readonly var a1 = ref pointsA[(segA + 1) % contourA.Count];
+                for (var b = a + 1; b < last; b++)
+                {
+                    var pathB = grid.EntryPaths[b];
+                    var segB = grid.EntrySegments[b];
+                    if (pathB == pathA)
+                    {
+                        var arcSeparation = MathF.Abs(arcPrefix[contourA.First + segB] - arcPrefix[contourA.First + segA]);
+                        arcSeparation = Minf(arcSeparation, arcTotals[pathA] - arcSeparation);
+                        if (arcSeparation <= minimumFoldSeparation)
+                        {
+                            continue;
+                        }
+                    }
+
+                    ref readonly var contourB = ref _cache.Paths[pathB];
+                    var pointsB = _cache.Points.AsSpan(contourB.First, contourB.Count);
+                    ref readonly var b0 = ref pointsB[segB];
+                    ref readonly var b1 = ref pointsB[(segB + 1) % contourB.Count];
+                    if (SegmentSegmentDistanceSquared(
+                            a0.X, a0.Y, a1.X, a1.Y, b0.X, b0.Y, b1.X, b1.Y) < marginSquared)
+                    {
+                        interacts = true;
+                        break;
+                    }
+                }
+            }
+        }
+
+        pool.Return(arcTotals, clearArray: false);
+        pool.Return(arcPrefix, clearArray: false);
+        return interacts;
+    }
+
+    private bool ResolveFillBoundaryContours(TessWindingRule windingRule)
+    {
+        _fillBoundaryTessellator.Clear();
+
+        Span<Vector2> stackContour = stackalloc Vector2[128];
+        Vector2[]? rentedContour = null;
+        try
+        {
+            for (var i = 0; i < _cache.NPaths; i++)
+            {
+                ref readonly var path = ref _cache.Paths[i];
+                if (path.Count < 3)
+                {
+                    continue;
+                }
+
+                var points = _cache.Points.AsSpan(path.First, path.Count);
+                var contour = path.Count <= stackContour.Length
+                    ? stackContour.Slice(0, path.Count)
+                    : (rentedContour = NvgScratchPool<Vector2>.Shared.Rent(path.Count)).AsSpan(0, path.Count);
+
+                for (var j = 0; j < path.Count; j++)
+                {
+                    contour[j] = new Vector2(points[j].X, points[j].Y);
+                }
+
+                _fillBoundaryTessellator.AddContour(contour);
+                if (rentedContour is not null)
+                {
+                    NvgScratchPool<Vector2>.Shared.Return(rentedContour, clearArray: false);
+                    rentedContour = null;
+                }
+            }
+        }
+        finally
+        {
+            if (rentedContour is not null)
+            {
+                NvgScratchPool<Vector2>.Shared.Return(rentedContour, clearArray: false);
+            }
+        }
+
+        var result = _fillBoundaryTessellator.Tessellate(
+            windingRule,
+            _fillBoundaryResultBuffer,
+            TessElementType.BoundaryContours,
+            3);
+        if (result.Status != TessStatus.Ok)
+        {
+            return false;
+        }
+
+        var vertices = result.Vertices.Span;
+        var elements = result.Indices.Span;
+        if ((elements.Length & 1) != 0)
+        {
+            return false;
+        }
+
+        EnsurePathCapacity(elements.Length / 2);
+        if (vertices.Length > _cache.CPoints)
+        {
+            var capacity = (vertices.Length + 0x7f) & ~0x7f;
+            Array.Resize(ref _cache.Points, capacity);
+            _cache.CPoints = capacity;
+        }
+
+        var pathCount = 0;
+        var pointCount = 0;
+        for (var i = 0; i < elements.Length; i += 2)
+        {
+            var first = elements[i];
+            var count = elements[i + 1];
+            if (first < 0 || count < 3 || first > vertices.Length - count)
+            {
+                continue;
+            }
+
+            var destinationFirst = pointCount;
+            for (var j = 0; j < count; j++)
+            {
+                var vertex = vertices[first + j];
+                _cache.Points[pointCount++] = new NVGpoint
+                {
+                    X = vertex.X,
+                    Y = vertex.Y,
+                    Flags = NVGpointFlags.Corner,
+                };
+            }
+
+            RecomputePathSegmentData(destinationFirst, count);
+            var signedArea2 = ComputeSignedArea2(destinationFirst, count);
+            _cache.Paths[pathCount++] = new NVGpathData
+            {
+                First = destinationFirst,
+                Count = count,
+                Closed = true,
+                Winding = signedArea2 >= 0.0 ? MewVGWinding.CCW : MewVGWinding.CW,
+            };
+        }
+
+        if (pathCount == 0)
+        {
+            return false;
+        }
+
+        _cache.NPaths = pathCount;
+        _cache.NPoints = pointCount;
+        RecalculatePathBounds();
+        return true;
+    }
+
+    // Threshold keeps ordinary sharp corners (arrow barbs, chevrons) fringed;
+    // only a near-exact fold-back such as a zero-thickness tangent reversal
+    // collapses the strip, where a join would fold the fringe over itself.
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static bool IsAaBoundaryReversal(in NVGpoint previous, in NVGpoint current)
+        => previous.DX * current.DX + previous.DY * current.DY < -0.95f;
+
+    private void ComputeThinBoundaryCoverages(
+        Span<float> coverages,
+        int sourcePathCount,
+        float fringeWidth)
+    {
+        if (fringeWidth <= 0f)
+        {
+            return;
+        }
+
+        // A single-cell lookup sees every segment within one fringe of the
+        // point because segments register a fringe-inflated bounding box.
+        BuildFillSegmentGrid(sourcePathCount, fringeWidth);
+        var grid = _fillSegmentGrid;
+
+        var fringeWidthSquared = fringeWidth * fringeWidth;
+        for (var pathIndex = 0; pathIndex < sourcePathCount; pathIndex++)
+        {
+            ref readonly var path = ref _cache.Paths[pathIndex];
+            var points = _cache.Points.AsSpan(path.First, path.Count);
+            for (var pointIndex = 0; pointIndex < path.Count; pointIndex++)
+            {
+                ref readonly var point = ref points[pointIndex];
+                var minimumDistanceSquared = fringeWidthSquared;
+                var previousIndex = (pointIndex + path.Count - 1) % path.Count;
+
+                var cell = grid.Row(point.Y) * grid.Cols + grid.Column(point.X);
+                var entryEnd = grid.CellStarts[cell + 1];
+                for (var entry = grid.CellStarts[cell]; entry < entryEnd; entry++)
+                {
+                    var candidatePathIndex = grid.EntryPaths[entry];
+                    var segmentIndex = grid.EntrySegments[entry];
+                    if (candidatePathIndex == pathIndex &&
+                        (segmentIndex == pointIndex || segmentIndex == previousIndex))
+                    {
+                        continue;
+                    }
+
+                    ref readonly var candidatePath = ref _cache.Paths[candidatePathIndex];
+                    var candidates = _cache.Points.AsSpan(candidatePath.First, candidatePath.Count);
+                    ref readonly var segmentStart = ref candidates[segmentIndex];
+                    // Only the opposite side of a thin feature can collapse
+                    // this point's inner/outer AA partners. Adjacent boundary
+                    // runs and ordinary corners face the same direction.
+                    if (point.DX * segmentStart.DX + point.DY * segmentStart.DY >= -0.5f)
+                    {
+                        continue;
+                    }
+
+                    ref readonly var segmentEnd = ref candidates[(segmentIndex + 1) % candidatePath.Count];
+                    var segmentX = segmentEnd.X - segmentStart.X;
+                    var segmentY = segmentEnd.Y - segmentStart.Y;
+                    var lengthSquared = segmentX * segmentX + segmentY * segmentY;
+                    var t = lengthSquared > 0f
+                        ? ((point.X - segmentStart.X) * segmentX +
+                           (point.Y - segmentStart.Y) * segmentY) / lengthSquared
+                        : 0f;
+                    t = Clampf(t, 0f, 1f);
+                    var closestX = segmentStart.X + segmentX * t;
+                    var closestY = segmentStart.Y + segmentY * t;
+                    var dx = point.X - closestX;
+                    var dy = point.Y - closestY;
+                    var distanceSquared = dx * dx + dy * dy;
+                    minimumDistanceSquared = Minf(minimumDistanceSquared, distanceSquared);
+                }
+
+                coverages[path.First + pointIndex] =
+                    MathF.Sqrt(minimumDistanceSquared) / fringeWidth;
+            }
+        }
+    }
+
+    private void ComputeFillFringeSigns(Span<float> signs, int sourcePathCount, TessWindingRule windingRule)
+    {
+        // Per-contour probe bounds, computed once and reused by every IsPointInsideFill
+        // call below so each probe can reject whole contours without walking their points.
+        Span<float> pathMinY = sourcePathCount <= 128 ? stackalloc float[sourcePathCount] : new float[sourcePathCount];
+        Span<float> pathMaxY = sourcePathCount <= 128 ? stackalloc float[sourcePathCount] : new float[sourcePathCount];
+        Span<float> pathMaxX = sourcePathCount <= 128 ? stackalloc float[sourcePathCount] : new float[sourcePathCount];
+        ComputeFillProbeBounds(pathMinY, pathMaxY, pathMaxX, sourcePathCount);
+
+        for (var i = 0; i < sourcePathCount; i++)
+        {
+            signs[i] = 1f;
+            ref readonly var path = ref _cache.Paths[i];
+            if (path.Count < 2)
+            {
+                continue;
+            }
+
+            var pts = _cache.Points.AsSpan(path.First, path.Count);
+            var probe = Maxf(_fringeWidth * 0.75f, _distTol * 4.0f);
+
+            // Retry at half distances before switching vertices: next to a
+            // sub-fringe band the full-distance probe overshoots through the
+            // material onto (or past) the far boundary and reads ambiguous, and
+            // the winding fallback below cannot tell a hole from an outer
+            // contour. A closer probe still lands inside the thin material.
+            var resolved = false;
+            for (var attempt = 0; attempt < 3 && !resolved; attempt++)
+            {
+                var attemptProbe = probe / (1 << attempt);
+                if (TryProbeFringeSign(pts, 0, attemptProbe, sourcePathCount, windingRule, pathMinY, pathMaxY, pathMaxX, out var sign) ||
+                    (path.Count > 2 &&
+                     TryProbeFringeSign(pts, path.Count / 2, attemptProbe, sourcePathCount, windingRule, pathMinY, pathMaxY, pathMaxX, out sign)))
+                {
+                    signs[i] = sign;
+                    resolved = true;
+                }
+            }
+
+            if (!resolved)
+            {
+                // Ambiguous - fall back to signed-area winding.
+                signs[i] = path.Winding == MewVGWinding.CW ? 1f : -1f;
+            }
+        }
+    }
+
+    private void ComputeFillProbeBounds(Span<float> pathMinY, Span<float> pathMaxY, Span<float> pathMaxX, int sourcePathCount)
+    {
+        for (var i = 0; i < sourcePathCount; i++)
+        {
+            ref readonly var path = ref _cache.Paths[i];
+            if (path.Count < 1)
+            {
+                // Empty range - the y/x reject in IsPointInsideFill always skips it.
+                pathMinY[i] = 1f;
+                pathMaxY[i] = 0f;
+                pathMaxX[i] = -1f;
+                continue;
+            }
+
+            var pts = _cache.Points.AsSpan(path.First, path.Count);
+            var minY = pts[0].Y;
+            var maxY = pts[0].Y;
+            var maxX = pts[0].X;
+            for (var j = 1; j < pts.Length; j++)
+            {
+                ref readonly var point = ref pts[j];
+                minY = Minf(minY, point.Y);
+                maxY = Maxf(maxY, point.Y);
+                maxX = Maxf(maxX, point.X);
+            }
+
+            pathMinY[i] = minY;
+            pathMaxY[i] = maxY;
+            pathMaxX[i] = maxX;
+        }
+    }
+
+    private bool TryProbeFringeSign(ReadOnlySpan<NVGpoint> pts, int vertexIndex,
+        float probe, int sourcePathCount, TessWindingRule windingRule,
+        ReadOnlySpan<float> pathMinY, ReadOnlySpan<float> pathMaxY, ReadOnlySpan<float> pathMaxX, out float sign)
+    {
+        ref readonly var p = ref pts[vertexIndex];
+
+        // Use normalized DM direction for probing.
+        // DM (average of adjacent edge normals) reliably points toward/away from
+        // the polygon interior, even at sharp corners where a single edge normal
+        // (DL) may miss. Normalizing prevents magnitude explosion (DM up to 600x).
+        var dmLen = p.DMX * p.DMX + p.DMY * p.DMY;
+        float pdx, pdy;
+        if (dmLen > 1e-6f)
+        {
+            dmLen = MathF.Sqrt(dmLen);
+            pdx = p.DMX / dmLen;
+            pdy = p.DMY / dmLen;
+        }
+        else
+        {
+            // DM degenerate - fall back to edge normal (DL)
+            pdx = p.DY;
+            pdy = -p.DX;
+        }
+
+        var plusX = p.X + pdx * probe;
+        var plusY = p.Y + pdy * probe;
+        var minusX = p.X - pdx * probe;
+        var minusY = p.Y - pdy * probe;
+
+        var plusInside = IsPointInsideFill(plusX, plusY, sourcePathCount, windingRule, pathMinY, pathMaxY, pathMaxX);
+        var minusInside = IsPointInsideFill(minusX, minusY, sourcePathCount, windingRule, pathMinY, pathMaxY, pathMaxX);
+
+        if (plusInside && !minusInside)
+        {
+            // +DM direction is inside → DM points inward → positive woff insets
+            sign = 1f;
+            return true;
+        }
+
+        if (!plusInside && minusInside)
+        {
+            // -DM direction is inside → DM points outward → negative woff insets
+            sign = -1f;
+            return true;
+        }
+
+        sign = 0f;
+        return false;
+    }
+
+    private bool IsPointInsideFill(float x, float y, int sourcePathCount, TessWindingRule windingRule,
+        ReadOnlySpan<float> pathMinY, ReadOnlySpan<float> pathMaxY, ReadOnlySpan<float> pathMaxX)
+    {
+        var winding = 0;
+        var crossings = 0;
+
+        for (var i = 0; i < sourcePathCount; i++)
+        {
+            // +x ray-cast: a contour whose y-range misses this probe, or whose
+            // rightmost point is at or left of it, can never register a crossing.
+            // (The left side can't be rejected this way - a hit only needs xHit > x.)
+            if (y < pathMinY[i] || y > pathMaxY[i] || x > pathMaxX[i])
+            {
+                continue;
+            }
+
+            ref readonly var path = ref _cache.Paths[i];
+            if (path.Count < 2)
+            {
+                continue;
+            }
+
+            var pts = _cache.Points.AsSpan(path.First, path.Count);
+            for (var j = 0; j < path.Count; j++)
+            {
+                ref readonly var a = ref pts[j];
+                ref readonly var b = ref pts[(j + 1) % path.Count];
+
+                var ayAbove = a.Y > y;
+                var byAbove = b.Y > y;
+                if (ayAbove == byAbove)
+                {
+                    continue;
+                }
+
+                var t = (y - a.Y) / (b.Y - a.Y);
+                var xHit = a.X + t * (b.X - a.X);
+                if (xHit <= x)
+                {
+                    continue;
+                }
+
+                crossings++;
+                if (windingRule == TessWindingRule.NonZero)
+                {
+                    winding += b.Y > a.Y ? 1 : -1;
+                }
+            }
+        }
+
+        return windingRule == TessWindingRule.NonZero
+            ? winding != 0
+            : (crossings & 1) != 0;
+    }
+
+    private void ExpandStroke(float w, float fringe, MewVGLineCap lineCap, MewVGLineJoin lineJoin, float miterLimit)
+    {
+        var aa = fringe;
+        float u0 = 0.0f, u1 = 1.0f;
+        var ncap = CurveDivs(w, NVG_PI, _tessTol);
+        if (lineJoin == MewVGLineJoin.Round || lineCap == MewVGLineCap.Round)
+        {
+            ncap = Maxi(ncap, 12);
+        }
+
+        w += aa * 0.5f;
+
+        // Disable the gradient used for antialiasing when antialiasing is not used.
+        if (aa == 0.0f)
+        {
+            u0 = 0.5f;
+            u1 = 0.5f;
+        }
+
+        CalculateJoins(w, lineJoin, miterLimit);
+
+        // Calculate max vertex usage
+        var cverts = 0;
+        for (var i = 0; i < _cache.NPaths; i++)
+        {
+            ref var path = ref _cache.Paths[i];
+            var loop = path.Closed;
+            if (lineJoin == MewVGLineJoin.Round)
+            {
+                cverts += (path.Count + path.NBevel * (ncap + 2) + 1) * 2;
+            }
+            else
+            {
+                cverts += (path.Count + path.NBevel * 5 + 1) * 2;
+            }
+
+            if (!loop)
+            {
+                // Space for caps
+                if (lineCap == MewVGLineCap.Round)
+                {
+                    cverts += (ncap * 2 + 2) * 2;
+                }
+                else
+                {
+                    cverts += (3 + 3) * 2;
+                }
+            }
+        }
+
+        EnsureVerts(cverts);
+
+        var vertOffset = 0;
+        for (var i = 0; i < _cache.NPaths; i++)
+        {
+            ref var path = ref _cache.Paths[i];
+            var pts = _cache.Points.AsSpan(path.First, path.Count);
+
+            path.FillOffset = 0;
+            path.NFill = 0;
+
+            // Calculate stroke
+            var loop = path.Closed;
+            path.StrokeOffset = vertOffset;
+
+            int s, e;
+            if (loop)
+            {
+                s = 0;
+                e = path.Count;
+            }
+            else
+            {
+                s = 1;
+                e = path.Count - 1;
+            }
+
+            if (!loop && path.Count > 0)
+            {
+                // Add cap
+                ref var p0 = ref pts[0];
+                ref var p1 = ref pts[1];
+                var dx = p1.X - p0.X;
+                var dy = p1.Y - p0.Y;
+                Normalize(ref dx, ref dy);
+
+                if (lineCap == MewVGLineCap.Butt)
+                {
+                    ButtCapStart(ref vertOffset, ref p0, dx, dy, w, -aa * 0.5f, aa, u0, u1);
+                }
+                else if (lineCap == MewVGLineCap.Square)
+                {
+                    ButtCapStart(ref vertOffset, ref p0, dx, dy, w, w - aa, aa, u0, u1);
+                }
+                else if (lineCap == MewVGLineCap.Round)
+                {
+                    RoundCapStart(ref vertOffset, ref p0, dx, dy, w, ncap, u0, u1);
+                }
+            }
+
+            for (var j = s; j < e; j++)
+            {
+                ref var p0 = ref pts[(j + path.Count - 1) % path.Count];
+                ref var p1 = ref pts[j];
+
+                if ((p1.Flags & (NVGpointFlags.Bevel | NVGpointFlags.InnerBevel)) != 0)
+                {
+                    if (lineJoin == MewVGLineJoin.Round)
+                    {
+                        RoundJoin(ref vertOffset, ref p0, ref p1, w, w, u0, u1, ncap);
+                    }
+                    else
+                    {
+                        BevelJoin(ref vertOffset, ref p0, ref p1, w, w, u0, u1);
+                    }
+                }
+                else
+                {
+                    SetVert(ref _cache.Verts[vertOffset++], p1.X + p1.DMX * w, p1.Y + p1.DMY * w, u0, 1);
+                    SetVert(ref _cache.Verts[vertOffset++], p1.X - p1.DMX * w, p1.Y - p1.DMY * w, u1, 1);
+                }
+            }
+
+            if (loop && path.Count > 0)
+            {
+                // Loop it. Guarded on Count > 0: with no points the join loop above
+                // never ran, so StrokeOffset still holds whatever was last written
+                // there (a previous path this frame, or a stale value from the
+                // previous frame) rather than this path's own start vertex.
+                SetVert(ref _cache.Verts[vertOffset++], _cache.Verts[path.StrokeOffset].X, _cache.Verts[path.StrokeOffset].Y, u0, 1);
+                SetVert(ref _cache.Verts[vertOffset++], _cache.Verts[path.StrokeOffset + 1].X, _cache.Verts[path.StrokeOffset + 1].Y, u1, 1);
+            }
+            else if (path.Count > 1)
+            {
+                // Add cap
+                ref var p0 = ref pts[path.Count - 2];
+                ref var p1 = ref pts[path.Count - 1];
+                var dx = p1.X - p0.X;
+                var dy = p1.Y - p0.Y;
+                Normalize(ref dx, ref dy);
+
+                if (lineCap == MewVGLineCap.Butt)
+                {
+                    ButtCapEnd(ref vertOffset, ref p1, dx, dy, w, -aa * 0.5f, aa, u0, u1);
+                }
+                else if (lineCap == MewVGLineCap.Square)
+                {
+                    ButtCapEnd(ref vertOffset, ref p1, dx, dy, w, w - aa, aa, u0, u1);
+                }
+                else if (lineCap == MewVGLineCap.Round)
+                {
+                    RoundCapEnd(ref vertOffset, ref p1, dx, dy, w, ncap, u0, u1);
+                }
+            }
+
+            path.NStroke = vertOffset - path.StrokeOffset;
+        }
+    }
+
+    private void CalculateJoins(float w, MewVGLineJoin lineJoin, float miterLimit)
+    {
+        var iw = w > 0.0f ? 1.0f / w : 0.0f;
+
+        for (var i = 0; i < _cache.NPaths; i++)
+        {
+            ref var path = ref _cache.Paths[i];
+            var pts = _cache.Points.AsSpan(path.First, path.Count);
+            var nleft = 0;
+            path.NBevel = 0;
+
+            for (var j = 0; j < path.Count; j++)
+            {
+                ref var p0 = ref pts[(j + path.Count - 1) % path.Count];
+                ref var p1 = ref pts[j];
+
+                var dlx0 = p0.DY;
+                var dly0 = -p0.DX;
+                var dlx1 = p1.DY;
+                var dly1 = -p1.DX;
+
+                // Calculate extrusions
+                p1.DMX = (dlx0 + dlx1) * 0.5f;
+                p1.DMY = (dly0 + dly1) * 0.5f;
+                var dmr2 = p1.DMX * p1.DMX + p1.DMY * p1.DMY;
+                if (dmr2 > 0.000001f)
+                {
+                    var scale = 1.0f / dmr2;
+                    if (scale > 600.0f)
+                    {
+                        scale = 600.0f;
+                    }
+
+                    p1.DMX *= scale;
+                    p1.DMY *= scale;
+                }
+
+                // Clear flags, but keep the corner
+                p1.Flags = (p1.Flags & NVGpointFlags.Corner) != 0 ? NVGpointFlags.Corner : 0;
+
+                // Keep track of left turns
+                var cross = p1.DX * p0.DY - p0.DX * p1.DY;
+                if (cross > 0.0f)
+                {
+                    nleft++;
+                    p1.Flags |= NVGpointFlags.Left;
+                }
+
+                // Calculate if we should use bevel or miter for inner join
+                var limit = Maxf(1.01f, Minf(p0.Len, p1.Len) * iw);
+                if (dmr2 * limit * limit < 1.0f)
+                {
+                    p1.Flags |= NVGpointFlags.InnerBevel;
+                }
+
+                // Check to see if the corner needs to be beveled
+                if ((p1.Flags & NVGpointFlags.Corner) != 0)
+                {
+                    if (dmr2 * miterLimit * miterLimit < 1.0f || lineJoin == MewVGLineJoin.Bevel || lineJoin == MewVGLineJoin.Round)
+                    {
+                        p1.Flags |= NVGpointFlags.Bevel;
+                    }
+                }
+
+                if ((p1.Flags & (NVGpointFlags.Bevel | NVGpointFlags.InnerBevel)) != 0)
+                {
+                    path.NBevel++;
+                }
+
+                // Store back
+                pts[j] = p1;
+            }
+
+            path.Convex = nleft == path.Count;
+        }
+    }
+
+    private void EnsureVerts(int count)
+    {
+        if (count > _cache.CVerts)
+        {
+            var cverts = (count + 0xff) & ~0xff;
+            Array.Resize(ref _cache.Verts, cverts);
+            _cache.CVerts = cverts;
+        }
+    }
+
+    private void EnsurePathCapacity(int count)
+    {
+        if (count > _cache.CPaths)
+        {
+            var cpaths = (count + 0x0f) & ~0x0f;
+            Array.Resize(ref _cache.Paths, cpaths);
+            _cache.CPaths = cpaths;
+        }
+    }
+
+    private void NormalizeContoursForFill(float epsWorld, float collinearTol)
+    {
+        if (_cache.NPaths == 0)
+        {
+            return;
+        }
+
+        var writePath = 0;
+        var writePoint = 0;
+
+        for (var i = 0; i < _cache.NPaths; i++)
+        {
+            ref var srcPath = ref _cache.Paths[i];
+            if (srcPath.Count < 2)
+            {
+                continue;
+            }
+
+            var src = _cache.Points.AsSpan(srcPath.First, srcPath.Count);
+            var dstStart = writePoint;
+
+            var hasPrev = false;
+            NVGpoint prev = default;
+            for (var j = 0; j < src.Length; j++)
+            {
+                var p = src[j];
+                if (!hasPrev || !PtEquals(prev.X, prev.Y, p.X, p.Y, epsWorld))
+                {
+                    _cache.Points[writePoint++] = p;
+                    prev = p;
+                    hasPrev = true;
+                }
+            }
+
+            var count = writePoint - dstStart;
+            if (count > 1 &&
+                PtEquals(
+                    _cache.Points[dstStart].X, _cache.Points[dstStart].Y,
+                    _cache.Points[dstStart + count - 1].X, _cache.Points[dstStart + count - 1].Y,
+                    epsWorld))
+            {
+                count--;
+                writePoint--;
+            }
+
+            if (count < 3)
+            {
+                writePoint = dstStart;
+                continue;
+            }
+
+            RemoveCollinearVerticesInPlace(dstStart, ref count, collinearTol);
+            if (count < 3)
+            {
+                writePoint = dstStart;
+                continue;
+            }
+
+            var dstPath = srcPath;
+            dstPath.First = dstStart;
+            dstPath.Count = count;
+            dstPath.Closed = true;
+            RecomputePathSegmentData(dstStart, count);
+            var signedArea2 = ComputeSignedArea2(dstStart, count);
+            dstPath.Winding = signedArea2 >= 0.0 ? MewVGWinding.CCW : MewVGWinding.CW;
+            _cache.Paths[writePath++] = dstPath;
+            writePoint = dstStart + count;
+        }
+
+        _cache.NPaths = writePath;
+        _cache.NPoints = writePoint;
+        RecalculatePathBounds();
+    }
+
+    private void RemoveCollinearVerticesInPlace(int start, ref int count, float collinearTol)
+    {
+        if (count < 3)
+        {
+            return;
+        }
+
+        var rentedA = NvgScratchPool<NVGpoint>.Shared.Rent(count);
+        var rentedB = NvgScratchPool<NVGpoint>.Shared.Rent(count);
+        try
+        {
+            var src = rentedA.AsSpan(0, count);
+            var dst = rentedB.AsSpan(0, count);
+            _cache.Points.AsSpan(start, count).CopyTo(src);
+            var srcCount = count;
+
+            while (srcCount >= 3)
+            {
+                var removed = false;
+                var dstCount = 0;
+                for (var i = 0; i < srcCount; i++)
+                {
+                    var iPrev = (i + srcCount - 1) % srcCount;
+                    var iNext = (i + 1) % srcCount;
+
+                    ref readonly var a = ref src[iPrev];
+                    ref readonly var b = ref src[i];
+                    ref readonly var c = ref src[iNext];
+                    if (IsNearlyCollinear(in a, in b, in c, collinearTol))
+                    {
+                        removed = true;
+                        continue;
+                    }
+
+                    dst[dstCount++] = b;
+                }
+
+                srcCount = dstCount;
+                if (!removed)
+                {
+                    break;
+                }
+
+                var tmp = src;
+                src = dst;
+                dst = tmp;
+            }
+
+            count = srcCount;
+            if (count > 0)
+            {
+                src.Slice(0, count).CopyTo(_cache.Points.AsSpan(start, count));
+            }
+        }
+        finally
+        {
+            NvgScratchPool<NVGpoint>.Shared.Return(rentedA, clearArray: false);
+            NvgScratchPool<NVGpoint>.Shared.Return(rentedB, clearArray: false);
+        }
+    }
+
+    private static bool IsNearlyCollinear(in NVGpoint a, in NVGpoint b, in NVGpoint c, float collinearTol)
+    {
+        var abx = (double)b.X - a.X;
+        var aby = (double)b.Y - a.Y;
+        var bcx = (double)c.X - b.X;
+        var bcy = (double)c.Y - b.Y;
+
+        var ab2 = abx * abx + aby * aby;
+        var bc2 = bcx * bcx + bcy * bcy;
+        var tol2 = (double)collinearTol * collinearTol;
+        if (ab2 <= tol2 || bc2 <= tol2)
+        {
+            return true;
+        }
+
+        var cross = abx * bcy - aby * bcx;
+        var cross2 = cross * cross;
+        // (|ab|+|bc|)^2 <= 2*(|ab|^2+|bc|^2). Avoids sqrt in hot path.
+        var rhs = tol2 * 2.0 * (ab2 + bc2);
+        return cross2 <= rhs;
+    }
+
+    private void RecomputePathSegmentData(int start, int count)
+    {
+        for (var i = 0; i < count; i++)
+        {
+            var next = (i + 1) % count;
+            ref var p0 = ref _cache.Points[start + i];
+            ref var p1 = ref _cache.Points[start + next];
+            p0.DX = p1.X - p0.X;
+            p0.DY = p1.Y - p0.Y;
+            p0.Len = Normalize(ref p0.DX, ref p0.DY);
+        }
+    }
+
+    private double ComputeSignedArea2(int start, int count)
+    {
+        double area2 = 0.0;
+        for (var i = 0; i < count; i++)
+        {
+            var j = (i + 1) % count;
+            ref readonly var a = ref _cache.Points[start + i];
+            ref readonly var b = ref _cache.Points[start + j];
+            area2 += (double)a.X * b.Y - (double)b.X * a.Y;
+        }
+
+        return area2;
+    }
+
+    private void RecalculatePathBounds()
+    {
+        if (_cache.NPaths == 0)
+        {
+            _cache.Bounds[0] = 0;
+            _cache.Bounds[1] = 0;
+            _cache.Bounds[2] = 0;
+            _cache.Bounds[3] = 0;
+            return;
+        }
+
+        _cache.Bounds[0] = _cache.Bounds[1] = 1e6f;
+        _cache.Bounds[2] = _cache.Bounds[3] = -1e6f;
+
+        for (var i = 0; i < _cache.NPaths; i++)
+        {
+            ref var path = ref _cache.Paths[i];
+            var pts = _cache.Points.AsSpan(path.First, path.Count);
+            for (var j = 0; j < pts.Length; j++)
+            {
+                ref var p = ref pts[j];
+                _cache.Bounds[0] = Minf(_cache.Bounds[0], p.X);
+                _cache.Bounds[1] = Minf(_cache.Bounds[1], p.Y);
+                _cache.Bounds[2] = Maxf(_cache.Bounds[2], p.X);
+                _cache.Bounds[3] = Maxf(_cache.Bounds[3], p.Y);
+            }
+        }
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static void SetVert(ref NVGvertex vtx, float x, float y, float u, float v)
+    {
+        vtx.X = x;
+        vtx.Y = y;
+        vtx.U = u;
+        vtx.V = v;
+    }
+
+    /// <summary>
+    /// Offset a point along its DM vector for tessellator inset, clamping DM magnitude
+    /// to 1 to prevent overshoot at sharp corners (where DM can be up to 600x).
+    /// </summary>
+    private static void InsetPoint(ref Vector2 dst, in NVGpoint pt, float woff)
+    {
+        var dmx = pt.DMX;
+        var dmy = pt.DMY;
+        var dmSq = dmx * dmx + dmy * dmy;
+        if (dmSq > 1.0f)
+        {
+            var invLen = 1.0f / MathF.Sqrt(dmSq);
+            dmx *= invLen;
+            dmy *= invLen;
+        }
+        dst = new Vector2(pt.X + dmx * woff, pt.Y + dmy * woff);
+    }
+
+    private void BevelJoin(ref int dst, ref NVGpoint p0, ref NVGpoint p1, float lw, float rw, float lu, float ru)
+    {
+        var dlx0 = p0.DY;
+        var dly0 = -p0.DX;
+        var dlx1 = p1.DY;
+        var dly1 = -p1.DX;
+
+        if ((p1.Flags & NVGpointFlags.Left) != 0)
+        {
+            float lx0, ly0, lx1, ly1;
+            ChooseBevel((p1.Flags & NVGpointFlags.InnerBevel) != 0, ref p0, ref p1, lw, out lx0, out ly0, out lx1, out ly1);
+
+            SetVert(ref _cache.Verts[dst++], lx0, ly0, lu, 1);
+            SetVert(ref _cache.Verts[dst++], p1.X - dlx0 * rw, p1.Y - dly0 * rw, ru, 1);
+
+            if ((p1.Flags & NVGpointFlags.Bevel) != 0)
+            {
+                SetVert(ref _cache.Verts[dst++], lx0, ly0, lu, 1);
+                SetVert(ref _cache.Verts[dst++], p1.X - dlx0 * rw, p1.Y - dly0 * rw, ru, 1);
+                SetVert(ref _cache.Verts[dst++], lx1, ly1, lu, 1);
+                SetVert(ref _cache.Verts[dst++], p1.X - dlx1 * rw, p1.Y - dly1 * rw, ru, 1);
+            }
+            else
+            {
+                var rx0 = p1.X - p1.DMX * rw;
+                var ry0 = p1.Y - p1.DMY * rw;
+
+                SetVert(ref _cache.Verts[dst++], p1.X, p1.Y, 0.5f, 1);
+                SetVert(ref _cache.Verts[dst++], p1.X - dlx0 * rw, p1.Y - dly0 * rw, ru, 1);
+                SetVert(ref _cache.Verts[dst++], rx0, ry0, ru, 1);
+                SetVert(ref _cache.Verts[dst++], rx0, ry0, ru, 1);
+                SetVert(ref _cache.Verts[dst++], p1.X, p1.Y, 0.5f, 1);
+                SetVert(ref _cache.Verts[dst++], p1.X - dlx1 * rw, p1.Y - dly1 * rw, ru, 1);
+            }
+
+            SetVert(ref _cache.Verts[dst++], lx1, ly1, lu, 1);
+            SetVert(ref _cache.Verts[dst++], p1.X - dlx1 * rw, p1.Y - dly1 * rw, ru, 1);
+        }
+        else
+        {
+            float rx0, ry0, rx1, ry1;
+            ChooseBevel((p1.Flags & NVGpointFlags.InnerBevel) != 0, ref p0, ref p1, -rw, out rx0, out ry0, out rx1, out ry1);
+
+            SetVert(ref _cache.Verts[dst++], p1.X + dlx0 * lw, p1.Y + dly0 * lw, lu, 1);
+            SetVert(ref _cache.Verts[dst++], rx0, ry0, ru, 1);
+
+            if ((p1.Flags & NVGpointFlags.Bevel) != 0)
+            {
+                SetVert(ref _cache.Verts[dst++], p1.X + dlx0 * lw, p1.Y + dly0 * lw, lu, 1);
+                SetVert(ref _cache.Verts[dst++], rx0, ry0, ru, 1);
+                SetVert(ref _cache.Verts[dst++], p1.X + dlx1 * lw, p1.Y + dly1 * lw, lu, 1);
+                SetVert(ref _cache.Verts[dst++], rx1, ry1, ru, 1);
+            }
+            else
+            {
+                var lx0 = p1.X + p1.DMX * lw;
+                var ly0 = p1.Y + p1.DMY * lw;
+
+                SetVert(ref _cache.Verts[dst++], p1.X + dlx0 * lw, p1.Y + dly0 * lw, lu, 1);
+                SetVert(ref _cache.Verts[dst++], p1.X, p1.Y, 0.5f, 1);
+                SetVert(ref _cache.Verts[dst++], lx0, ly0, lu, 1);
+                SetVert(ref _cache.Verts[dst++], lx0, ly0, lu, 1);
+                SetVert(ref _cache.Verts[dst++], p1.X + dlx1 * lw, p1.Y + dly1 * lw, lu, 1);
+                SetVert(ref _cache.Verts[dst++], p1.X, p1.Y, 0.5f, 1);
+            }
+
+            SetVert(ref _cache.Verts[dst++], p1.X + dlx1 * lw, p1.Y + dly1 * lw, lu, 1);
+            SetVert(ref _cache.Verts[dst++], rx1, ry1, ru, 1);
+        }
+    }
+
+    private void RoundJoin(ref int dst, ref NVGpoint p0, ref NVGpoint p1, float lw, float rw, float lu, float ru, int ncap)
+    {
+        var dlx0 = p0.DY;
+        var dly0 = -p0.DX;
+        var dlx1 = p1.DY;
+        var dly1 = -p1.DX;
+
+        if ((p1.Flags & NVGpointFlags.Left) != 0)
+        {
+            float lx0, ly0, lx1, ly1;
+            ChooseBevel((p1.Flags & NVGpointFlags.InnerBevel) != 0, ref p0, ref p1, lw, out lx0, out ly0, out lx1, out ly1);
+            var a0 = Atan2f(-dly0, -dlx0);
+            var a1 = Atan2f(-dly1, -dlx1);
+            if (a1 > a0)
+            {
+                a1 -= NVG_PI * 2;
+            }
+
+            SetVert(ref _cache.Verts[dst++], lx0, ly0, lu, 1);
+            SetVert(ref _cache.Verts[dst++], p1.X - dlx0 * rw, p1.Y - dly0 * rw, ru, 1);
+
+            var n = Clampi((int)MathF.Ceiling((a0 - a1) / NVG_PI * ncap), 2, ncap);
+            for (var i = 0; i < n; i++)
+            {
+                var u = i / (float)(n - 1);
+                var a = a0 + u * (a1 - a0);
+                var rx = p1.X + Cosf(a) * rw;
+                var ry = p1.Y + Sinf(a) * rw;
+                SetVert(ref _cache.Verts[dst++], p1.X, p1.Y, 0.5f, 1);
+                SetVert(ref _cache.Verts[dst++], rx, ry, ru, 1);
+            }
+
+            SetVert(ref _cache.Verts[dst++], lx1, ly1, lu, 1);
+            SetVert(ref _cache.Verts[dst++], p1.X - dlx1 * rw, p1.Y - dly1 * rw, ru, 1);
+        }
+        else
+        {
+            float rx0, ry0, rx1, ry1;
+            ChooseBevel((p1.Flags & NVGpointFlags.InnerBevel) != 0, ref p0, ref p1, -rw, out rx0, out ry0, out rx1, out ry1);
+            var a0 = Atan2f(dly0, dlx0);
+            var a1 = Atan2f(dly1, dlx1);
+            if (a1 < a0)
+            {
+                a1 += NVG_PI * 2;
+            }
+
+            SetVert(ref _cache.Verts[dst++], p1.X + dlx0 * rw, p1.Y + dly0 * rw, lu, 1);
+            SetVert(ref _cache.Verts[dst++], rx0, ry0, ru, 1);
+
+            var n = Clampi((int)MathF.Ceiling((a1 - a0) / NVG_PI * ncap), 2, ncap);
+            for (var i = 0; i < n; i++)
+            {
+                var u = i / (float)(n - 1);
+                var a = a0 + u * (a1 - a0);
+                var lx = p1.X + Cosf(a) * lw;
+                var ly = p1.Y + Sinf(a) * lw;
+                SetVert(ref _cache.Verts[dst++], lx, ly, lu, 1);
+                SetVert(ref _cache.Verts[dst++], p1.X, p1.Y, 0.5f, 1);
+            }
+
+            SetVert(ref _cache.Verts[dst++], p1.X + dlx1 * rw, p1.Y + dly1 * rw, lu, 1);
+            SetVert(ref _cache.Verts[dst++], rx1, ry1, ru, 1);
+        }
+    }
+
+    private static void ChooseBevel(bool bevel, ref NVGpoint p0, ref NVGpoint p1, float w, out float x0, out float y0, out float x1, out float y1)
+    {
+        if (bevel)
+        {
+            x0 = p1.X + p0.DY * w;
+            y0 = p1.Y - p0.DX * w;
+            x1 = p1.X + p1.DY * w;
+            y1 = p1.Y - p1.DX * w;
+        }
+        else
+        {
+            x0 = p1.X + p1.DMX * w;
+            y0 = p1.Y + p1.DMY * w;
+            x1 = p1.X + p1.DMX * w;
+            y1 = p1.Y + p1.DMY * w;
+        }
+    }
+
+    private void ButtCapStart(ref int dst, ref NVGpoint p, float dx, float dy, float w, float d, float aa, float u0, float u1)
+    {
+        var px = p.X - dx * d;
+        var py = p.Y - dy * d;
+        var dlx = dy;
+        var dly = -dx;
+        SetVert(ref _cache.Verts[dst++], px + dlx * w - dx * aa, py + dly * w - dy * aa, u0, 0);
+        SetVert(ref _cache.Verts[dst++], px - dlx * w - dx * aa, py - dly * w - dy * aa, u1, 0);
+        SetVert(ref _cache.Verts[dst++], px + dlx * w, py + dly * w, u0, 1);
+        SetVert(ref _cache.Verts[dst++], px - dlx * w, py - dly * w, u1, 1);
+    }
+
+    private void ButtCapEnd(ref int dst, ref NVGpoint p, float dx, float dy, float w, float d, float aa, float u0, float u1)
+    {
+        var px = p.X + dx * d;
+        var py = p.Y + dy * d;
+        var dlx = dy;
+        var dly = -dx;
+        SetVert(ref _cache.Verts[dst++], px + dlx * w, py + dly * w, u0, 1);
+        SetVert(ref _cache.Verts[dst++], px - dlx * w, py - dly * w, u1, 1);
+        SetVert(ref _cache.Verts[dst++], px + dlx * w + dx * aa, py + dly * w + dy * aa, u0, 0);
+        SetVert(ref _cache.Verts[dst++], px - dlx * w + dx * aa, py - dly * w + dy * aa, u1, 0);
+    }
+
+    private void RoundCapStart(ref int dst, ref NVGpoint p, float dx, float dy, float w, int ncap, float u0, float u1)
+    {
+        var px = p.X;
+        var py = p.Y;
+        var dlx = dy;
+        var dly = -dx;
+
+        for (var i = 0; i < ncap; i++)
+        {
+            var a = i / (float)(ncap - 1) * NVG_PI;
+            float ax = Cosf(a) * w, ay = Sinf(a) * w;
+            SetVert(ref _cache.Verts[dst++], px - dlx * ax - dx * ay, py - dly * ax - dy * ay, u0, 1);
+            SetVert(ref _cache.Verts[dst++], px, py, 0.5f, 1);
+        }
+        SetVert(ref _cache.Verts[dst++], px + dlx * w, py + dly * w, u0, 1);
+        SetVert(ref _cache.Verts[dst++], px - dlx * w, py - dly * w, u1, 1);
+    }
+
+    private void RoundCapEnd(ref int dst, ref NVGpoint p, float dx, float dy, float w, int ncap, float u0, float u1)
+    {
+        var px = p.X;
+        var py = p.Y;
+        var dlx = dy;
+        var dly = -dx;
+
+        SetVert(ref _cache.Verts[dst++], px + dlx * w, py + dly * w, u0, 1);
+        SetVert(ref _cache.Verts[dst++], px - dlx * w, py - dly * w, u1, 1);
+
+        for (var i = 0; i < ncap; i++)
+        {
+            var a = i / (float)(ncap - 1) * NVG_PI;
+            float ax = Cosf(a) * w, ay = Sinf(a) * w;
+            SetVert(ref _cache.Verts[dst++], px, py, 0.5f, 1);
+            SetVert(ref _cache.Verts[dst++], px - dlx * ax + dx * ay, py - dly * ax + dy * ay, u0, 1);
+        }
+    }
+
+    #endregion
+
+    #region Gradients
+
+    public MewVGPaint LinearGradient(float sx, float sy, float ex, float ey, MewVGColor icol, MewVGColor ocol)
+    {
+        const float large = 1e5f;
+
+        MewVGPaint p = default;
+
+        var dx = ex - sx;
+        var dy = ey - sy;
+        var d = Sqrtf(dx * dx + dy * dy);
+        if (d > 0.0001f)
+        {
+            dx /= d;
+            dy /= d;
+        }
+        else
+        {
+            dx = 0;
+            dy = 1;
+        }
+
+        p.Xform[0] = dy; p.Xform[1] = -dx;
+        p.Xform[2] = dx; p.Xform[3] = dy;
+        p.Xform[4] = sx - dx * large; p.Xform[5] = sy - dy * large;
+
+        p.Extent[0] = large;
+        p.Extent[1] = large + d * 0.5f;
+
+        p.Radius = 0.0f;
+        p.Feather = Maxf(1.0f, d);
+        p.InnerColor = icol;
+        p.OuterColor = ocol;
+
+        return p;
+    }
+
+    public MewVGPaint RadialGradient(float cx, float cy, float inr, float outr, MewVGColor icol, MewVGColor ocol)
+    {
+        MewVGPaint p = default;
+
+        var r = (inr + outr) * 0.5f;
+        var f = outr - inr;
+
+        TransformIdentity(p.Xform);
+        p.Xform[4] = cx;
+        p.Xform[5] = cy;
+
+        p.Extent[0] = r;
+        p.Extent[1] = r;
+
+        p.Radius = r;
+        p.Feather = Maxf(1.0f, f);
+        p.InnerColor = icol;
+        p.OuterColor = ocol;
+
+        return p;
+    }
+
+    public MewVGPaint GradientRadial(in Matrix3x2 gradientTransform, float centerX, float centerY, float focalX, float focalY, float radiusX, float radiusY, int spreadMethod, int image)
+    {
+        MewVGPaint p = default;
+        p.PaintKind = (int)NVGpaintKind.GradientRadial;
+        p.Image = image;
+        p.Center[0] = centerX;
+        p.Center[1] = centerY;
+        p.Focal[0] = focalX;
+        p.Focal[1] = focalY;
+        p.Radius2[0] = radiusX;
+        p.Radius2[1] = radiusY;
+        p.SpreadMethod = spreadMethod;
+        p.InnerColor = MewVGColor.White;
+        p.OuterColor = MewVGColor.White;
+        p.Xform[0] = gradientTransform.M11;
+        p.Xform[1] = gradientTransform.M12;
+        p.Xform[2] = gradientTransform.M21;
+        p.Xform[3] = gradientTransform.M22;
+        p.Xform[4] = gradientTransform.M31;
+        p.Xform[5] = gradientTransform.M32;
+        return p;
+    }
+
+    public MewVGPaint GradientLinear(in Matrix3x2 gradientTransform, float startX, float startY, float endX, float endY, int spreadMethod, int image)
+    {
+        MewVGPaint p = default;
+        p.PaintKind = (int)NVGpaintKind.GradientLinear;
+        p.Image = image;
+        p.Center[0] = startX;
+        p.Center[1] = startY;
+        p.Focal[0] = endX;
+        p.Focal[1] = endY;
+        p.SpreadMethod = spreadMethod;
+        p.InnerColor = MewVGColor.White;
+        p.OuterColor = MewVGColor.White;
+        p.Xform[0] = gradientTransform.M11;
+        p.Xform[1] = gradientTransform.M12;
+        p.Xform[2] = gradientTransform.M21;
+        p.Xform[3] = gradientTransform.M22;
+        p.Xform[4] = gradientTransform.M31;
+        p.Xform[5] = gradientTransform.M32;
+        return p;
+    }
+
+    public MewVGPaint BoxGradient(float x, float y, float w, float h, float r, float f, MewVGColor icol, MewVGColor ocol)
+    {
+        MewVGPaint p = default;
+
+        TransformIdentity(p.Xform);
+        p.Xform[4] = x + w * 0.5f;
+        p.Xform[5] = y + h * 0.5f;
+
+        p.Extent[0] = w * 0.5f;
+        p.Extent[1] = h * 0.5f;
+
+        p.Radius = r;
+        p.Feather = Maxf(1.0f, f);
+        p.InnerColor = icol;
+        p.OuterColor = ocol;
+
+        return p;
+    }
+
+    public MewVGPaint ImagePattern(float cx, float cy, float w, float h, float angle, int image, float alpha)
+    {
+        MewVGPaint p = default;
+
+        TransformRotate(p.Xform, angle);
+        p.Xform[4] = cx;
+        p.Xform[5] = cy;
+
+        p.Extent[0] = w;
+        p.Extent[1] = h;
+
+        p.Image = image;
+        p.InnerColor = p.OuterColor = MewVGColor.RGBAf(1, 1, 1, alpha);
+
+        return p;
+    }
+
+    #endregion
+}

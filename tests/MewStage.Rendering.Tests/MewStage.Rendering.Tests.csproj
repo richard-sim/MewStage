@@ -1,0 +1,29 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!-- Render graph, scheduler, headless device, descriptor sizing, Vulkan lavapipe (gated by MEWSTAGE_VK_SMOKE=1) and DX12 smoke (Windows only). -->
+
+  <PropertyGroup>
+    <RootNamespace>MewStage.Rendering.Tests</RootNamespace>
+    <AssemblyName>MewStage.Rendering.Tests</AssemblyName>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Microsoft.NET.Test.Sdk" Version="18.11.0" />
+    <PackageReference Include="xunit" Version="2.9.3" />
+    <PackageReference Include="xunit.runner.visualstudio" Version="4.0.1" />
+    <PackageReference Include="Xunit.SkippableFact" Version="1.5.23" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!-- Cooked test fixtures; re-cook with scripts/cook_shaders.py (see Shaders/shaders.manifest.toml for the command). -->
+    <EmbeddedResource Include="Shaders\cooked\*.spv;Shaders\cooked\*.dxil" LogicalName="%(Filename)%(Extension)" />
+    <None Include="Shaders\*.hlsl;Shaders\shaders.manifest.toml" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\..\src\MewStage.Graphics\MewStage.Graphics.csproj" />
+    <ProjectReference Include="..\..\src\MewStage.Rendering\MewStage.Rendering.csproj" />
+  </ItemGroup>
+
+</Project>

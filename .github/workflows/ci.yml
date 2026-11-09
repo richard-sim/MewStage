@@ -1,0 +1,145 @@
+# MewStage CI. Four jobs:
+#   linux         build (warnings are errors), format gate, every headless test, the lavapipe Vulkan tests through the
+#                 real render path (with the Khronos validation layer on; a validation message fails the job), Kit mode
+#                 on an Xvfb screen with all four DevTools, screenshots as an artifact
+#   windows       build + every headless test (the DX12 WARP smoke runs here), then the NativeAOT win-x64 publish
+#   aot-linux     the NativeAOT linux-x64 publish, started in all three modes on an Xvfb screen (SDL X11 window +
+#                 lavapipe swapchain; Kit on X11 + Mesa GL)
+#   vendor-lock   third_party matches vendor.lock.toml (downloads the pinned upstream tarballs)
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  DOTNET_NOLOGO: 1
+  DOTNET_CLI_TELEMETRY_OPTOUT: 1
+  DOTNET_SKIP_FIRST_TIME_EXPERIENCE: 1
+
+jobs:
+  linux:
+    name: Linux build, tests, lavapipe, kit smoke
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-dotnet@v4
+        with:
+          global-json-file: global.json
+      - name: Install Mesa (lavapipe + software GL), the Vulkan validation layer, Xvfb, xdotool, ImageMagick
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends libvulkan1 mesa-vulkan-drivers vulkan-validationlayers \
+            libgl1-mesa-dri libegl1 libgl1 xvfb xdotool imagemagick
+          ls /usr/share/vulkan/icd.d/
+      - name: Build (Debug, warnings are errors)
+        run: dotnet build MewStage.sln -c Debug
+      - name: Format gate
+        run: python3 scripts/format_verify.py
+      - name: Headless tests (every project; the Vulkan tests skip without MEWSTAGE_VK_SMOKE and are run below)
+        run: dotnet test MewStage.sln --no-build -c Debug
+      - name: Lavapipe tests through the real render path, validation layer on
+        env:
+          MEWSTAGE_VK_VALIDATION: "1"
+          MEWSTAGE_JOURNEY_OUT: ${{ runner.temp }}/journeys
+        run: |
+          bash scripts/ci-vulkan-render-test.sh dotnet --no-build -c Debug --logger "console;verbosity=detailed" | tee "${{ runner.temp }}/lavapipe.log"
+          if grep -q "\[VK-VALIDATION" "${{ runner.temp }}/lavapipe.log"; then
+            echo "::error::Vulkan validation layer reported a message (see lavapipe.log)"; exit 1
+          fi
+      - name: Kit mode on the X11 platform host (Xvfb, all four DevTools)
+        env:
+          MEWSTAGE_JOURNEY_OUT: ${{ runner.temp }}/kit
+        run: bash scripts/kit-smoke-x11.sh dotnet
+      - name: Upload screenshots
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux-screenshots
+          path: |
+            ${{ runner.temp }}/journeys/*.png
+            ${{ runner.temp }}/kit/*.png
+            ${{ runner.temp }}/lavapipe.log
+          if-no-files-found: warn
+
+  windows:
+    name: Windows build, tests, AOT publish
+    runs-on: windows-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-dotnet@v4
+        with:
+          global-json-file: global.json
+      - name: Build (Debug, warnings are errors)
+        run: dotnet build MewStage.sln -c Debug
+      - name: Headless tests (includes the DX12 WARP smoke)
+        run: dotnet test MewStage.sln --no-build -c Debug
+      - name: NativeAOT publish win-x64
+        run: dotnet publish src/MewStage.Demo -c Release -r win-x64 -p:PublishAot=true -o publish/win-x64
+      - name: Report the published size
+        shell: pwsh
+        run: |
+          $files = Get-ChildItem publish/win-x64 -Recurse -File
+          $mb = ($files | Measure-Object -Property Length -Sum).Sum / 1MB
+          Write-Host ("publish/win-x64: {0:N1} MB in {1} files" -f $mb, $files.Count)
+      - name: Upload the win-x64 publish
+        uses: actions/upload-artifact@v4
+        with:
+          name: MewStage.Demo-win-x64
+          path: publish/win-x64
+
+  aot-linux:
+    name: Linux AOT publish and start
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-dotnet@v4
+        with:
+          global-json-file: global.json
+      - name: Install clang, zlib, Mesa, Xvfb
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends clang zlib1g-dev libvulkan1 mesa-vulkan-drivers libgl1-mesa-dri libegl1 libgl1 xvfb
+      - name: NativeAOT publish linux-x64
+        run: dotnet publish src/MewStage.Demo -c Release -r linux-x64 -p:PublishAot=true -o publish/linux-x64
+      - name: Start every mode on an Xvfb screen (SDL X11 window + lavapipe swapchain; Kit on X11 + Mesa GL)
+        run: |
+          du -sh publish/linux-x64
+          export VK_ICD_FILENAMES="$(ls /usr/share/vulkan/icd.d/lvp_icd*.json | head -n 1)"
+          export VK_DRIVER_FILES="$VK_ICD_FILENAMES"
+          export LIBGL_ALWAYS_SOFTWARE=1
+          Xvfb :77 -screen 0 1600x1000x24 >/dev/null 2>&1 &
+          sleep 1
+          export DISPLAY=:77
+          cd "${{ runner.temp }}"   # away from the repository: the exe must find <exe dir>/assets, not the source tree
+          for mode in "--overlay --render-vk" "--workbench --render-vk" "--standard"; do
+            "$GITHUB_WORKSPACE/publish/linux-x64/MewStage.Demo" $mode > "aot-$$.log" 2>&1 &
+            pid=$!
+            sleep 8
+            if kill -0 $pid 2>/dev/null; then echo "[aot] $mode: running after 8 s"; kill $pid; else echo "::error::[aot] $mode exited early"; cat "aot-$$.log"; exit 1; fi
+            sleep 1
+          done
+      - name: Upload the linux-x64 publish
+        uses: actions/upload-artifact@v4
+        with:
+          name: MewStage.Demo-linux-x64
+          path: publish/linux-x64
+
+  vendor-lock:
+    name: third_party matches vendor.lock.toml
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: vendor.py self-test and --check
+        run: |
+          python3 third_party/tools/vendor.py --self-test
+          python3 third_party/tools/vendor.py --check

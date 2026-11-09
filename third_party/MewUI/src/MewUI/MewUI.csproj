@@ -1,0 +1,80 @@
+﻿<Project Sdk="Microsoft.NET.Sdk">
+
+  <Import Project="..\..\build\MewUI.Common.props" />
+
+  <PropertyGroup>
+    <!-- Assembly Info -->
+    <AssemblyName>$(MewUITitle)</AssemblyName>
+    <Description>$(MewUIDescription)</Description>
+
+    <!-- NuGet -->
+    <PackageId>$(MewUITitle).Core</PackageId>
+  </PropertyGroup>
+
+  <!-- Bundle the analyzer (built first by pack_mewui.cmd) as a build-time asset. Only our DLL goes in;
+       the host provides Roslyn. Added once (analyzers are language-scoped, not per-TFM). -->
+  <ItemGroup>
+    <None Include="..\MewUI.Analyzers\bin\$(Configuration)\netstandard2.0\Aprillz.MewUI.Analyzers.dll"
+          Pack="true" PackagePath="analyzers/dotnet/cs" Visible="false" />
+  </ItemGroup>
+
+  <!-- The generator needs Roslyn 4.12+ for GetInterceptableLocation. The roslyn4.12 folder keeps
+       older hosts from loading it, which would otherwise fail with CS8032 and take the analyzer
+       in the sibling folder down with it. -->
+  <ItemGroup>
+    <None Include="..\MewUI.Generators\bin\$(Configuration)\netstandard2.0\Aprillz.MewUI.Generators.dll"
+          Pack="true" PackagePath="analyzers/dotnet/roslyn4.12/cs" Visible="false" />
+  </ItemGroup>
+
+  <!-- Build-order only: keeps the packed analyzer DLL above fresh even when packing outside
+       pack_mewui.cmd. Not loaded into this compilation (no OutputItemType) and not a package
+       dependency (PrivateAssets=all). The two projects demote the publish properties locally,
+       so they survive an AOT publish that walks this reference. -->
+  <ItemGroup>
+    <ProjectReference Include="..\MewUI.Analyzers\MewUI.Analyzers.csproj"
+                      ReferenceOutputAssembly="false" PrivateAssets="all" />
+    <ProjectReference Include="..\MewUI.Generators\MewUI.Generators.csproj"
+                      ReferenceOutputAssembly="false" PrivateAssets="all" />
+  </ItemGroup>
+
+  <!-- Feature-switch substitutions let the trimmer drop optional framework graphs. -->
+  <ItemGroup>
+    <EmbeddedResource Include="ILLink.Substitutions.xml">
+      <LogicalName>ILLink.Substitutions.xml</LogicalName>
+    </EmbeddedResource>
+  </ItemGroup>
+
+  <!-- Framework-wide build policy. Core carries it because every MewUI package depends on Core,
+       so the feature switches and the generator's interceptor namespace reach a consumer whatever
+       combination of packages it references. -->
+  <ItemGroup>
+    <None Include="..\..\build\$(MewUITitle).Core.targets" Link="buildTransitive\$(MewUITitle).Core.targets"
+          Pack="true" PackagePath="buildTransitive\" Visible="false" />
+  </ItemGroup>
+
+  <!-- Editor preview session support. The preview assembly ships inside this package (never as a
+       package dependency) so the framework/previewer pair cannot version-skew, and it is referenced
+       only when the MEWUI_PREVIEW environment variable is set. MewUI.Preview references this project,
+       so build order comes from pack_mewui.cmd building it first rather than from a ProjectReference;
+       _MewUIRequirePreviewAssemblies below turns a missing build into a pack failure. -->
+  <ItemGroup>
+    <None Include="..\..\build\MewUIPreview.targets" Link="buildTransitive\MewUIPreview.targets"
+          Pack="true" PackagePath="buildTransitive\" Visible="false" />
+    <None Include="..\..\build\MewUIPreviewInit.cs" Link="buildTransitive\MewUIPreviewInit.cs"
+          Pack="true" PackagePath="buildTransitive\" Visible="false" />
+    <None Include="..\MewUI.Preview\bin\$(Configuration)\net8.0\$(MewUITitle).Preview.dll"
+          Pack="true" PackagePath="buildTransitive\preview\net8.0\" Visible="false" />
+    <None Include="..\MewUI.Preview\bin\$(Configuration)\net10.0\$(MewUITitle).Preview.dll"
+          Pack="true" PackagePath="buildTransitive\preview\net10.0\" Visible="false" />
+  </ItemGroup>
+
+  <Target Name="_MewUIRequirePreviewAssemblies" BeforeTargets="Pack">
+    <Error Condition="!Exists('..\MewUI.Preview\bin\$(Configuration)\net8.0\$(MewUITitle).Preview.dll') Or !Exists('..\MewUI.Preview\bin\$(Configuration)\net10.0\$(MewUITitle).Preview.dll')"
+           Text="Build src\MewUI.Preview for both target frameworks before packing; the package must carry the previewer for IDE preview sessions." />
+  </Target>
+
+  <!-- Split platform hosts and rendering backends into separate assemblies -->
+  <ItemGroup>
+    <Compile Remove="Shared\**" />
+  </ItemGroup>
+</Project>

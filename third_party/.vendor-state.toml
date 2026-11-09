@@ -1,0 +1,4 @@
+# Written by third_party/tools/vendor.py; records which patch categories the tree was vendored with.
+# --check compares the tree against this set. Re-run vendor.py to change it. Committed on purpose.
+applied_categories = ["allocation", "build", "core-bridge", "design-space", "mewdock", "multi-host", "rendering", "text"]
+skipped_categories = []

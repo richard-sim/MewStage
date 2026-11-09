@@ -1,0 +1,65 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!-- MewStage-authored; preserved by tools/vendor.py (upstream's MewUI.Svg.csproj is excluded). See ../../../NOTICE.
+       It is upstream's project file with ONE change: SvgNet's element/attribute registry (the output of its
+       AvailableElementsGenerator source generator) is COMMITTED under Generated/ and compiled directly, so the
+       normal build runs no build-time Roslyn component and a NativeAOT build compiles exactly what a JIT build
+       does. (Upstream drops the generator under PublishAot, which would leave the registry out.) Regenerate after
+       bumping the SvgNet pin: python third_party/tools/vendor.py with its emit-svg-generated switch. -->
+
+  <Import Project="..\..\build\MewUI.Common.props" />
+
+  <PropertyGroup>
+    <AssemblyName>$(MewUITitle).Svg</AssemblyName>
+    <PackageId>$(MewUITitle).Svg</PackageId>
+    <DefineConstants>$(DefineConstants);NO_SDC</DefineConstants>
+    <Nullable>disable</Nullable>
+    <NoWarn>$(NoWarn);CS8632</NoWarn>
+    <GenerateAssemblyInfo>false</GenerateAssemblyInfo>
+    <Description>SVG rendering support for $(MewUITitle). Pure managed implementation via System.Xml.Linq - no System.Drawing dependency, NativeAOT compatible.</Description>
+  </PropertyGroup>
+
+  <!-- ThirdParty + Generated leave the default items; each is included explicitly below. -->
+  <ItemGroup>
+    <Compile Remove="ThirdParty\**" />
+    <EmbeddedResource Remove="ThirdParty\**" />
+    <None Remove="ThirdParty\**" />
+    <Compile Remove="Generated\**" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <PackageReference Include="ExCSS" Version="4.3.1" />
+  </ItemGroup>
+
+  <!-- SvgNet core (Ms-PL), minus the System.Drawing rendering partials and the files MewUI replaces (as upstream). -->
+  <ItemGroup>
+    <Compile Include="ThirdParty\SvgNet\Source\**\*.cs" Exclude="ThirdParty\SvgNet\Source\**\*.Drawing.cs;ThirdParty\SvgNet\Source\obj\**\*.cs;ThirdParty\SvgNet\Source\bin\**\*.cs" />
+    <Compile Remove="ThirdParty\SvgNet\Source\Painting\GenericBoundable.cs" />
+    <Compile Remove="ThirdParty\SvgNet\Source\Painting\ISvgBoundable.cs" />
+    <Compile Remove="ThirdParty\SvgNet\Source\Properties\AssemblyInfo.cs" />
+    <Compile Remove="ThirdParty\SvgNet\Source\SvgElementIdManager.cs" />
+    <Compile Remove="ThirdParty\SvgNet\Source\Transforms\ISvgTransformable.cs" />
+    <Compile Remove="ThirdParty\SvgNet\Source\SvgDocument.Win32.cs" />
+
+    <EmbeddedResource Include="ThirdParty\SvgNet\Source\Resources\svg11.dtd">
+      <LogicalName>Svg.Resources.svg11.dtd</LogicalName>
+    </EmbeddedResource>
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\..\src\MewUI\MewUI.csproj" />
+  </ItemGroup>
+
+  <!-- NORMAL (committed) mode: compile the committed generated registry; no build-time generator. -->
+  <ItemGroup Condition="'$(MewUISvgEmitGenerated)' != 'true'">
+    <Compile Include="Generated\**\*.cs" />
+  </ItemGroup>
+
+  <!-- EMIT mode (regeneration only; set by vendor.py with its emit-svg-generated switch): run SvgNet's generator so its output
+       can be copied back into Generated/. SetTargetFramework pins the netstandard2.0 Roslyn component. -->
+  <ItemGroup Condition="'$(MewUISvgEmitGenerated)' == 'true'">
+    <ProjectReference Include="ThirdParty\SvgNet\Generators\Svg.Generators.csproj"
+                      OutputItemType="Analyzer" ReferenceOutputAssembly="false"
+                      SetTargetFramework="TargetFramework=netstandard2.0" />
+  </ItemGroup>
+</Project>

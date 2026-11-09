@@ -1,0 +1,200 @@
+MewStage third_party - VENDOR NOTICE
+====================================
+
+This directory holds third-party source vendored into the MewStage repository. Every vendored component keeps its
+upstream license file. MewStage itself is MIT (../LICENSE).
+
+Provenance and updates are data-driven. The authoritative pins (one commit per upstream repository, with the
+archive and content hashes), the per-component layout, the MewStage-authored files the updater never touches, and
+the patch series with its categories all live in third_party/vendor.lock.toml:
+
+    python third_party/tools/vendor.py                      # re-vendor every component at the pinned commits, every patch
+    python third_party/tools/vendor.py --check              # verify the tree equals the lock + the recorded patch set
+    python third_party/tools/vendor.py --list               # sources and components
+    python third_party/tools/vendor.py --list-patches       # every patch, its category and its purpose
+    python third_party/tools/vendor.py --skip-category X    # vendor without an optional category (docs/vendoring.md)
+    python third_party/tools/vendor.py --emit-svg-generated # refresh MewUI.Svg/Generated (needs dotnet)
+    python third_party/tools/vendor.py --self-test          # test the patch applier
+
+The updater downloads GitHub codeload tarballs of the pinned commits, reads them in memory (no extraction, no git,
+no `patch` binary) and applies the patches with a strict pure-Python applier that fails loudly when a patch no
+longer applies (the signal that upstream moved the patched code). The applied patch set is recorded in
+third_party/.vendor-state.toml. Design and procedures: ../docs/vendoring.md.
+
+Layout: third_party/MewUI and third_party/MewVG mirror the upstream REPOSITORY layout (build/, src/<project>/,
+extensions/<project>/). Upstream project files are used as shipped; MewStage hooks in only through upstream's own
+local-override file build/MewUI.Local.props and the same hook in MewVG (the mewvg/build patch below).
+
+--------------------------------------------------------------------------------
+1. Aprillz.MewUI  (MIT)  ->  third_party/MewUI/
+--------------------------------------------------------------------------------
+Upstream:  https://github.com/aprillz/MewUI
+Pin:       commit 8b9c9433fc9b1450d994b26bcef55a8d294bbd29 (main, 2026-10-16; version 0.22.1+)
+License:   MIT (third_party/MewUI/LICENSE). Code upstream bundles is listed in
+           third_party/MewUI/THIRD_PARTY_NOTICES.md (vendored unchanged).
+
+Vendored projects (all built by MewStage.sln):
+  build/                          MewUI.Common.props, Aprillz.MewUI.Core.targets, MewUIPreview.targets,
+                                  MewUIPreviewInit.cs (the framework-wide build policy and preview hooks)
+  src/MewUI                       the framework, including Shared/** (platform hosts and rendering backends;
+                                  compiled only by the projects that link them, as upstream)
+  src/MewUI.Analyzers             Roslyn analyzer + code fixes (fluent markup); IDE / build time only
+  src/MewUI.Generators            binding-path source generator (interceptors); wired by MewUI.Consumer.targets
+  src/MewUI.Preview               IDE preview session host (Kit mode; JIT only)
+  src/MewUI.Platform.Win32, .X11  standard platform hosts         } Kit mode (--standard) runs on them;
+  src/MewUI.Backend.MewVG.Win32, .X11  MewVG (OpenGL) backends   } the embedded modes never use them
+  extensions/MewUI.MewDock        docking (a C# port of FlexLayout, BSL-1.0)
+  extensions/MewUI.Svg            pure-managed SVG, bundling SvgNet (Ms-PL) and ExCSS 4.3.1 (MIT, NuGet)
+  extensions/MewUI.Geometry       geometry operations, bundling Clipper2 (BSL-1.0)
+  extensions/MewUI.MewCharts      charts: the LiveChartsCore engine (MIT) compiled into the extension's own
+                                  assembly over a MewUI drawing context, as upstream builds it
+Not vendored: Backend.Direct2D / Gdi / MewVG.MacOS, Platform.MacOS / Browser, Backend.MewVG.Browser (the Browser
+pair is the reference design for MewStage's own backend), Markdown, MewvalonEdit, Skia, WebView2, samples, tests,
+tools.
+
+Git submodules, vendored as their own pinned sources:
+  extensions/MewUI.Svg/ThirdParty/SvgNet        https://github.com/svg-net/SVG
+      commit 853a9ae8d7e34415ff6a0c4a24d4ef29032c72fa; Microsoft Public License (Ms-PL), license.txt.
+      Source/** and Generators/** (the System.Drawing partials are not compiled).
+  extensions/MewUI.Geometry/ThirdParty/Clipper2  https://github.com/AngusJohnson/Clipper2
+      commit 21ebba05db8894f0c7217ad35ea518080f324946; Boost Software License 1.0, LICENSE.
+      CSharp/Clipper2Lib/*.cs only (what upstream's MewUI.Geometry.csproj compiles).
+  extensions/MewUI.MewCharts/ThirdParty/LiveCharts2  https://github.com/beto-rodriguez/LiveCharts2
+      commit 1cab5f348baa8dbeb5c77f7c098b133844022f3b; MIT, LICENSE.
+      src/LiveChartsCore/** (the engine, compiled into MewUI.MewCharts), generators/** (its source generator, a
+      build-time component), nuget.props (the generator project imports it). Its Microsoft.SourceLink.GitHub
+      1.1.1 (MIT, NuGet) package reference comes along with nuget.props.
+
+MewStage-authored files inside the vendored tree (listed as `preserve` in the lock; the updater never writes them):
+  build/MewUI.Local.props            net10.0 only; MewVGProjectPath -> third_party/MewVG (ProjectReferences
+                                     instead of the Aprillz.MewVG.* packages)
+  src/MewUI/MewStage.InternalsVisibleTo.cs  grants MewStage.Ui.Backend, MewStage.Ui.Tests, MewStage.Demo.Tests
+                                     (MewUI has no public third-party backend API; upstream's own backends get the
+                                     same grants in AssemblyInfo.cs)
+  extensions/MewUI.Svg/MewUI.Svg.csproj  upstream's project file with one change: SvgNet's element/attribute
+                                     registry is the COMMITTED Generated/ folder (no build-time Roslyn component;
+                                     NativeAOT compiles what JIT compiles). Upstream's .gitignore is not vendored
+                                     because it ignores that folder.
+  extensions/MewUI.Svg/Generated/**  that registry; refresh with --emit-svg-generated. DO NOT hand-edit.
+  */packages.lock.json               NuGet lock files (root Directory.Build.props RestorePackagesWithLockFile)
+
+Patch series (third_party/patches/mewui/<category>/, applied in memory by vendor.py in the order the lock lists
+them). A MANDATORY category cannot be skipped. Each header says what and why; hunks are the whole change.
+
+  core-bridge (MANDATORY)
+  0001-mewvg-context-app-branch.patch - Shared/Rendering/MewVG/MewVGGraphicsContext.Common.cs gains a
+      `#elif MEWUI_MEWVG_MEWSTAGE` branch: the class MewStageMewVGGraphicsContext (with the dirty-rect interfaces
+      and IGroupOpacityContext), `_vg` typed MewVGContext (the backend supplies a subclass over its own GPU device),
+      and the GL-only clear / blit path compiled out so Clear() takes the fill path. Upstream branches unchanged.
+
+  design-space (MANDATORY)
+  0001-surface-scale-below-one.patch - a surface whose DPI scale is below 1 renders at that scale (it was clamped
+      to 1, so an embedded host at 1280x720 showing a 1920x1080 design-space layout clipped a third of it).
+
+  multi-host (MANDATORY: the test suites run several hosts in one process; secondary windows share a factory)
+  0001-per-thread-ui-statics-and-graphics-factory.patch - VisualTree / LogicalTree traversal scratch is per
+      thread and Application.ThreadGraphicsFactory (per thread) wins over the process-wide default factory, so
+      several embedded hosts in one process (parallel test threads, or one after another) never share a traversal
+      list or a text engine. Single-host behaviour unchanged.
+  0002-per-thread-animation-manager.patch - AnimationManager is per UI thread (a clock keeps the manager it
+      registered with), so one embedded host's per-frame pulse never ticks another host's transitions on the wrong
+      thread. Single-UI-thread behaviour unchanged.
+
+  allocation (optional; without it a steady-state UI frame allocates and the allocation gate tests fail)
+  0001-replay-text-without-delegate.patch - RenderDataReplayer replays text by switching on the command kind
+      instead of building a delegate per text command.
+  0002-gradient-lut-identity-lookup.patch - NvgStrokeHelper's gradient LUT cache finds a stop list by reference
+      first (ConditionalWeakTable), so a cached gradient needs no content key per draw.
+  0003-resource-cache-evict-without-closure.patch - RenderResourceCache's budget eviction loops instead of
+      running a LINQ lambda per frame.
+  0004-scene-pass-without-per-frame-allocation.patch - the retained scene pass reuses its recorder, its dirty
+      registry prunes in place, and the layer roots reuse the scene's array.
+  0005-apply-template-without-per-call-closure.patch - Control.ApplyTemplate's presenter walk moved to its own
+      method: the captured local made the compiler allocate a 32 B closure on EVERY call, and Window.PerformLayout
+      calls it every frame.
+  0006-dashed-stroke-without-per-draw-allocation.patch - NvgStrokeHelper (linked into MewStage.Ui.Backend) reuses
+      per-thread scratch for software dashing instead of a new List and PathGeometry per dashed draw.
+
+  text (optional)
+  0001-letter-spacing-draws-per-grapheme.patch - letter-spaced text is drawn one grapheme per laid-out column, so
+      the drawn glyphs sit where the layout put them (CSS letter-spacing); each grapheme's run box is at least its
+      own advance, so a negative kerning pair does not cut the glyph on raster-box backends.
+  0002-negative-half-leading.patch - a line box smaller than its text (CSS line-height below the font's) centres
+      the text with negative half-leading, as CSS does; it was clamped at zero.
+  0003-font-registry-multi-face-families.patch - FontResources.Register keeps every face of a family (with the
+      weight and style its file declares) and the text backends choose among them; it kept the last file only, so
+      a standard platform host drew every weight and style of a multi-file family with one face (Kit mode, Lora).
+
+  rendering (optional)
+  0001-rect-stroke-antialias-off-axis.patch - MewVG's rectangle stroke turns antialiasing off only on the pixel
+      grid (as its rectangle fill does); a stroke under a skew came out stair-stepped.
+
+  mewdock (optional; component mewdock, -p1 from extensions/MewUI.MewDock)
+  0001-tool-caption-toggle.patch - DockingManager.ShowToolCaptions (default true) lets an app hide the tool-group
+      caption bar when its panes carry their own header. Upstream behaviour with the default.
+
+--------------------------------------------------------------------------------
+2. Aprillz.MewVG  (MIT)  ->  third_party/MewVG/
+--------------------------------------------------------------------------------
+Upstream:  https://github.com/aprillz/MewVG
+Pin:       commit 5758c6bfc927d6b1dac64b13f6979fd464e0fcfb (tag v0.10.1, the version MewUI main builds against)
+License:   MIT (third_party/MewVG/LICENSE); the bundled LibTessDotNet tessellator is SGI Free Software License
+           B 2.0 (src/MewVG.Core/Tess/LibTessDotNet/LICENSE.txt).
+
+Vendored: build/MewVG.Common.props, src/MewVG.Core (the managed NanoVG core), src/MewVG.GL (the OpenGL renderer:
+used by the MewVG backends Kit mode runs on, and the reference renderer for MewStage's NanoVgRenderer).
+Not vendored: MewVG.Metal, samples, tests.
+
+MewStage-authored, preserved: build/MewVG.Local.props (net10.0 only); src/MewVG.Core/MewStage.InternalsVisibleTo.cs
+  (the renderer interface is internal; upstream grants MewVG.GL / MewVG.Metal the same).
+
+Patch series (third_party/patches/mewvg/<category>/):
+  build (MANDATORY)
+  0001-common-props-local-hook.patch - build/MewVG.Common.props imports an optional MewVG.Local.props before it
+      sets TargetFrameworks (the hook MewUI.Common.props already has). No change when the file is absent.
+  allocation (optional)
+  0001-scratch-pool-not-trimmed.patch - src/MewVG.Core rents its per-frame scratch arrays (tessellation, the BGRA
+      image swap) from NvgScratchPool<T> (ArrayPool<T>.Create()) instead of ArrayPool<T>.Shared, which trims
+      itself on Gen2 GCs and so would make a UI frame re-allocate them after a collection.
+
+--------------------------------------------------------------------------------
+3. FontStashSharp  (MIT, NuGet)  - NOT source-vendored
+--------------------------------------------------------------------------------
+PackageReference "FontStashSharp" 1.3.9 from MewStage.Ui.Backend - the texture-backend-agnostic main package
+(managed StbTrueTypeSharp rasterizer, no native dependency, NativeAOT-safe). It rasterises glyphs for the MewUI
+backend under MewUI's backend text contract (MewVG has no font system).
+
+--------------------------------------------------------------------------------
+4. Fonts  (SIL Open Font License 1.1)  ->  assets/fonts/
+--------------------------------------------------------------------------------
+Roboto Regular (Roboto-Regular.ttf, version 3.009; Copyright 2011 The Roboto Project Authors,
+https://github.com/googlefonts/roboto-classic) is embedded in MewStage.Ui.Backend as the backend's built-in default
+face: a MewUI backend must measure and draw text before the application registers its own faces. License:
+assets/fonts/OFL-Roboto.txt.
+Lora Regular, Italic, Bold and Bold Italic (version 3.021; Copyright 2011 The Lora Project Authors,
+https://github.com/cyrealtype/Lora-Cyrillic) are registered by the demo to show (family, weight, italic) face
+resolution. License: assets/fonts/OFL-Lora.txt.
+
+--------------------------------------------------------------------------------
+5. Other NuGet packages (not vendored)
+--------------------------------------------------------------------------------
+  ppy.SDL3-CS 2026.520.0 (MIT; SDL3 is zlib)      MewStage.Host: the window, events and gamepads
+  Silk.NET.Vulkan 2.21.0 + Extensions.KHR / .EXT (MIT)   MewStage.Rendering: the Vulkan backend
+  Vortice.Direct3D12 3.8.2, Vortice.DXGI 3.8.3 (MIT)     MewStage.Rendering: the Direct3D 12 backend
+  ExCSS 4.3.1 (MIT)                                upstream MewUI.Svg's CSS parser
+  xunit 2.9.3, xunit.runner.visualstudio 4.0.1, Microsoft.NET.Test.Sdk 18.11.0, Xunit.SkippableFact 1.5.23
+                                                   test projects only
+
+--------------------------------------------------------------------------------
+Build integration
+--------------------------------------------------------------------------------
+third_party/Directory.Build.props imports the repository-root Directory.Build.props (net10 / lock files) and then
+turns OFF TreatWarningsAsErrors, analyzers and code-style enforcement for vendored sources only. MewStage's own
+code lives outside third_party/ and keeps the strict standard.
+
+third_party/MewUI.Consumer.targets (MewStage-authored) is imported at the end of every project that USES MewUI
+(the demo executable, the UI test hosts; a library does not need it). It references the binding generator as an
+analyzer and imports upstream's build/Aprillz.MewUI.Core.targets, which a ProjectReference does not carry: the
+runtime feature switches (trimmed with ILLink.Substitutions.xml) and the interceptor namespace. MewStageUiHost =
+Embedded turns DevTools, Hot Reload, managed file dialogs, touch gestures and MEWUI_*_DEBUG logging off;
+MewStageUiHost = Tool keeps upstream's defaults.

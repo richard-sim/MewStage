@@ -1,0 +1,198 @@
+MewStage vendor patch allocation/0001 for MewVG (third_party/NOTICE): MewVG.Core rents its per-frame scratch arrays
+(tessellation, the BGRA image swap) from a pool of its own (ArrayPool<T>.Create(), NvgScratchPool.cs) instead of
+ArrayPool<T>.Shared, which trims itself on Gen2 GCs and so would make the next UI frame re-allocate its scratch
+arrays after a GC in the process (a steady-state frame must allocate nothing). Behaviour is otherwise unchanged.
+
+--- a/NVGContext.cs
++++ b/NVGContext.cs
+@@ -2158,7 +2158,7 @@
+ 
+                     var contour = path.Count <= stackContour.Length
+                         ? stackContour.Slice(0, path.Count)
+-                        : (rentedContour = System.Buffers.ArrayPool<Vector2>.Shared.Rent(path.Count)).AsSpan(0, path.Count);
++                        : (rentedContour = NvgScratchPool<Vector2>.Shared.Rent(path.Count)).AsSpan(0, path.Count);
+ 
+                     for (var j = 0; j < path.Count; j++)
+                         InsetPoint(ref contour[j], in pts[j], woff);
+@@ -2166,7 +2166,7 @@
+ 
+                     if (rentedContour is not null)
+                     {
+-                        System.Buffers.ArrayPool<Vector2>.Shared.Return(rentedContour, clearArray: false);
++                        NvgScratchPool<Vector2>.Shared.Return(rentedContour, clearArray: false);
+                         rentedContour = null;
+                     }
+                 }
+@@ -2175,7 +2175,7 @@
+             {
+                 if (rentedContour is not null)
+                 {
+-                    System.Buffers.ArrayPool<Vector2>.Shared.Return(rentedContour, clearArray: false);
++                    NvgScratchPool<Vector2>.Shared.Return(rentedContour, clearArray: false);
+                 }
+             }
+ 
+@@ -2693,7 +2693,7 @@
+                         }
+                         else
+                         {
+-                            rentedContour = System.Buffers.ArrayPool<Vector2>.Shared.Rent(path.Count);
++                            rentedContour = NvgScratchPool<Vector2>.Shared.Rent(path.Count);
+                             var contour = rentedContour.AsSpan(0, path.Count);
+                             for (var j = 0; j < path.Count; j++)
+                             {
+@@ -2704,7 +2704,7 @@
+                             }
+ 
+                             _fillTessellator.AddContour(contour);
+-                            System.Buffers.ArrayPool<Vector2>.Shared.Return(rentedContour, clearArray: false);
++                            NvgScratchPool<Vector2>.Shared.Return(rentedContour, clearArray: false);
+                             rentedContour = null;
+                         }
+                     }
+@@ -2713,7 +2713,7 @@
+                 {
+                     if (rentedContour is not null)
+                     {
+-                        System.Buffers.ArrayPool<Vector2>.Shared.Return(rentedContour, clearArray: false);
++                        NvgScratchPool<Vector2>.Shared.Return(rentedContour, clearArray: false);
+                     }
+                 }
+ 
+@@ -3095,7 +3095,7 @@
+         // are close in space but adjacent along the contour (flattened tight
+         // arcs, end caps) are normal geometry, not a fold-over. Only pairs far
+         // apart along the contour count as self-overlap.
+-        var pool = System.Buffers.ArrayPool<float>.Shared;
++        var pool = NvgScratchPool<float>.Shared;
+         var arcPrefix = pool.Rent(_cache.NPoints);
+         var arcTotals = pool.Rent(pathCount);
+         for (var i = 0; i < pathCount; i++)
+@@ -3179,7 +3179,7 @@
+                 var points = _cache.Points.AsSpan(path.First, path.Count);
+                 var contour = path.Count <= stackContour.Length
+                     ? stackContour.Slice(0, path.Count)
+-                    : (rentedContour = System.Buffers.ArrayPool<Vector2>.Shared.Rent(path.Count)).AsSpan(0, path.Count);
++                    : (rentedContour = NvgScratchPool<Vector2>.Shared.Rent(path.Count)).AsSpan(0, path.Count);
+ 
+                 for (var j = 0; j < path.Count; j++)
+                 {
+@@ -3189,7 +3189,7 @@
+                 _fillBoundaryTessellator.AddContour(contour);
+                 if (rentedContour is not null)
+                 {
+-                    System.Buffers.ArrayPool<Vector2>.Shared.Return(rentedContour, clearArray: false);
++                    NvgScratchPool<Vector2>.Shared.Return(rentedContour, clearArray: false);
+                     rentedContour = null;
+                 }
+             }
+@@ -3198,7 +3198,7 @@
+         {
+             if (rentedContour is not null)
+             {
+-                System.Buffers.ArrayPool<Vector2>.Shared.Return(rentedContour, clearArray: false);
++                NvgScratchPool<Vector2>.Shared.Return(rentedContour, clearArray: false);
+             }
+         }
+ 
+@@ -3873,8 +3873,8 @@
+             return;
+         }
+ 
+-        var rentedA = System.Buffers.ArrayPool<NVGpoint>.Shared.Rent(count);
+-        var rentedB = System.Buffers.ArrayPool<NVGpoint>.Shared.Rent(count);
++        var rentedA = NvgScratchPool<NVGpoint>.Shared.Rent(count);
++        var rentedB = NvgScratchPool<NVGpoint>.Shared.Rent(count);
+         try
+         {
+             var src = rentedA.AsSpan(0, count);
+@@ -3922,8 +3922,8 @@
+         }
+         finally
+         {
+-            System.Buffers.ArrayPool<NVGpoint>.Shared.Return(rentedA, clearArray: false);
+-            System.Buffers.ArrayPool<NVGpoint>.Shared.Return(rentedB, clearArray: false);
++            NvgScratchPool<NVGpoint>.Shared.Return(rentedA, clearArray: false);
++            NvgScratchPool<NVGpoint>.Shared.Return(rentedB, clearArray: false);
+         }
+     }
+ 
+--- a/MewVGContext.cs
++++ b/MewVGContext.cs
+@@ -187,7 +187,7 @@
+             return CreateImageRGBA(width, height, imageFlags, data);
+         }
+ 
+-        var rgba = System.Buffers.ArrayPool<byte>.Shared.Rent(data.Length);
++        var rgba = NvgScratchPool<byte>.Shared.Rent(data.Length);
+         try
+         {
+             var rgbaSpan = rgba.AsSpan(0, data.Length);
+@@ -196,7 +196,7 @@
+         }
+         finally
+         {
+-            System.Buffers.ArrayPool<byte>.Shared.Return(rgba);
++            NvgScratchPool<byte>.Shared.Return(rgba);
+         }
+     }
+ 
+@@ -211,7 +211,7 @@
+             return UpdateImage(image, data);
+         }
+ 
+-        var rgba = System.Buffers.ArrayPool<byte>.Shared.Rent(data.Length);
++        var rgba = NvgScratchPool<byte>.Shared.Rent(data.Length);
+         try
+         {
+             var rgbaSpan = rgba.AsSpan(0, data.Length);
+@@ -220,7 +220,7 @@
+         }
+         finally
+         {
+-            System.Buffers.ArrayPool<byte>.Shared.Return(rgba);
++            NvgScratchPool<byte>.Shared.Return(rgba);
+         }
+     }
+ 
+--- a/Tess/LibTessDotNet/PriorityQueue.cs
++++ b/Tess/LibTessDotNet/PriorityQueue.cs
+@@ -79,11 +79,11 @@
+             if (count == stack.Length)
+             {
+                 int newLength = stack.Length * 2;
+-                var newStack = ArrayPool<StackItem>.Shared.Rent(newLength);
++                var newStack = global::Aprillz.MewVG.NvgScratchPool<StackItem>.Shared.Rent(newLength);
+                 stack.CopyTo(newStack);
+                 if (rentedStack != null)
+                 {
+-                    ArrayPool<StackItem>.Shared.Return(rentedStack);
++                    global::Aprillz.MewVG.NvgScratchPool<StackItem>.Shared.Return(rentedStack);
+                 }
+ 
+                 rentedStack = newStack;
+@@ -164,7 +164,7 @@
+             {
+                 if (rentedStack != null)
+                 {
+-                    ArrayPool<StackItem>.Shared.Return(rentedStack);
++                    global::Aprillz.MewVG.NvgScratchPool<StackItem>.Shared.Return(rentedStack);
+                 }
+             }
+ 
+--- /dev/null
++++ b/NvgScratchPool.cs
+@@ -0,0 +1,13 @@
++// MewStage vendor patch allocation/0001 (third_party/NOTICE): the scratch arrays MewVG rents while it builds a frame (the
++// tessellator, the BGRA image swap) come from a pool of its own instead of ArrayPool<T>.Shared. The shared pool
++// trims itself from a Gen2 GC callback (on the finalizer thread, by array age and memory pressure), so a GC caused
++// by anything else in the process could empty the render thread's buckets and make the next frame allocate its
++// scratch arrays again. A pool made by ArrayPool<T>.Create() is never trimmed: once a frame's arrays have been
++// rented they are reused for good, and a steady-state frame allocates nothing.
++namespace Aprillz.MewVG;
++
++internal static class NvgScratchPool<T>
++{
++    /// <summary>The pool every scratch rent in MewVG.Core goes through.</summary>
++    internal static readonly System.Buffers.ArrayPool<T> Shared = System.Buffers.ArrayPool<T>.Create();
++}

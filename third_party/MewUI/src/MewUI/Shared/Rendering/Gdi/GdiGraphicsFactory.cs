@@ -1,0 +1,560 @@
+using System.Runtime.Intrinsics;
+
+using Aprillz.MewUI.Native;
+using Aprillz.MewUI.Native.Structs;
+using Aprillz.MewUI.Platform;
+using Aprillz.MewUI.Platform.Win32;
+using Aprillz.MewUI.Rendering.Gdi.Core;
+using Aprillz.MewUI.Rendering.DirectWrite;
+using Aprillz.MewUI.Rendering.Win32;
+using Aprillz.MewUI.Resources;
+using Aprillz.MewUI.Text;
+
+namespace Aprillz.MewUI.Rendering.Gdi;
+
+/// <summary>
+/// GDI+ graphics factory implementation.
+/// </summary>
+public sealed class GdiGraphicsFactory : IGraphicsFactory, ITextBackendFactory, IRenderDevice, IWindowResourceReleaser, IWindowSurfacePresenter,
+    IBackendRenderCacheMaintenance, IPersistentFrameGraphicsFactory, IDisposable
+{
+    public const string BackendIdentifier = "Gdi";
+
+    public string Backend => BackendIdentifier;
+
+    public ITextEngine TextEngine => TextServices.GetEngine(this);
+
+    internal GdiGraphicsFactory() { }
+
+    private readonly RenderResourceCache _renderResourceCache = new();
+    private readonly ulong _renderDeviceId = RenderDeviceIdentity.AllocateDeviceId();
+
+    public RenderDeviceIdentity RenderIdentity => new(_renderDeviceId, 0);
+
+    bool IPersistentFrameGraphicsFactory.IsPersistentFrameRenderingVerified => true;
+
+    // The window is drawn through a back buffer kept per window, which is copied to the screen whole.
+    bool IPersistentFrameGraphicsFactory.WindowTargetKeepsPresentedFrame => IsDoubleBuffered;
+
+    // The back buffer kept per window is the frame itself, so an opaque window is repainted in place
+    // instead of through a second surface of the same size.
+    bool IPersistentFrameGraphicsFactory.DrawsWindowFramesInPlace => IsDoubleBuffered;
+
+    IDisposable IPersistentFrameGraphicsFactory.AcquirePersistentFrameRenderScope()
+        => PersistentFrameRenderScope.Instance;
+
+    public bool IsDoubleBuffered { get; set; } = true;
+
+    public GdiCurveQuality CurveQuality { get; set; } = GdiCurveQuality.Supersample2x;
+
+    // Keep backend default aligned with other backends: Default => Linear unless the app explicitly overrides.
+    public ImageScaleQuality ImageScaleQuality { get; set; } = ImageScaleQuality.Normal;
+
+    public IFont CreateFont(string family, double size, FontWeight weight = FontWeight.Normal,
+        bool italic = false, bool underline = false, bool strikethrough = false)
+        => CreateFontCore(family, size, DpiHelper.GetSystemDpi(), weight, italic, underline, strikethrough);
+
+    /// <summary>
+    /// Creates a font with a specific DPI.
+    /// </summary>
+    public IFont CreateFont(string family, double size, uint dpi, FontWeight weight = FontWeight.Normal,
+        bool italic = false, bool underline = false, bool strikethrough = false)
+        => CreateFontCore(family, size, dpi, weight, italic, underline, strikethrough);
+
+    private IFont CreateFontCore(string family, double size, uint dpi, FontWeight weight,
+        bool italic, bool underline, bool strikethrough)
+    {
+        if (DirectWriteTextGate.IsSupported)
+        {
+            return Win32DirectWriteFonts.CreateFont(family, size, weight, italic, underline, strikethrough, dpi);
+        }
+
+        family = GdiFont.SelectFamilyCandidate(family);
+        family = ResolveFontFamilyOrFile(family);
+        return new GdiFont(family, size, weight, italic, underline, strikethrough, dpi);
+    }
+
+    private static string ResolveFontFamilyOrFile(string familyOrPath)
+    {
+        // 1. Check FontRegistry (registered via FontResources.Register)
+        var resolved = FontRegistry.Resolve(familyOrPath);
+        if (resolved != null)
+        {
+            // MewStage vendor patch text/0003: every face of the family, so GDI matches the weight and style among them.
+            foreach (var file in FontRegistry.ResolveFiles(resolved.Value.FamilyName))
+            {
+                _ = Win32Fonts.EnsurePrivateFont(file);
+            }
+            return GdiFamilyName(resolved.Value.FilePath, resolved.Value.FamilyName);
+        }
+
+        // 2. Legacy: file path directly in FontFamily
+        if (!FontResources.LooksLikeFontFilePath(familyOrPath))
+        {
+            return familyOrPath;
+        }
+
+        var path = Path.GetFullPath(familyOrPath);
+        _ = Win32Fonts.EnsurePrivateFont(path);
+
+        var fallback = FontResources.TryGetParsedFamilyName(path, out var parsed) && !string.IsNullOrWhiteSpace(parsed)
+            ? parsed
+            : "Segoe UI";
+        return GdiFamilyName(path, fallback);
+    }
+
+    // GDI's CreateFont matches the legacy Windows family name (name ID 1), not the typographic name
+    // (name ID 16) used elsewhere; for multi-weight fonts they differ and GDI would substitute a fallback.
+    private static string GdiFamilyName(string filePath, string fallbackFamily)
+        => OpenTypeNameTable.TryGetFamilyName(filePath, out var windowsFamily, preferLegacyFamily: true)
+                && !string.IsNullOrWhiteSpace(windowsFamily)
+            ? windowsFamily
+            : fallbackFamily;
+
+    /// <summary>
+    /// Creates an empty 32-bit ARGB image.
+    /// </summary>
+    public IImage CreateImage(int width, int height) => new GdiImage(width, height);
+
+    /// <summary>
+    /// Creates a 32-bit ARGB image from raw pixel data.
+    /// </summary>
+    public IImage CreateImage(int width, int height, byte[] pixelData) => new GdiImage(width, height, pixelData);
+
+    public IGraphicsContext CreateContext(IRenderTarget target)
+    {
+        ArgumentNullException.ThrowIfNull(target);
+
+        if (target is IRenderSurface surface)
+        {
+            target = RenderSurfaceResource.ResolveBackendSurface(surface);
+        }
+
+        if (target is WindowRenderTarget windowTarget)
+        {
+            if (windowTarget.Surface is not IWin32HdcWindowSurface win32Surface ||
+                win32Surface.Hwnd == 0 ||
+                win32Surface.Hdc == 0)
+            {
+                throw new ArgumentException("GDI backend requires a Win32 HDC window surface.", nameof(target));
+            }
+
+            return CreateContextCore(win32Surface.Hwnd, win32Surface.Hdc, windowTarget.DpiScale, win32Surface.TransparentComposition);
+        }
+
+        if (target is GdiPixelRenderSurface pixelSurface)
+        {
+            // Use target's Hdc directly - no wrapper needed
+            return new GdiPlusGraphicsContext(
+                hwnd: 0,
+                hdc: pixelSurface.Hdc,
+                pixelWidth: pixelSurface.PixelWidth,
+                pixelHeight: pixelSurface.PixelHeight,
+                dpiScale: pixelSurface.DpiScale,
+                imageScaleQuality: ImageScaleQuality,
+                ownsDc: false,
+                pixelSurface: pixelSurface);
+        }
+
+        if (target is ICpuPixelSurface)
+        {
+            throw new ArgumentException(
+                $"Render surface was created by a different backend. " +
+                $"Use {nameof(CreateSurface)} from the same factory.",
+                nameof(target));
+        }
+
+        throw new NotSupportedException($"Unsupported render target type: {target.GetType().Name}");
+    }
+
+    private IGraphicsContext CreateContextCore(nint hwnd, nint hdc, double dpiScale, bool transparentComposition = false)
+        => IsDoubleBuffered
+        ? GdiPlusGraphicsContext.CreateDoubleBuffered(hwnd, hdc, dpiScale, ImageScaleQuality, transparentComposition)
+        : new GdiPlusGraphicsContext(hwnd, hdc, dpiScale, ImageScaleQuality);
+
+    ITextBackendMeasurementContext ITextBackendFactory.CreateTextMeasurementContext(uint dpi)
+    {
+        var hdc = User32.GetDC(0);
+        return new GdiMeasurementContext(hdc, dpi);
+    }
+
+    private IRenderSurface CreatePixelSurface(int pixelWidth, int pixelHeight, double dpiScale, bool hasAlpha)
+        => new GdiPixelRenderSurface(pixelWidth, pixelHeight, dpiScale, hasAlpha: hasAlpha);
+
+    public IRenderResourceCache? ResourceCache => _renderResourceCache;
+
+    public IRenderEffectDevice? Effects => null;
+
+    public IRenderSurface CreateSurface(RenderSurfaceDescriptor descriptor)
+        => CreatePixelSurface(
+            descriptor.PixelWidth,
+            descriptor.PixelHeight,
+            descriptor.DpiScale,
+            descriptor.RequiredCapabilities.HasFlag(SurfaceCapabilities.Alpha));
+
+    public IGraphicsContext CreateContext(IRenderSurface surface)
+    {
+        surface = RenderSurfaceResource.ResolveBackendSurface(surface);
+        return surface.Capabilities.HasFlag(SurfaceCapabilities.Renderable)
+            ? CreateContext((IRenderTarget)surface)
+            : throw new NotSupportedException(
+                $"{GetType().Name} can only create contexts for renderable surfaces.");
+    }
+
+    public IImage CreateImageView(IRenderSurface surface)
+    {
+        int logicalWidth = surface.PixelWidth;
+        int logicalHeight = surface.PixelHeight;
+        surface = RenderSurfaceResource.ResolveBackendSurface(surface);
+        var image = surface is IPixelBufferSource pixelSource
+            ? CreateImageView(pixelSource)
+            : throw new NotSupportedException(
+                $"{GetType().Name} can only create image views for pixel-backed surfaces.");
+        // A recorded frame outlives the owner that made this view, so the surface release waits for
+        // the last view instead of freeing the pixels the tree still draws.
+        if (surface is IRetainableSurface retainableSurface)
+        {
+            image = ImageResource.WrapSurfaceView(image, retainableSurface);
+        }
+        return ImageResource.WrapLogical(image, logicalWidth, logicalHeight);
+    }
+
+    public IImage CreateImageView(IPixelBufferSource source)
+        => new GdiImage(source);
+
+    public IImage CreateImageView(IExternalRasterSource source)
+        => throw new NotSupportedException(
+            $"{GetType().Name} does not support external raster sources of type {source.GetType().Name}.");
+
+    /// <summary>Wraps an externally-owned DIB section as an <see cref="IImage"/>. Caller keeps DIB ownership; call <see cref="MarkExternalImageBitsChanged"/> after writes.</summary>
+    public IImage CreateImageOverDibSection(int width, int height, nint dibHandle, nint dibBits)
+        => new GdiImage(width, height, dibHandle, dibBits);
+
+    /// <summary>Invalidates derived caches on an image returned by <see cref="CreateImageOverDibSection"/>.</summary>
+    public void MarkExternalImageBitsChanged(IImage image)
+    {
+        if (image is GdiImage gdi) gdi.MarkBitsChanged();
+    }
+
+    /// <summary>Flags an image as fully opaque so the GDI context picks SRCCOPY over AlphaBlend.</summary>
+    public void SetImageOpaque(IImage image, bool opaque)
+    {
+        if (image is GdiImage gdi) gdi.IsOpaque = opaque;
+    }
+
+    public bool TryReadPixels(IRenderSurface source, Span<byte> destination, int destinationStrideBytes)
+        => RenderDeviceFactoryHelpers.TryReadPixels(source, destination, destinationStrideBytes);
+
+    public IRenderOperation RequestReadback(IRenderSurface source)
+        => RenderDeviceFactoryHelpers.RequestReadback(source);
+
+    public IRenderOperation FlushAsyncWork() => RenderOperation.Completed;
+
+    void IBackendRenderCacheMaintenance.TrimBackendCaches(RenderCacheTrimReason reason)
+        => GdiPlusGraphicsContext.TrimWindowResourceCaches();
+
+    void IBackendRenderCacheMaintenance.MaintainBackendCaches(RenderCacheMaintenanceMode mode)
+    {
+        if (mode is RenderCacheMaintenanceMode.MemoryPressure
+            or RenderCacheMaintenanceMode.WindowClosed
+            or RenderCacheMaintenanceMode.DeviceLost
+            or RenderCacheMaintenanceMode.Shutdown)
+        {
+            GdiPlusGraphicsContext.TrimWindowResourceCaches();
+        }
+    }
+
+    public void Dispose()
+    {
+        ImageSource.RetireRealizationsForFactory(this);
+        TextServices.ReleaseIfCreated(this);
+        _renderResourceCache.Dispose();
+        if (DirectWriteTextGate.IsSupported)
+        {
+            Win32DirectWriteFonts.DisposeIfCreated();
+        }
+
+        lock (_layeredLock)
+        {
+            foreach (var (_, layered) in _layeredTargets)
+                layered.Dispose();
+            _layeredTargets.Clear();
+
+            foreach (var (_, staging) in _layeredStagingTargets)
+                staging.Dispose();
+            _layeredStagingTargets.Clear();
+        }
+
+        GdiPlusGraphicsContext.ReleaseAllBackBuffers();
+    }
+
+    public void ReleaseWindowResources(nint windowHandle)
+    {
+        if (windowHandle == 0)
+        {
+            return;
+        }
+
+        lock (_layeredLock)
+        {
+            if (_layeredTargets.Remove(windowHandle, out var layered))
+            {
+                layered.Dispose();
+            }
+
+            if (_layeredStagingTargets.Remove(windowHandle, out var staging))
+            {
+                staging.Dispose();
+            }
+        }
+
+        GdiPlusGraphicsContext.ReleaseForWindow(windowHandle);
+    }
+
+    private readonly object _layeredLock = new();
+    private readonly Dictionary<nint, GdiPixelRenderSurface> _layeredTargets = new();
+    private readonly Dictionary<nint, Win32LayeredBitmap> _layeredStagingTargets = new();
+
+    public bool Present(Window window, IWindowSurface surface, double opacity)
+    {
+        if (surface is not IWin32WindowSurface win32Surface || win32Surface.Hwnd == 0)
+        {
+            return false;
+        }
+
+        ArgumentNullException.ThrowIfNull(window);
+
+        var hwnd = win32Surface.Hwnd;
+        int w = Math.Max(1, win32Surface.PixelWidth);
+        int h = Math.Max(1, win32Surface.PixelHeight);
+        double dpiScale = win32Surface.DpiScale <= 0 ? 1.0 : win32Surface.DpiScale;
+
+        var target = GetOrCreateLayeredTarget(window, hwnd, w, h, dpiScale);
+        window.RenderFrameToPresentSurface(target);
+
+        // UpdateLayeredWindow expects premultiplied BGRA. The GDI pipeline already renders premultiplied
+        // into the pixel surface; only fix up missing alpha from legacy GDI text/bitblt paths.
+        var staging = GetOrCreateLayeredStagingTarget(hwnd, w, h, dpiScale);
+        CopyWithAlphaFix(target.GetPixelSpan(), staging.GetPixelSpan());
+
+        // NOTE: UpdateLayeredWindow interprets pptDst as the WINDOW top-left in screen coordinates.
+        // Passing ClientToScreen(0,0) will move the window every time we present (drift), because
+        // client-origin != window-origin for any style with a non-client border.
+        //
+        // For per-pixel transparency we enforce a borderless popup window style on Win32 so
+        // client-size == window-size and input/render stay aligned.
+        if (!User32.GetWindowRect(hwnd, out var windowRect))
+        {
+            return true; // Best-effort: rendered but couldn't present.
+        }
+        var dst = new POINT(windowRect.left, windowRect.top);
+
+        var size = new SIZE(w, h);
+        var src = new POINT(0, 0);
+        byte alpha = (byte)Math.Round(Math.Clamp(opacity, 0.0, 1.0) * 255.0);
+        var blend = BLENDFUNCTION.SourceOver(alpha);
+
+        const uint ULW_ALPHA = 0x00000002;
+        _ = User32.UpdateLayeredWindow(
+            hwnd: hwnd,
+            hdcDst: 0,
+            pptDst: ref dst,
+            psize: ref size,
+            hdcSrc: staging.Hdc,
+            pptSrc: ref src,
+            crKey: 0,
+            pblend: ref blend,
+            dwFlags: ULW_ALPHA);
+
+        return true;
+    }
+
+    private GdiPixelRenderSurface GetOrCreateLayeredTarget(Window window, nint hwnd, int pixelWidth, int pixelHeight, double dpiScale)
+    {
+        lock (_layeredLock)
+        {
+            if (_layeredTargets.TryGetValue(hwnd, out var existing) &&
+                existing.PixelWidth == pixelWidth &&
+                existing.PixelHeight == pixelHeight &&
+                Math.Abs(existing.DpiScale - dpiScale) < 0.001)
+            {
+                return existing;
+            }
+
+            if (_layeredTargets.Remove(hwnd, out var old))
+            {
+                // The window's context for the old surface still points at it.
+                window.ReleasePresentSurfaceContext();
+                old.Dispose();
+            }
+
+            var created = new GdiPixelRenderSurface(pixelWidth, pixelHeight, dpiScale, presentationMode: GdiPresentationMode.PerPixelAlpha);
+            _layeredTargets[hwnd] = created;
+            return created;
+        }
+    }
+
+    private Win32LayeredBitmap GetOrCreateLayeredStagingTarget(nint hwnd, int pixelWidth, int pixelHeight, double dpiScale)
+    {
+        lock (_layeredLock)
+        {
+            if (_layeredStagingTargets.TryGetValue(hwnd, out var existing) &&
+                existing.PixelWidth == pixelWidth &&
+                existing.PixelHeight == pixelHeight &&
+                Math.Abs(existing.DpiScale - dpiScale) < 0.001)
+            {
+                return existing;
+            }
+
+            if (_layeredStagingTargets.Remove(hwnd, out var old))
+            {
+                old.Dispose();
+            }
+
+            var created = new Win32LayeredBitmap(pixelWidth, pixelHeight, dpiScale);
+            _layeredStagingTargets[hwnd] = created;
+            return created;
+        }
+    }
+
+    private static unsafe void CopyWithAlphaFix(ReadOnlySpan<byte> srcBgra, Span<byte> dstBgra)
+    {
+        int byteCount = Math.Min(srcBgra.Length, dstBgra.Length);
+        if (byteCount <= 0) return;
+
+        // GDI text/bitblt paths often leave A=0; infer opaque pixels from RGB.
+        // Per pixel (BGRA little-endian = 0xAARRGGBB in uint):
+        //   if (alpha == 0 && rgb != 0) alpha = 0xFF
+
+        fixed (byte* srcPtr = srcBgra, dstPtr = dstBgra)
+        {
+            int pixelCount = byteCount / 4;
+            int i = 0;
+
+            if (System.Runtime.Intrinsics.X86.Sse2.IsSupported)
+            {
+                // 4 pixels per iteration (16 bytes).
+                // alphaMask isolates A byte per pixel: 0x FF000000 repeated.
+                var alphaMask = System.Runtime.Intrinsics.Vector128.Create(0xFF000000u).AsByte();
+                var zero = System.Runtime.Intrinsics.Vector128<byte>.Zero;
+
+                int simdCount = pixelCount & ~3; // round down to multiple of 4
+                for (; i < simdCount; i += 4)
+                {
+                    var v = System.Runtime.Intrinsics.X86.Sse2.LoadVector128(srcPtr + i * 4);
+
+                    // alphaBytes: A channels only (others zeroed)
+                    var alphaBytes = System.Runtime.Intrinsics.X86.Sse2.And(v, alphaMask);
+                    // alphaZero: 0xFFFFFFFF per pixel where A==0
+                    var alphaZero = System.Runtime.Intrinsics.X86.Sse2.CompareEqual(alphaBytes.AsInt32(), zero.AsInt32()).AsByte();
+
+                    // rgbBytes: RGB channels only (A zeroed)
+                    var rgbBytes = System.Runtime.Intrinsics.X86.Sse2.AndNot(alphaMask, v);
+                    // rgbNonZero: 0xFFFFFFFF per pixel where any RGB byte != 0
+                    // CompareEqual gives 0xFFFFFFFF where all bytes are 0 => invert
+                    var rgbAllZero = System.Runtime.Intrinsics.X86.Sse2.CompareEqual(rgbBytes.AsInt32(), zero.AsInt32()).AsByte();
+                    var rgbHasColor = System.Runtime.Intrinsics.X86.Sse2.Xor(rgbAllZero,
+                        System.Runtime.Intrinsics.Vector128.Create((byte)0xFF));
+
+                    // needsFix: pixels where A==0 AND RGB!=0
+                    var needsFix = System.Runtime.Intrinsics.X86.Sse2.And(alphaZero, rgbHasColor);
+                    // OR 0xFF into the alpha byte position for those pixels
+                    var fix = System.Runtime.Intrinsics.X86.Sse2.And(needsFix, alphaMask);
+                    var result = System.Runtime.Intrinsics.X86.Sse2.Or(v, fix);
+
+                    System.Runtime.Intrinsics.X86.Sse2.Store(dstPtr + i * 4, result);
+                }
+            }
+
+            // Scalar remainder
+            for (; i < pixelCount; i++)
+            {
+                uint pixel = ((uint*)srcPtr)[i];
+                if ((pixel & 0xFF000000) == 0 && (pixel & 0x00FFFFFF) != 0)
+                    pixel |= 0xFF000000;
+                ((uint*)dstPtr)[i] = pixel;
+            }
+        }
+    }
+
+    private sealed class Win32LayeredBitmap : IDisposable
+    {
+        private readonly nint _dibSection;
+        private readonly nint _oldBitmap;
+        private readonly nint _dibBits;
+        private bool _disposed;
+
+        public int PixelWidth { get; }
+
+        public int PixelHeight { get; }
+
+        public double DpiScale { get; }
+
+        public nint Hdc { get; }
+
+        public Win32LayeredBitmap(int pixelWidth, int pixelHeight, double dpiScale)
+        {
+            ArgumentOutOfRangeException.ThrowIfLessThanOrEqual(pixelWidth, 0);
+            ArgumentOutOfRangeException.ThrowIfLessThanOrEqual(pixelHeight, 0);
+            ArgumentOutOfRangeException.ThrowIfLessThanOrEqual(dpiScale, 0);
+
+            PixelWidth = pixelWidth;
+            PixelHeight = pixelHeight;
+            DpiScale = dpiScale;
+
+            var screenDc = User32.GetDC(0);
+            Hdc = Gdi32.CreateCompatibleDC(screenDc);
+            _ = User32.ReleaseDC(0, screenDc);
+
+            if (Hdc == 0)
+            {
+                throw new InvalidOperationException("Failed to create memory DC for layered presentation.");
+            }
+
+            var bmi = BITMAPINFO.Create32bpp(pixelWidth, pixelHeight);
+            _dibSection = Gdi32.CreateDIBSection(Hdc, ref bmi, 0, out _dibBits, 0, 0);
+            if (_dibSection == 0 || _dibBits == 0)
+            {
+                Gdi32.DeleteDC(Hdc);
+                throw new InvalidOperationException("Failed to create DIB section for layered presentation.");
+            }
+
+            _oldBitmap = Gdi32.SelectObject(Hdc, _dibSection);
+        }
+
+        public unsafe Span<byte> GetPixelSpan()
+        {
+            if (_disposed || _dibBits == 0)
+            {
+                return Span<byte>.Empty;
+            }
+
+            return new Span<byte>((void*)_dibBits, PixelWidth * PixelHeight * 4);
+        }
+
+        public void Dispose()
+        {
+            if (_disposed)
+            {
+                return;
+            }
+
+            _disposed = true;
+
+            if (_oldBitmap != 0 && Hdc != 0)
+            {
+                Gdi32.SelectObject(Hdc, _oldBitmap);
+            }
+
+            if (_dibSection != 0)
+            {
+                Gdi32.DeleteObject(_dibSection);
+            }
+
+            if (Hdc != 0)
+            {
+                Gdi32.DeleteDC(Hdc);
+            }
+        }
+    }
+}

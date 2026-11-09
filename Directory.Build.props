@@ -1,0 +1,42 @@
+<Project>
+  <!--
+    Root build settings for every project in the repository. third_party/Directory.Build.props imports this file and
+    then relaxes the standard for the vendored upstream trees; everything under src/ and tests/ builds under the full
+    standard: nullable, every analyzer at warning (see .editorconfig), warnings as errors, code style enforced in the
+    build, XML documentation on every public member.
+  -->
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <LangVersion>latest</LangVersion>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>disable</ImplicitUsings>
+    <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
+    <WarningLevel>9999</WarningLevel>
+    <AnalysisLevel>latest-all</AnalysisLevel>
+    <EnforceCodeStyleInBuild>true</EnforceCodeStyleInBuild>
+    <GenerateDocumentationFile>true</GenerateDocumentationFile>
+    <RestorePackagesWithLockFile>true</RestorePackagesWithLockFile>
+    <InvariantGlobalization>true</InvariantGlobalization>
+    <Deterministic>true</Deterministic>
+    <Configurations>Debug;Release</Configurations>
+    <SatelliteResourceLanguages>en</SatelliteResourceLanguages>
+    <!-- No per-project AssemblyInfo attributes beyond what the SDK generates; the LICENSE file governs. -->
+    <Authors>Richard Sim</Authors>
+    <Copyright>Copyright (c) 2026 Richard Sim</Copyright>
+    <RepositoryUrl>https://github.com/richard-sim/MewStage</RepositoryUrl>
+    <PackageLicenseExpression>MIT</PackageLicenseExpression>
+    <IsPackable>false</IsPackable>
+  </PropertyGroup>
+
+  <!-- Test projects: no documentation requirement (the documentation file itself stays on: IDE0005, unnecessary
+       usings, only runs in the build when it is generated), no AOT analysis (Directory.Build.targets). -->
+  <PropertyGroup Condition="$(MSBuildProjectName.EndsWith('.Tests'))">
+    <IsTestProject>true</IsTestProject>
+    <NoWarn>$(NoWarn);CS1591</NoWarn>
+  </PropertyGroup>
+
+  <!-- Path to the repository root, for projects and tests that need it (asset roots, layering gate). -->
+  <PropertyGroup>
+    <MewStageRepoRoot>$(MSBuildThisFileDirectory)</MewStageRepoRoot>
+  </PropertyGroup>
+</Project>

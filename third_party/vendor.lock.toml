@@ -1,0 +1,262 @@
+# vendor.lock.toml - the single source of provenance for MewStage's vendored MewUI / MewVG (+ extensions).
+#
+# Re-vendor:      python third_party/tools/vendor.py                  (writes the tree; every patch applied)
+# Verify:         python third_party/tools/vendor.py --check          (exit 1 on drift from the lock + the recorded patch set)
+# List patches:   python third_party/tools/vendor.py --list-patches
+# Fewer patches:  python third_party/tools/vendor.py --skip-category allocation,text   (mandatory categories never skip)
+#
+# [sources.*]     one upstream COMMIT each (never a branch or a tag: tags move, main churns). The codeload tarball of
+#                 that commit is verified by archive_sha256 and, authoritatively, by content_sha256 (sha256 over every
+#                 "F <path> <file sha256>" line, sorted; see Source.content_digest in the script). Git submodules are
+#                 their own sources, pinned to the commit the parent repository records.
+# [categories.*]  the patch categories (docs/vendoring.md). A mandatory category cannot be skipped: the backend does
+#                 not compile without it, or the test suites cannot run.
+# [components.*]  one upstream folder -> one third_party folder. Paths are relative to third_party/. include / exclude
+#                 are globs on the path below src_root. preserve globs are MewStage-authored files inside dest that
+#                 the updater never writes or deletes. patches apply in list order, -p1 relative to dest, by the
+#                 script's strict in-memory applier; each names its category. A component whose dest lies inside
+#                 another's dest owns that folder (the outer component never touches it).
+#
+# Layout: third_party/MewUI and third_party/MewVG mirror the upstream REPOSITORY layout (build/, src/<proj>/,
+# extensions/<proj>/), so upstream csprojs, their relative links into src/MewUI/Shared/ and the build/ props all work
+# unmodified. MewStage hooks in only through upstream's own build/MewUI.Local.props and (by the mewvg/build patch) the
+# same hook in MewVG's build/MewVG.Common.props. See third_party/NOTICE and docs/vendoring.md.
+
+[meta]
+order = [
+  "mewui_build", "mewui", "analyzers", "generators", "preview",
+  "platform_win32", "platform_x11", "backend_mewvg_win32", "backend_mewvg_x11",
+  "mewdock", "svg", "svgnet", "geometry", "clipper2", "mewcharts", "livecharts2",
+  "mewvg_build", "mewvg", "mewvg_gl",
+]
+
+# ------------------------------------------------------------------------------------------------- sources
+
+[sources.mewui]
+repo = "https://github.com/aprillz/MewUI"
+commit = "8b9c9433fc9b1450d994b26bcef55a8d294bbd29"          # main, 2026-10-16 ("0.22.1+")
+archive_sha256 = "3acf8f15768922d78c3238ab9aa308947b5982cb9280a764f0ce18d02e011e7d"
+content_sha256 = "d5867e8ddfc1402a5f8aca6011b563346423cf27b11d8a384564808bb2124395"
+license = "MIT"
+
+[sources.mewvg]
+repo = "https://github.com/aprillz/MewVG"
+commit = "5758c6bfc927d6b1dac64b13f6979fd464e0fcfb"          # tag v0.10.1 (the version MewUI main builds against)
+archive_sha256 = "5c11e2c23a41516c715b8b73ab80e9184bca23b1698dab1fb0409c4de8e5c243"
+content_sha256 = "bad1d31dc8998aff15ad48f8f75d6b29635ad51ce815e3fbc9ea938036eae1ab"
+license = "MIT"
+
+[sources.svgnet]
+repo = "https://github.com/svg-net/SVG"
+commit = "853a9ae8d7e34415ff6a0c4a24d4ef29032c72fa"          # MewUI submodule extensions/MewUI.Svg/ThirdParty/SvgNet
+archive_sha256 = "a1453b713f63a6abb1c24f6cd70c9d580548f15665a22298e466996d092ce4e4"
+content_sha256 = "5bc869bce07429d7b804d85287b5dfe2ac0d3c51b7b280db32ce4766c447e26d"
+license = "Ms-PL"
+
+[sources.clipper2]
+repo = "https://github.com/AngusJohnson/Clipper2"
+commit = "21ebba05db8894f0c7217ad35ea518080f324946"          # MewUI submodule extensions/MewUI.Geometry/ThirdParty/Clipper2
+archive_sha256 = "897b7ed793b6a0565f7b1d34367f2301e08d541d82aa238b5f4042b701c811dc"
+content_sha256 = "440f618658eaceea20f6329f06b514ce2b410cf9613755804472cd12eb431b78"
+license = "BSL-1.0"
+
+[sources.livecharts2]
+repo = "https://github.com/beto-rodriguez/LiveCharts2"
+commit = "1cab5f348baa8dbeb5c77f7c098b133844022f3b"          # MewUI submodule extensions/MewUI.MewCharts/ThirdParty/LiveCharts2
+archive_sha256 = "c366a873ecb3148068098e2323c313db3204afc67559ba107b3edfabdf7d3075"
+content_sha256 = "daa38eddd015394570282b6da705a86d8dd3c370d2722e597d116b998e10550a"
+license = "MIT"
+
+# ------------------------------------------------------------------------------------------------- categories
+
+[categories.core-bridge]
+mandatory = true
+description = "The MEWUI_MEWVG_MEWSTAGE branch of the MewVG IGraphicsContext bridge; the backend does not compile without it."
+
+[categories.design-space]
+mandatory = true
+description = "A window frame drawn to a surface whose scale is below 1 lays out the whole design space (the Overlay HUD at 1280x720)."
+
+[categories.multi-host]
+mandatory = true
+description = "Per-thread UI statics, graphics factory and animation manager: several hosts in one process (test suites, secondary windows)."
+
+[categories.allocation]
+mandatory = false
+description = "A steady-state UI frame allocates nothing. Skipping it makes the frame allocate and the allocation gates fail, as expected."
+
+[categories.text]
+mandatory = false
+description = "Letter spacing drawn per grapheme, negative half-leading, and a font registry that keeps every face of a family (Kit mode draws every weight of Lora)."
+
+[categories.rendering]
+mandatory = false
+description = "Rectangle strokes keep antialiasing when the transform takes them off the pixel grid."
+
+[categories.mewdock]
+mandatory = false
+description = "MewDock tool groups can hide their caption bar."
+
+[categories.build]
+mandatory = true
+description = "The local-override hook in MewVG's build props, so the vendored MewVG builds net10.0 only."
+
+# ------------------------------------------------------------------------------------------------- MewUI
+
+# Repository root: license, notices and the build/ props + targets every project imports.
+[components.mewui_build]
+source = "mewui"
+dest = "MewUI"
+include = [
+  "LICENSE", "THIRD_PARTY_NOTICES.md",
+  "build/MewUI.Common.props", "build/Aprillz.MewUI.Core.targets",
+  "build/MewUIPreview.targets", "build/MewUIPreviewInit.cs",
+]
+preserve = ["build/MewUI.Local.props"]
+
+# The framework. Shared/** (platform hosts and rendering backends) is vendored whole: upstream's MewUI.csproj does
+# <Compile Remove="Shared\**" /> and the platform / backend projects link the files they need.
+[components.mewui]
+source = "mewui"
+src_root = "src/MewUI"
+dest = "MewUI/src/MewUI"
+preserve = ["MewStage.InternalsVisibleTo.cs", "packages.lock.json"]
+patches = [
+  { file = "patches/mewui/core-bridge/0001-mewvg-context-app-branch.patch", category = "core-bridge" },
+  { file = "patches/mewui/allocation/0001-replay-text-without-delegate.patch", category = "allocation" },
+  { file = "patches/mewui/allocation/0002-gradient-lut-identity-lookup.patch", category = "allocation" },
+  { file = "patches/mewui/allocation/0003-resource-cache-evict-without-closure.patch", category = "allocation" },
+  { file = "patches/mewui/allocation/0004-scene-pass-without-per-frame-allocation.patch", category = "allocation" },
+  { file = "patches/mewui/design-space/0001-surface-scale-below-one.patch", category = "design-space" },
+  { file = "patches/mewui/text/0001-letter-spacing-draws-per-grapheme.patch", category = "text" },
+  { file = "patches/mewui/text/0002-negative-half-leading.patch", category = "text" },
+  { file = "patches/mewui/rendering/0001-rect-stroke-antialias-off-axis.patch", category = "rendering" },
+  { file = "patches/mewui/text/0003-font-registry-multi-face-families.patch", category = "text" },
+  { file = "patches/mewui/allocation/0005-apply-template-without-per-call-closure.patch", category = "allocation" },
+  { file = "patches/mewui/allocation/0006-dashed-stroke-without-per-draw-allocation.patch", category = "allocation" },
+  { file = "patches/mewui/multi-host/0001-per-thread-ui-statics-and-graphics-factory.patch", category = "multi-host" },
+  { file = "patches/mewui/multi-host/0002-per-thread-animation-manager.patch", category = "multi-host" },
+]
+
+[components.analyzers]
+source = "mewui"
+src_root = "src/MewUI.Analyzers"
+dest = "MewUI/src/MewUI.Analyzers"
+preserve = ["packages.lock.json"]
+
+[components.generators]
+source = "mewui"
+src_root = "src/MewUI.Generators"
+dest = "MewUI/src/MewUI.Generators"
+preserve = ["packages.lock.json"]
+
+[components.preview]
+source = "mewui"
+src_root = "src/MewUI.Preview"
+dest = "MewUI/src/MewUI.Preview"
+preserve = ["packages.lock.json"]
+
+# Standard platform hosts + MewVG (OpenGL) backends: Kit mode runs on them; the embedded modes do not use them.
+[components.platform_win32]
+source = "mewui"
+src_root = "src/MewUI.Platform.Win32"
+dest = "MewUI/src/MewUI.Platform.Win32"
+preserve = ["packages.lock.json"]
+
+[components.platform_x11]
+source = "mewui"
+src_root = "src/MewUI.Platform.X11"
+dest = "MewUI/src/MewUI.Platform.X11"
+preserve = ["packages.lock.json"]
+
+[components.backend_mewvg_win32]
+source = "mewui"
+src_root = "src/MewUI.Backend.MewVG.Win32"
+dest = "MewUI/src/MewUI.Backend.MewVG.Win32"
+preserve = ["packages.lock.json"]
+
+[components.backend_mewvg_x11]
+source = "mewui"
+src_root = "src/MewUI.Backend.MewVG.X11"
+dest = "MewUI/src/MewUI.Backend.MewVG.X11"
+preserve = ["packages.lock.json"]
+
+[components.mewdock]
+source = "mewui"
+src_root = "extensions/MewUI.MewDock"
+dest = "MewUI/extensions/MewUI.MewDock"
+preserve = ["packages.lock.json"]
+patches = [
+  { file = "patches/mewui/mewdock/0001-tool-caption-toggle.patch", category = "mewdock" },
+]
+
+# SVG: MewStage keeps its own csproj, which compiles the COMMITTED generated registry (Generated/) instead of running
+# SvgNet's source generator at build time (no build-time Roslyn component; AOT output equals JIT output). Upstream's
+# .gitignore is excluded because it ignores that folder.
+[components.svg]
+source = "mewui"
+src_root = "extensions/MewUI.Svg"
+dest = "MewUI/extensions/MewUI.Svg"
+exclude = ["MewUI.Svg.csproj", ".gitignore", "ThirdParty/**"]
+preserve = ["MewUI.Svg.csproj", "Generated/**", "packages.lock.json"]
+
+[components.svgnet]
+source = "svgnet"
+dest = "MewUI/extensions/MewUI.Svg/ThirdParty/SvgNet"
+include = ["Source/**", "Generators/**", "license.txt"]
+
+[components.geometry]
+source = "mewui"
+src_root = "extensions/MewUI.Geometry"
+dest = "MewUI/extensions/MewUI.Geometry"
+exclude = ["ThirdParty/**"]
+preserve = ["packages.lock.json"]
+
+[components.clipper2]
+source = "clipper2"
+dest = "MewUI/extensions/MewUI.Geometry/ThirdParty/Clipper2"
+include = ["CSharp/Clipper2Lib/*.cs", "LICENSE"]
+
+# MewCharts: LiveChartsCore compiled into the extension's own assembly (upstream's design); the engine and its source
+# generator come from the pinned LiveCharts2 submodule commit. ThirdParty/Directory.Build.targets is upstream MewUI's
+# (it silences the generator's doc warnings), so only the submodule folder itself is excluded here.
+[components.mewcharts]
+source = "mewui"
+src_root = "extensions/MewUI.MewCharts"
+dest = "MewUI/extensions/MewUI.MewCharts"
+exclude = ["ThirdParty/LiveCharts2/**"]
+preserve = ["packages.lock.json"]
+
+[components.livecharts2]
+source = "livecharts2"
+dest = "MewUI/extensions/MewUI.MewCharts/ThirdParty/LiveCharts2"
+include = ["src/LiveChartsCore/**", "generators/**", "nuget.props", "LICENSE"]
+exclude = ["generators/LiveChartsGenerators/Properties/launchSettings.json"]
+preserve = ["generators/LiveChartsGenerators/packages.lock.json"]
+
+# ------------------------------------------------------------------------------------------------- MewVG
+
+[components.mewvg_build]
+source = "mewvg"
+dest = "MewVG"
+include = ["LICENSE", "build/MewVG.Common.props"]
+preserve = ["build/MewVG.Local.props"]
+patches = [
+  { file = "patches/mewvg/build/0001-common-props-local-hook.patch", category = "build" },
+]
+
+[components.mewvg]
+source = "mewvg"
+src_root = "src/MewVG.Core"
+dest = "MewVG/src/MewVG.Core"
+preserve = ["MewStage.InternalsVisibleTo.cs", "packages.lock.json"]
+patches = [
+  { file = "patches/mewvg/allocation/0001-scratch-pool-not-trimmed.patch", category = "allocation" },
+]
+
+# The OpenGL renderer: the MewVG backends Kit mode runs on need it; it is also the reference the NanoVG port mirrors.
+[components.mewvg_gl]
+source = "mewvg"
+src_root = "src/MewVG.GL"
+dest = "MewVG/src/MewVG.GL"
+preserve = ["packages.lock.json"]

@@ -1,0 +1,682 @@
+using System.Buffers.Binary;
+using System.Runtime.InteropServices;
+using Aprillz.MewUI.Native;
+using Aprillz.MewUI.Native.Constants;
+using Aprillz.MewUI.Native.Structs;
+using Aprillz.MewUI.Rendering.Win32;
+using Aprillz.MewUI.Text;
+
+namespace Aprillz.MewUI.Rendering.Gdi;
+
+/// <summary>
+/// GDI font implementation.
+/// </summary>
+internal sealed partial class GdiFont : FontBase, IGlyphOutlineFont, IWin32TextFace
+{
+    private bool _disposed;
+    private nint _outlineDc;
+    private nint _outlineOldObject;
+
+    // The weight-resolved GDI face name used to actually create the font, which can differ from the
+    // requested family. Kept internal so IFont.Family reports the requested family, not the resolved name.
+    private readonly string _gdiFace;
+
+    internal nint Handle { get; private set; }
+    private uint Dpi { get; }
+
+    /// <summary>
+    /// Cache: (baseFamilyName, weight) → resolved GDI face name (or null if no match).
+    /// Populated once per unique (family, weight) pair via EnumFontFamiliesEx.
+    /// </summary>
+    private static readonly Dictionary<(string Family, FontWeight Weight), string?> _weightFaceCache = new();
+
+    public GdiFont(string family, double size, FontWeight weight, bool italic, bool underline, bool strikethrough, uint dpi)
+        : base(family, size, weight, italic, underline, strikethrough)   // IFont.Family = the REQUESTED family
+    {
+        Dpi = dpi;
+        _gdiFace = ResolveFamily(family, weight);
+
+        // Font size in this framework is in DIPs (1/96 inch). Convert to pixels for GDI.
+        // Negative height means use character height, not cell height.
+        int height = -(int)Math.Round(size * dpi / 96.0, MidpointRounding.AwayFromZero);
+
+        Handle = CreateFontCore(height, GdiConstants.CLEARTYPE_QUALITY);
+
+        if (Handle == 0)
+        {
+            throw new InvalidOperationException($"Failed to create font: {family}");
+        }
+
+        // Query font metrics and convert from pixels to DIPs.
+        double dpiScale = dpi / 96.0;
+        var hdc = User32.GetDC(0);
+        var oldFont = Gdi32.SelectObject(hdc, Handle);
+        Gdi32.GetTextMetrics(hdc, out TEXTMETRIC tm);
+        Gdi32.SelectObject(hdc, oldFont);
+        User32.ReleaseDC(0, hdc);
+
+        InternalLeadingPx = tm.tmInternalLeading;
+        _ascentPx = tm.tmAscent;
+        _descentPx = tm.tmDescent;
+        Ascent = tm.tmAscent / dpiScale;
+        Descent = tm.tmDescent / dpiScale;
+        InternalLeading = tm.tmInternalLeading / dpiScale;
+        CapHeight = ResolveCapHeight(in tm, dpiScale);
+        XHeight = ResolveXHeight(in tm, dpiScale);
+    }
+
+    /// <summary>Cap height in device-independent units.</summary>
+    private unsafe double ResolveCapHeight(in TEXTMETRIC tm, double dpiScale)
+    {
+        // TEXTMETRIC carries no cap height. Loading a flat-sided capital through the hinting the text
+        // will be drawn with reports where the rasterizer puts the cap line, which is what a box
+        // trimmed to that line has to agree with. The ratio below stands in for faces with no outline:
+        // it is a guess, and one measured at 0.67 rather than 0.92 on families whose ascent runs tall.
+        EnsureOutlineDc();
+        if (_outlineDc != 0)
+        {
+            var matrix = MAT2.Identity;
+            GLYPHMETRICS metrics;
+            if (GetGlyphOutlineW(_outlineDc, 'H', GdiConstants.GGO_METRICS, &metrics, 0, null, &matrix)
+                    != 0xFFFFFFFF
+                && metrics.gmptGlyphOrigin.y > 0)
+            {
+                return metrics.gmptGlyphOrigin.y / dpiScale;
+            }
+        }
+
+        return (tm.tmAscent - tm.tmInternalLeading) * 0.92 / dpiScale;
+    }
+
+    private unsafe double ResolveXHeight(in TEXTMETRIC tm, double dpiScale)
+    {
+        EnsureOutlineDc();
+        if (_outlineDc != 0)
+        {
+            var matrix = MAT2.Identity;
+            GLYPHMETRICS metrics;
+            if (GetGlyphOutlineW(_outlineDc, 'x', GdiConstants.GGO_METRICS, &metrics, 0, null, &matrix)
+                    != 0xFFFFFFFF
+                && metrics.gmptGlyphOrigin.y > 0)
+            {
+                return metrics.gmptGlyphOrigin.y / dpiScale;
+            }
+        }
+
+        return (tm.tmAscent - tm.tmInternalLeading) * 0.66 / dpiScale;
+    }
+
+    /// <summary>Internal leading in pixels (for use by rasterizers operating in pixel space).</summary>
+    internal int InternalLeadingPx { get; }
+
+    private readonly int _ascentPx;
+    private readonly int _descentPx;
+    private Dictionary<char, GlyphInk>? _glyphInk;
+
+    /// <summary>
+    /// Ink of a single-line run that falls outside its advance box and the font's ascent/descent band,
+    /// in device-independent units. Zero for code units the outline query cannot answer.
+    /// </summary>
+    public TextInkOverhang GetRunInkOverhang(ReadOnlySpan<char> text)
+    {
+        if (text.IsEmpty || Handle == 0)
+        {
+            return TextInkOverhang.None;
+        }
+
+        EnsureOutlineDc();
+        if (_outlineDc == 0)
+        {
+            return TextInkOverhang.None;
+        }
+
+        // The right overhang is the furthest any glyph's ink reaches past the run's end, so a wide
+        // italic followed by a narrow glyph still counts; the left one only comes from the first glyph.
+        int advanceAfter = 0;
+        int left = 0;
+        int right = 0;
+        int above = 0;
+        int below = 0;
+        for (int index = text.Length - 1; index >= 0; index--)
+        {
+            var ink = GetGlyphInk(text[index]);
+            right = Math.Max(right, ink.Right - advanceAfter);
+            above = Math.Max(above, ink.Above);
+            below = Math.Max(below, ink.Below);
+            advanceAfter += ink.Advance;
+            if (index == 0)
+            {
+                left = ink.Left;
+            }
+        }
+
+        double scale = 96.0 / Dpi;
+        return TextInkOverhang.FromEdges(left * scale, above * scale, right * scale, below * scale);
+    }
+
+    public bool TryGetPrefixAdvances(ReadOnlySpan<char> text, double dpiScale, Span<double> destination)
+    {
+        if (destination.Length < text.Length)
+        {
+            return false;
+        }
+
+        if (text.IsEmpty)
+        {
+            return true;
+        }
+
+        // The face measures through the device context it already owns for outline queries, so the
+        // caller does not have to hand one over. Advances come from the selected HFONT, not from the
+        // device, so a screen-compatible memory DC reports what a screen DC would.
+        EnsureOutlineDc();
+        if (_outlineDc == 0)
+        {
+            return false;
+        }
+
+        GdiTextAdvances.GetUtf16PrefixAdvances(_outlineDc, this, text, dpiScale, destination);
+        return true;
+    }
+
+    /// <summary>The GDI backends keep their own rasterizers, which draw straight into their target.</summary>
+    public bool TryRasterize(ReadOnlySpan<char> text, in Win32TextRasterizeRequest request, out TextBitmap bitmap)
+    {
+        bitmap = default;
+        return false;
+    }
+
+    public bool TryRasterizeSubpixel(ReadOnlySpan<char> text, in Win32TextRasterizeRequest request,
+        out Win32TextCoverage coverage)
+    {
+        coverage = default;
+        return false;
+    }
+
+    public unsafe Size Measure(ReadOnlySpan<char> text, double maxWidthDip, TextWrapping wrapping, double dpiScale)
+    {
+        if (text.IsEmpty)
+        {
+            return default;
+        }
+
+        EnsureOutlineDc();
+        if (_outlineDc == 0)
+        {
+            return default;
+        }
+
+        double scale = dpiScale > 0 ? dpiScale : 1.0;
+        bool constrained = !double.IsNaN(maxWidthDip) && !double.IsInfinity(maxWidthDip) && maxWidthDip > 0;
+        bool hasLineBreaks = text.IndexOfAny('\r', '\n') >= 0;
+
+        if (!constrained && !hasLineBreaks)
+        {
+            SIZE extent;
+            fixed (char* textPointer = text)
+            {
+                if (Gdi32.GetTextExtentPoint32(_outlineDc, textPointer, text.Length, &extent))
+                {
+                    return new Size(extent.cx / scale, extent.cy / scale);
+                }
+            }
+        }
+
+        int maxWidthPx = LayoutRounding.RoundToPixelInt(constrained ? maxWidthDip : 1_000_000, scale);
+        if (maxWidthPx <= 0)
+        {
+            maxWidthPx = LayoutRounding.RoundToPixelInt(1_000_000, scale);
+        }
+
+        bool singleLine = !constrained && !hasLineBreaks;
+        var rect = singleLine ? new RECT(0, 0, 0, 0) : new RECT(0, 0, maxWidthPx, 0);
+        uint format = GdiConstants.DT_CALCRECT | GdiConstants.DT_NOPREFIX
+            | (singleLine ? GdiConstants.DT_SINGLELINE : GdiConstants.DT_WORDBREAK);
+
+        fixed (char* pText = text)
+        {
+            Gdi32.DrawText(_outlineDc, pText, text.Length, ref rect, format);
+        }
+
+        return new Size(rect.Width / scale, rect.Height / scale);
+    }
+
+    private unsafe GlyphInk GetGlyphInk(char ch)
+    {
+        _glyphInk ??= new Dictionary<char, GlyphInk>();
+        if (_glyphInk.TryGetValue(ch, out var cached))
+        {
+            return cached;
+        }
+
+        var ink = default(GlyphInk);
+        if (!char.IsSurrogate(ch) && !char.IsControl(ch))
+        {
+            var matrix = MAT2.Identity;
+            GLYPHMETRICS metrics;
+            if (GetGlyphOutlineW(_outlineDc, ch, GdiConstants.GGO_METRICS, &metrics, 0, null, &matrix) != 0xFFFFFFFF)
+            {
+                int originX = metrics.gmptGlyphOrigin.x;
+                int originY = metrics.gmptGlyphOrigin.y;
+                ink = new GlyphInk(
+                    Math.Max(0, -originX),
+                    Math.Max(0, originX + (int)metrics.gmBlackBoxX - metrics.gmCellIncX),
+                    Math.Max(0, originY - _ascentPx),
+                    Math.Max(0, (int)metrics.gmBlackBoxY - originY - _descentPx),
+                    metrics.gmCellIncX);
+            }
+        }
+
+        _glyphInk[ch] = ink;
+        return ink;
+    }
+
+    private readonly record struct GlyphInk(int Left, int Right, int Above, int Below, int Advance);
+
+    /// <summary>
+    /// Picks the first installed family from a comma-separated list; single names pass through. GDI text draws with that
+    /// family alone: the families after it are not consulted for missing characters, which font linking supplies.
+    /// </summary>
+    internal static string SelectFamilyCandidate(string family)
+    {
+        if (!FontFamilyList.IsList(family))
+        {
+            return family;
+        }
+
+        string[] candidates = FontFamilyList.Split(family);
+        foreach (string candidate in candidates)
+        {
+            if (Resources.FontRegistry.Resolve(candidate) != null || IsInstalled(candidate))
+            {
+                return candidate;
+            }
+        }
+        return candidates.Length > 0 ? candidates[0] : family;
+    }
+
+    private static bool IsInstalled(string family)
+    {
+        // GDI substitutes silently, so the face a DC reports back is the availability signal.
+        nint font = Gdi32.CreateFont(
+            -12, 0, 0, 0, 400, 0u, 0u, 0u,
+            GdiConstants.DEFAULT_CHARSET,
+            GdiConstants.OUT_TT_PRECIS,
+            GdiConstants.CLIP_DEFAULT_PRECIS,
+            0,
+            GdiConstants.DEFAULT_PITCH | GdiConstants.FF_DONTCARE,
+            family);
+        if (font == 0)
+        {
+            return false;
+        }
+
+        nint hdc = User32.GetDC(0);
+        nint previous = Gdi32.SelectObject(hdc, font);
+        var face = new char[64];
+        int copied = Gdi32.GetTextFace(hdc, face.Length, face);
+        Gdi32.SelectObject(hdc, previous);
+        User32.ReleaseDC(0, hdc);
+        Gdi32.DeleteObject(font);
+        if (copied <= 0)
+        {
+            return false;
+        }
+
+        int terminator = Array.IndexOf(face, '\0');
+        string reported = new string(face, 0, terminator >= 0 ? terminator : Math.Min(copied, face.Length));
+        return string.Equals(reported, family, StringComparison.OrdinalIgnoreCase);
+    }
+
+    private nint CreateFontCore(int height, uint quality)
+    {
+        return Gdi32.CreateFont(
+            height,
+            0, 0, 0,
+            (int)Weight,
+            IsItalic ? 1u : 0u,
+            IsUnderline ? 1u : 0u,
+            IsStrikethrough ? 1u : 0u,
+            GdiConstants.DEFAULT_CHARSET,
+            GdiConstants.OUT_TT_PRECIS,
+            GdiConstants.CLIP_DEFAULT_PRECIS,
+            quality,
+            GdiConstants.DEFAULT_PITCH | GdiConstants.FF_DONTCARE,
+            _gdiFace
+        );
+    }
+
+    internal nint GetHandle(GdiFontRenderMode mode)
+    {
+        // The primary handle is already created with ClearType quality, which is also
+        // what coverage rasterization requires. Reuse it instead of owning a duplicate HFONT.
+        return Handle;
+    }
+
+    public unsafe bool TryAppendGlyphOutline(PathGeometry path, char ch, Point baselineOrigin, out double advance)
+    {
+        advance = 0;
+        if (path is null || Handle == 0) return false;
+
+        EnsureOutlineDc();
+        if (_outlineDc == 0) return false;
+
+        var matrix = MAT2.Identity;
+        GLYPHMETRICS metrics;
+        uint glyph = ch;
+
+        // CFF / PostScript-outline OpenType fonts (.otf) reject GGO_NATIVE (0xFFFFFFFF); GGO_BEZIER
+        // returns cubic splines instead, handled by ParseGlyphOutline's TT_PRIM_CSPLINE branch. Without
+        // this fallback such fonts extract no outline at all (blank text).
+        uint format = GdiConstants.GGO_NATIVE;
+        uint size = GetGlyphOutlineW(_outlineDc, glyph, format, &metrics, 0, null, &matrix);
+        if (size == 0xFFFFFFFF)
+        {
+            format = GdiConstants.GGO_BEZIER;
+            size = GetGlyphOutlineW(_outlineDc, glyph, format, &metrics, 0, null, &matrix);
+        }
+
+        advance = metrics.gmCellIncX * (96.0 / Dpi);
+        if (size == 0xFFFFFFFF || size == 0) return size != 0xFFFFFFFF;
+
+        var buffer = new byte[size];
+        fixed (byte* bufferPtr = buffer)
+        {
+            uint result = GetGlyphOutlineW(_outlineDc, glyph, format, &metrics, size, bufferPtr, &matrix);
+            if (result == 0xFFFFFFFF)
+            {
+                advance = metrics.gmCellIncX * (96.0 / Dpi);
+                return false;
+            }
+        }
+
+        ParseGlyphOutline(path, buffer, baselineOrigin);
+        return true;
+    }
+
+    private void EnsureOutlineDc()
+    {
+        if (_outlineDc != 0)
+        {
+            return;
+        }
+
+        _outlineDc = Gdi32.CreateCompatibleDC(0);
+        if (_outlineDc == 0)
+        {
+            return;
+        }
+
+        _outlineOldObject = Gdi32.SelectObject(_outlineDc, Handle);
+    }
+
+    private void ParseGlyphOutline(PathGeometry path, byte[] buffer, Point baselineOrigin)
+    {
+        var data = buffer.AsSpan();
+        int offset = 0;
+
+        while (offset < data.Length)
+        {
+            int contourSize = (int)BinaryPrimitives.ReadUInt32LittleEndian(data.Slice(offset, 4));
+            int contourEnd = offset + contourSize;
+            var start = ReadPointFx(data, offset + 8);
+            path.MoveTo(ToWorldX(start.X, baselineOrigin.X), ToWorldY(start.Y, baselineOrigin.Y));
+
+            int curveOffset = offset + 16;
+            while (curveOffset < contourEnd)
+            {
+                ushort type = BinaryPrimitives.ReadUInt16LittleEndian(data.Slice(curveOffset, 2));
+                ushort count = BinaryPrimitives.ReadUInt16LittleEndian(data.Slice(curveOffset + 2, 2));
+                int pointsOffset = curveOffset + 4;
+
+                switch (type)
+                {
+                    case GdiConstants.TT_PRIM_LINE:
+                        for (int i = 0; i < count; i++)
+                        {
+                            var point = ReadPointFx(data, pointsOffset + (i * 8));
+                            path.LineTo(ToWorldX(point.X, baselineOrigin.X), ToWorldY(point.Y, baselineOrigin.Y));
+                        }
+                        break;
+
+                    case GdiConstants.TT_PRIM_QSPLINE:
+                        for (int i = 0; i < count - 1; i++)
+                        {
+                            var control = ReadPointFx(data, pointsOffset + (i * 8));
+                            var end = i < count - 2
+                                ? Midpoint(control, ReadPointFx(data, pointsOffset + ((i + 1) * 8)))
+                                : ReadPointFx(data, pointsOffset + ((count - 1) * 8));
+
+                            path.QuadTo(
+                                ToWorldX(control.X, baselineOrigin.X), ToWorldY(control.Y, baselineOrigin.Y),
+                                ToWorldX(end.X, baselineOrigin.X), ToWorldY(end.Y, baselineOrigin.Y));
+                        }
+                        break;
+
+                    case GdiConstants.TT_PRIM_CSPLINE:
+                        for (int i = 0; i + 2 < count; i += 3)
+                        {
+                            var c1 = ReadPointFx(data, pointsOffset + (i * 8));
+                            var c2 = ReadPointFx(data, pointsOffset + ((i + 1) * 8));
+                            var end = ReadPointFx(data, pointsOffset + ((i + 2) * 8));
+                            path.BezierTo(
+                                ToWorldX(c1.X, baselineOrigin.X), ToWorldY(c1.Y, baselineOrigin.Y),
+                                ToWorldX(c2.X, baselineOrigin.X), ToWorldY(c2.Y, baselineOrigin.Y),
+                                ToWorldX(end.X, baselineOrigin.X), ToWorldY(end.Y, baselineOrigin.Y));
+                        }
+                        break;
+                }
+
+                curveOffset += 4 + (count * 8);
+            }
+
+            path.Close();
+            offset = contourEnd;
+        }
+    }
+
+    private double ToWorldX(double x, double baselineX) => baselineX + (x * (96.0 / Dpi));
+
+    private double ToWorldY(double y, double baselineY) => baselineY - (y * (96.0 / Dpi));
+
+    private static PointFx Midpoint(PointFx a, PointFx b) => new((a.X + b.X) * 0.5, (a.Y + b.Y) * 0.5);
+
+    private static PointFx ReadPointFx(ReadOnlySpan<byte> data, int offset)
+        => new(ReadFixed(data, offset), ReadFixed(data, offset + 4));
+
+    private static double ReadFixed(ReadOnlySpan<byte> data, int offset)
+    {
+        // FIXED layout in the GDI outline buffer is { WORD fract; SHORT value; } -
+        // fract first (matches the corrected struct definition below).
+        ushort fraction = BinaryPrimitives.ReadUInt16LittleEndian(data.Slice(offset, 2));
+        short value = BinaryPrimitives.ReadInt16LittleEndian(data.Slice(offset + 2, 2));
+        return value + (fraction / 65536.0);
+    }
+
+    ~GdiFont() => ReleaseNativeHandles();
+
+    public override void Dispose()
+    {
+        ReleaseNativeHandles();
+        GC.SuppressFinalize(this);
+    }
+
+    private void ReleaseNativeHandles()
+    {
+        if (!_disposed && Handle != 0)
+        {
+            Gdi32.DeleteObject(Handle);
+            Handle = 0;
+            if (_outlineDc != 0)
+            {
+                if (_outlineOldObject != 0)
+                {
+                    Gdi32.SelectObject(_outlineDc, _outlineOldObject);
+                    _outlineOldObject = 0;
+                }
+                Gdi32.DeleteDC(_outlineDc);
+                _outlineDc = 0;
+            }
+            _disposed = true;
+        }
+    }
+
+    /// <summary>
+    /// For non-standard weights (not 400/700), tries to find a GDI sub-family
+    /// that matches the requested weight by enumerating fonts whose face name
+    /// starts with the base family name.
+    /// </summary>
+    private static string ResolveFamily(string family, FontWeight weight)
+    {
+        // GDI natively handles Regular (400) and Bold (700) well.
+        if (weight is FontWeight.Normal or FontWeight.Bold)
+            return family;
+
+        var key = (family, weight);
+        lock (_weightFaceCache)
+        {
+            if (_weightFaceCache.TryGetValue(key, out var cached))
+                return cached ?? family;
+
+            // Enumerate all fonts that match the base family's charset.
+            string? resolved = FindSubFamilyByWeight(family, (int)weight);
+            _weightFaceCache[key] = resolved;
+            return resolved ?? family;
+        }
+    }
+
+    private static unsafe string? FindSubFamilyByWeight(string baseFamily, int targetWeight)
+    {
+        var hdc = User32.GetDC(0);
+        try
+        {
+            var logFont = new LOGFONT();
+            logFont.lfCharSet = (byte)GdiConstants.DEFAULT_CHARSET;
+            logFont.SetFaceName(""); // enumerate all families, filter by prefix
+
+            string? result = null;
+            string prefix = baseFamily + " ";
+
+            // EnumFontFamiliesEx callback: (LOGFONT*, TEXTMETRIC*, uint fontType, LPARAM)
+            delegate* unmanaged[Stdcall]<LOGFONT*, nint, uint, nint, int> callback =
+                &EnumCallback;
+
+            var state = new EnumState { Prefix = prefix, TargetWeight = targetWeight };
+            var handle = GCHandle.Alloc(state);
+            try
+            {
+                Gdi32.EnumFontFamiliesEx(hdc, ref logFont, (nint)callback, GCHandle.ToIntPtr(handle), 0);
+                result = state.Result;
+            }
+            finally
+            {
+                handle.Free();
+            }
+
+            return result;
+        }
+        finally
+        {
+            User32.ReleaseDC(0, hdc);
+        }
+    }
+
+    [UnmanagedCallersOnly(CallConvs = [typeof(System.Runtime.CompilerServices.CallConvStdcall)])]
+    private static unsafe int EnumCallback(LOGFONT* lf, nint textMetric, uint fontType, nint lParam)
+    {
+        var handle = GCHandle.FromIntPtr(lParam);
+        var state = (EnumState)handle.Target!;
+
+        // Read face name from LOGFONT
+        var faceSpan = new ReadOnlySpan<char>(&lf->lfFaceName, 32);
+        int nullIdx = faceSpan.IndexOf('\0');
+        if (nullIdx >= 0) faceSpan = faceSpan[..nullIdx];
+        var faceName = faceSpan.ToString();
+
+        // Check if it's a sub-family of our base family and weight matches
+        if (faceName.StartsWith(state.Prefix, StringComparison.OrdinalIgnoreCase)
+            && lf->lfWeight == state.TargetWeight)
+        {
+            state.Result = faceName;
+            return 0; // stop enumeration
+        }
+
+        return 1; // continue
+    }
+
+    private sealed class EnumState
+    {
+        public required string Prefix;
+        public required int TargetWeight;
+        public string? Result;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct FIXED
+    {
+        // Per MS docs the on-wire layout is { WORD fract; SHORT value; } - fract FIRST.
+        // Reversing this makes MAT2.Identity decode as ~0 in GDI's eyes and
+        // GetGlyphOutlineW returns ERROR_INVALID_DATATYPE (1003).
+        public ushort fract;
+        public short value;
+
+        public static FIXED One => new() { value = 1, fract = 0 };
+        public static FIXED Zero => default;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct MAT2
+    {
+        public FIXED eM11;
+        public FIXED eM12;
+        public FIXED eM21;
+        public FIXED eM22;
+
+        public static MAT2 Identity => new()
+        {
+            eM11 = FIXED.One,
+            eM12 = FIXED.Zero,
+            eM21 = FIXED.Zero,
+            eM22 = FIXED.One
+        };
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct GLYPHMETRICS
+    {
+        public uint gmBlackBoxX;
+        public uint gmBlackBoxY;
+        public POINT gmptGlyphOrigin;
+        public short gmCellIncX;
+        public short gmCellIncY;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    private readonly struct PointFx
+    {
+        public PointFx(double x, double y)
+        {
+            X = x;
+            Y = y;
+        }
+
+        public double X { get; }
+        public double Y { get; }
+    }
+
+    [LibraryImport("gdi32.dll", EntryPoint = "GetGlyphOutlineW")]
+    private static unsafe partial uint GetGlyphOutlineW(
+        nint hdc,
+        uint uChar,
+        uint uFormat,
+        GLYPHMETRICS* lpgm,
+        uint cbBuffer,
+        byte* lpvBuffer,
+        MAT2* lpmat2);
+}
+
+internal enum GdiFontRenderMode
+{
+    Default,
+    Coverage
+}

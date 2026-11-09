@@ -1,0 +1,22 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!--
+    Tier 1. Navigation vocabulary shared by the UI backend and the demo: the navigation commands (Back, Confirm,
+    PrevTab, ...), the gamepad claim, hover parking, focus fallback and the focus-related control interfaces. It
+    depends on MewUI alone, so a control library can implement the interfaces without pulling the GPU stack in.
+  -->
+
+  <PropertyGroup>
+    <RootNamespace>MewStage.Ui.Navigation</RootNamespace>
+    <AssemblyName>MewStage.Ui.Navigation</AssemblyName>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <InternalsVisibleTo Include="MewStage.Ui.Tests" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\..\third_party\MewUI\src\MewUI\MewUI.csproj" />
+  </ItemGroup>
+
+</Project>

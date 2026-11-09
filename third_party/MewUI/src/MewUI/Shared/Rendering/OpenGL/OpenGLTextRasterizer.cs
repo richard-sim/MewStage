@@ -1,0 +1,239 @@
+using System.Runtime.InteropServices;
+
+using Aprillz.MewUI.Native;
+using Aprillz.MewUI.Native.Constants;
+using Aprillz.MewUI.Native.Structs;
+using Aprillz.MewUI.Rendering.Gdi;
+
+namespace Aprillz.MewUI.Rendering.OpenGL;
+
+internal static class OpenGLTextRasterizer
+{
+    private static readonly byte[] EmptyPixel = new byte[4];
+
+    public unsafe static TextBitmap Rasterize(
+        nint hdcWindow,
+        GdiFont font,
+        ReadOnlySpan<char> text,
+        int widthPx,
+        int heightPx,
+        Color color,
+        TextAlignment horizontalAlignment,
+        TextAlignment verticalAlignment,
+        TextWrapping wrapping,
+        TextTrimming trimming = TextTrimming.None,
+        byte[]? buffer = null,
+        TextInkInsetPx inkInset = default)
+    {
+        widthPx = Math.Max(1, widthPx);
+        heightPx = Math.Max(1, heightPx);
+
+        nint memDc = Gdi32.CreateCompatibleDC(hdcWindow);
+        if (memDc == 0)
+        {
+            return new TextBitmap(1, 1, EmptyPixel);
+        }
+
+        try
+        {
+            var bmi = BITMAPINFO.Create32bpp(widthPx, heightPx);
+            nint bits;
+            nint dib = Gdi32.CreateDIBSection(memDc, ref bmi, GdiConstants.DIB_RGB_COLORS, out bits, 0, 0);
+            if (dib == 0 || bits == 0)
+            {
+                return new TextBitmap(1, 1, EmptyPixel);
+            }
+
+            nint oldBmp = Gdi32.SelectObject(memDc, dib);
+            nint oldFont = Gdi32.SelectObject(memDc, font.Handle);
+            try
+            {
+                // Opaque black background for coverage extraction.
+                var rect = new RECT(0, 0, widthPx, heightPx);
+                var brush = Gdi32.CreateSolidBrush(0x000000);
+                try
+                {
+                    Gdi32.FillRect(memDc, ref rect, brush);
+                }
+                finally
+                {
+                    Gdi32.DeleteObject(brush);
+                }
+
+                Gdi32.SetBkMode(memDc, GdiConstants.OPAQUE);
+                Gdi32.SetBkColor(memDc, 0x000000);
+                Gdi32.SetTextColor(memDc, 0xFFFFFF);
+
+                bool drawn = false;
+
+                // Wrap + Ellipsis: GDI's DT_END_ELLIPSIS doesn't handle vertical overflow
+                // with DT_WORDBREAK, so render line-by-line when text overflows vertically.
+                if (trimming == TextTrimming.CharacterEllipsis && wrapping != TextWrapping.NoWrap)
+                {
+                    drawn = GdiWrappedEllipsisHelper.TryDrawWrappedWithEllipsis(memDc, text, rect, widthPx, heightPx, horizontalAlignment, verticalAlignment);
+                }
+
+                if (!drawn)
+                {
+                    uint format = GdiConstants.DT_NOPREFIX;
+                    if (inkInset.HasInset)
+                    {
+                        // The bitmap was grown by the ink inset; the text lays out in the inner box and
+                        // draws past it into the margin.
+                        rect = inkInset.Inner(widthPx, heightPx);
+                        format |= GdiConstants.DT_NOCLIP;
+                    }
+                    format |= wrapping == TextWrapping.NoWrap ? GdiConstants.DT_SINGLELINE : GdiConstants.DT_WORDBREAK;
+                    if (trimming == TextTrimming.CharacterEllipsis)
+                        format |= GdiConstants.DT_END_ELLIPSIS;
+
+                    format |= horizontalAlignment switch
+                    {
+                        TextAlignment.Center => GdiConstants.DT_CENTER,
+                        TextAlignment.Right => GdiConstants.DT_RIGHT,
+                        _ => GdiConstants.DT_LEFT
+                    };
+
+                    // For wrapped text, GDI ignores DT_VCENTER/DT_BOTTOM, so we manually offset.
+                    int yOffsetPx = 0;
+                    int textHeightPx = 0;
+                    if (wrapping != TextWrapping.NoWrap && verticalAlignment != TextAlignment.Top)
+                    {
+                        ComputeWrappedTextOffsetsPx(memDc, text, font.Handle, widthPx, heightPx, verticalAlignment, out yOffsetPx, out textHeightPx);
+                    }
+
+                    format |= (wrapping == TextWrapping.NoWrap) ? verticalAlignment switch
+                    {
+                        TextAlignment.Center => GdiConstants.DT_VCENTER,
+                        TextAlignment.Bottom => GdiConstants.DT_BOTTOM,
+                        _ => GdiConstants.DT_TOP
+                    } : GdiConstants.DT_TOP;
+
+                    if (yOffsetPx != 0)
+                    {
+                        rect.top += yOffsetPx;
+                        rect.bottom = rect.top + (textHeightPx > 0 ? textHeightPx : rect.Height);
+                    }
+
+                    fixed (char* pText = text)
+                    {
+                        Gdi32.DrawText(memDc, pText, text.Length, ref rect, format);
+                    }
+                }
+
+                // A caller-provided buffer (at least widthPx * heightPx * 4 bytes) is filled in its
+                // leading region; the returned bitmap then aliases it.
+                int bytes = widthPx * heightPx * 4;
+                var bgra = buffer != null && buffer.Length >= bytes ? buffer : new byte[bytes];
+                Marshal.Copy(bits, bgra, 0, bytes);
+
+                // Convert black background + white text into alpha, and apply requested color.
+                ApplyCoverageToColor(bgra.AsSpan(0, bytes), color);
+                return new TextBitmap(widthPx, heightPx, bgra);
+            }
+            finally
+            {
+                if (oldFont != 0)
+                {
+                    Gdi32.SelectObject(memDc, oldFont);
+                }
+
+                if (oldBmp != 0)
+                {
+                    Gdi32.SelectObject(memDc, oldBmp);
+                }
+
+                Gdi32.DeleteObject(dib);
+            }
+        }
+        finally
+        {
+            Gdi32.DeleteDC(memDc);
+        }
+    }
+
+    private static void ApplyCoverageToColor(Span<byte> bgra, Color color)
+    {
+        byte r = color.R;
+        byte g = color.G;
+        byte b = color.B;
+        byte a0 = color.A;
+
+        for (int i = 0; i < bgra.Length; i += 4)
+        {
+            byte bb = bgra[i];
+            byte gg = bgra[i + 1];
+            byte rr = bgra[i + 2];
+
+            // ClearType can output colored subpixels; approximate coverage using luminance to avoid "bold" look.
+            byte coverage = (byte)((rr * 30 + gg * 59 + bb * 11) / 100);
+
+            if (coverage == 0 || a0 == 0)
+            {
+                bgra[i] = 0;
+                bgra[i + 1] = 0;
+                bgra[i + 2] = 0;
+                bgra[i + 3] = 0;
+                continue;
+            }
+
+            int a = coverage * a0 / 255;
+            bgra[i] = b;
+            bgra[i + 1] = g;
+            bgra[i + 2] = r;
+            bgra[i + 3] = (byte)a;
+        }
+    }
+
+    private static unsafe void ComputeWrappedTextOffsetsPx(
+        nint hdc,
+        ReadOnlySpan<char> text,
+        nint fontHandle,
+        int widthPx,
+        int heightPx,
+        TextAlignment verticalAlignment,
+        out int yOffsetPx,
+        out int textHeightPx)
+    {
+        if (verticalAlignment == TextAlignment.Top)
+        {
+            yOffsetPx = 0;
+            textHeightPx = 0;
+            return;
+        }
+
+        if (widthPx <= 0 || heightPx <= 0 || text.IsEmpty || fontHandle == 0 || hdc == 0)
+        {
+            yOffsetPx = 0;
+            textHeightPx = 0;
+            return;
+        }
+
+        var oldFont = Gdi32.SelectObject(hdc, fontHandle);
+        try
+        {
+            var rect = new RECT(0, 0, widthPx, 0);
+            fixed (char* pText = text)
+            {
+                Gdi32.DrawText(hdc, pText, text.Length, ref rect,
+                    GdiConstants.DT_CALCRECT | GdiConstants.DT_WORDBREAK | GdiConstants.DT_NOPREFIX);
+            }
+
+            textHeightPx = rect.Height;
+            int remaining = heightPx - textHeightPx;
+            if (remaining <= 0)
+            {
+                yOffsetPx = 0;
+                return;
+            }
+
+            yOffsetPx = verticalAlignment == TextAlignment.Bottom
+                ? remaining
+                : remaining / 2;
+        }
+        finally
+        {
+            Gdi32.SelectObject(hdc, oldFont);
+        }
+    }
+}

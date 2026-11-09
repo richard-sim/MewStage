@@ -1,0 +1,19 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!--
+    Tier 0. The GPU device abstraction: the interfaces (device, recorder, swapchain, mapped buffer), the resource and
+    pipeline descriptions, the enums, the capability report and the no-op profiler seam. No package references and
+    no project references: everything above it compiles against these contracts, and a backend implements them.
+  -->
+
+  <PropertyGroup>
+    <RootNamespace>MewStage.Graphics</RootNamespace>
+    <AssemblyName>MewStage.Graphics</AssemblyName>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <InternalsVisibleTo Include="MewStage.Rendering.Tests" />
+  </ItemGroup>
+
+</Project>

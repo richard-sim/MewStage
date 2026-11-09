@@ -1,0 +1,66 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!--
+    Tier 2. The MewUI backend: everything MewUI needs to run inside an application that owns the window, the GPU
+    device and the frame loop. The embedded host (window stack, pulse, layout, one render-graph pass per frame),
+    the contracts MewUI's internals require (window backend, graphics factory, render device and surface, the text
+    backend over FontStashSharp), the NanoVG renderer over the device abstraction, the input bridge and the gamepad
+    focus navigator.
+
+    This is the ONLY project that compiles against MewUI and MewVG internals (the InternalsVisibleTo grants live in
+    third_party/MewUI/src/MewUI/MewStage.InternalsVisibleTo.cs and third_party/MewVG/src/MewVG.Core/
+    MewStage.InternalsVisibleTo.cs) and the only one that compiles upstream's MewVG bridge sources, linked below
+    under the MEWUI_MEWVG_MEWSTAGE branch that the core-bridge vendor patch adds.
+  -->
+
+  <PropertyGroup>
+    <RootNamespace>MewStage.Ui.Backend</RootNamespace>
+    <AssemblyName>MewStage.Ui.Backend</AssemblyName>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <DefineConstants>$(DefineConstants);MEWUI_MEWVG_MEWSTAGE</DefineConstants>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <InternalsVisibleTo Include="MewStage.Ui.Tests" />
+    <InternalsVisibleTo Include="MewStage.Demo.Tests" />
+    <InternalsVisibleTo Include="MewStage.Viewport" />
+    <InternalsVisibleTo Include="MewStage.Host" />
+  </ItemGroup>
+
+  <!-- The linked upstream bridge sources assume ImplicitUsings (on upstream, off here). -->
+  <ItemGroup>
+    <Using Include="System" />
+    <Using Include="System.Collections.Generic" />
+    <Using Include="System.Threading" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\MewStage.Graphics\MewStage.Graphics.csproj" />
+    <ProjectReference Include="..\MewStage.Rendering\MewStage.Rendering.csproj" />
+    <ProjectReference Include="..\MewStage.Input\MewStage.Input.csproj" />
+    <ProjectReference Include="..\MewStage.Ui.Navigation\MewStage.Ui.Navigation.csproj" />
+    <ProjectReference Include="..\..\third_party\MewUI\src\MewUI\MewUI.csproj" />
+    <ProjectReference Include="..\..\third_party\MewVG\src\MewVG.Core\MewVG.Core.csproj" />
+  </ItemGroup>
+
+  <!-- The built-in default face (Roboto Regular, SIL Open Font License 1.1). A backend must measure and draw text before the
+       application registers any font, and a family nobody registered falls back to it. -->
+  <ItemGroup>
+    <EmbeddedResource Include="..\..\assets\fonts\Roboto-Regular.ttf" LogicalName="MewStage.Ui.Backend.Fonts.Roboto-Regular.ttf" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!-- Managed glyph rasterizer (no native dependency). The main package; the .Base package lacks FontSystem. -->
+    <PackageReference Include="FontStashSharp" Version="1.3.9" />
+  </ItemGroup>
+
+  <!-- Upstream's MewVG IGraphicsContext bridge: exactly the files upstream's own MewVG backends link, minus the
+       GL / OS-specific ones. -->
+  <ItemGroup>
+    <Compile Include="..\..\third_party\MewUI\src\MewUI\Shared\Rendering\MewVG\MewVGGraphicsContext.Common.cs" Link="Bridge\MewVGGraphicsContext.Common.cs" />
+    <Compile Include="..\..\third_party\MewUI\src\MewUI\Shared\Rendering\MewVG\NvgStrokeHelper.cs" Link="Bridge\NvgStrokeHelper.cs" />
+    <Compile Include="..\..\third_party\MewUI\src\MewUI\Shared\Rendering\MewVG\MewVGImage.cs" Link="Bridge\MewVGImage.cs" />
+    <Compile Include="..\..\third_party\MewUI\src\MewUI\Shared\Rendering\Common\TextInkInsetPx.cs" Link="Bridge\TextInkInsetPx.cs" />
+  </ItemGroup>
+
+</Project>

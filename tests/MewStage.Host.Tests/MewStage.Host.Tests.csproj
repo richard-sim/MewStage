@@ -1,0 +1,28 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!-- Input mapping (SDL scancodes to KeyCode to MewUI), pixel-to-DIP scale, gamepad aggregation, AssetPaths, and the architecture gates: project layering (read from the csproj ProjectReference closure) and the foreign-reference hygiene gate. -->
+
+  <PropertyGroup>
+    <RootNamespace>MewStage.Host.Tests</RootNamespace>
+    <AssemblyName>MewStage.Host.Tests</AssemblyName>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Microsoft.NET.Test.Sdk" Version="18.11.0" />
+    <PackageReference Include="xunit" Version="2.9.3" />
+    <PackageReference Include="xunit.runner.visualstudio" Version="4.0.1" />
+    <PackageReference Include="Xunit.SkippableFact" Version="1.5.23" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\..\src\MewStage.Graphics\MewStage.Graphics.csproj" />
+    <ProjectReference Include="..\..\src\MewStage.Rendering\MewStage.Rendering.csproj" />
+    <ProjectReference Include="..\..\src\MewStage.Input\MewStage.Input.csproj" />
+    <ProjectReference Include="..\..\src\MewStage.Ui.Navigation\MewStage.Ui.Navigation.csproj" />
+    <ProjectReference Include="..\..\src\MewStage.Ui.Backend\MewStage.Ui.Backend.csproj" />
+    <ProjectReference Include="..\..\src\MewStage.Host\MewStage.Host.csproj" />
+    <ProjectReference Include="..\..\third_party\MewUI\src\MewUI\MewUI.csproj" />
+  </ItemGroup>
+
+</Project>

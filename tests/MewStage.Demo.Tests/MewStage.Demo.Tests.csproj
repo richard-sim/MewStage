@@ -1,0 +1,40 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!-- Offscreen journeys on lavapipe through the real AppHost (SDL offscreen video driver, headless Vulkan device, offscreen swapchain): the start page, Overlay and Workbench modes rendered and asserted structurally; PNG dumps under MEWSTAGE_JOURNEY_OUT. -->
+
+  <PropertyGroup>
+    <RootNamespace>MewStage.Demo.Tests</RootNamespace>
+    <AssemblyName>MewStage.Demo.Tests</AssemblyName>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Microsoft.NET.Test.Sdk" Version="18.11.0" />
+    <PackageReference Include="xunit" Version="2.9.3" />
+    <PackageReference Include="xunit.runner.visualstudio" Version="4.0.1" />
+    <PackageReference Include="Xunit.SkippableFact" Version="1.5.23" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\..\src\MewStage.Graphics\MewStage.Graphics.csproj" />
+    <ProjectReference Include="..\..\src\MewStage.Rendering\MewStage.Rendering.csproj" />
+    <ProjectReference Include="..\..\src\MewStage.Input\MewStage.Input.csproj" />
+    <ProjectReference Include="..\..\src\MewStage.Ui.Navigation\MewStage.Ui.Navigation.csproj" />
+    <ProjectReference Include="..\..\src\MewStage.Ui.Backend\MewStage.Ui.Backend.csproj" />
+    <ProjectReference Include="..\..\src\MewStage.Scene\MewStage.Scene.csproj" />
+    <ProjectReference Include="..\..\src\MewStage.Viewport\MewStage.Viewport.csproj" />
+    <ProjectReference Include="..\..\src\MewStage.Host\MewStage.Host.csproj" />
+    <ProjectReference Include="..\..\src\MewStage.Demo\MewStage.Demo.csproj" />
+    <ProjectReference Include="..\..\third_party\MewUI\src\MewUI\MewUI.csproj" />
+    <ProjectReference Include="..\..\third_party\MewUI\extensions\MewUI.Svg\MewUI.Svg.csproj" />
+  </ItemGroup>
+
+  <!-- Embedded host, but with the DevTools on in Debug like the demo executable (KitTests prove the gate opens in a
+       Debug JIT build and that the in-window tools toggle on the embedded host). -->
+  <PropertyGroup>
+    <MewStageUiHost>Embedded</MewStageUiHost>
+    <MewUIDevTools Condition="'$(Configuration)' == 'Debug'">true</MewUIDevTools>
+  </PropertyGroup>
+  <Import Project="$(MSBuildThisFileDirectory)..\..\third_party\MewUI.Consumer.targets" />
+
+</Project>

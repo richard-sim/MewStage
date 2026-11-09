@@ -1,0 +1,304 @@
+using System.Numerics;
+
+namespace Aprillz.MewVG;
+
+/// <summary>Draws paths, paints and images into the current frame; each backend derives its own context.</summary>
+public abstract class MewVGContext : IDisposable
+{
+    private bool _disposed;
+    private readonly NVGContext _nvg;
+    private readonly List<int> _ownedImages = [];
+
+    internal MewVGContext(INVGRenderer renderer)
+    {
+        _nvg = new NVGContext(renderer);
+    }
+
+    #region Frame Management
+
+    public void BeginFrame(float windowWidth, float windowHeight, float devicePixelRatio = 1.0f) => _nvg.BeginFrame(windowWidth, windowHeight, devicePixelRatio);
+
+    public void EndFrame() => _nvg.EndFrame();
+
+    public void CancelFrame() => _nvg.CancelFrame();
+
+    #endregion
+
+    #region State Management
+
+    public void Save() => _nvg.Save();
+
+    public void Restore() => _nvg.Restore();
+
+    public void FillColor(MewVGColor color) => _nvg.FillColor(color);
+
+    public void FillColor(byte r, byte g, byte b, byte a = 255) => _nvg.FillColor(MewVGColor.RGBA(r, g, b, a));
+
+    public void FillColor(float r, float g, float b, float a = 1.0f) => _nvg.FillColor(MewVGColor.RGBAf(r, g, b, a));
+
+    public void StrokeColor(MewVGColor color) => _nvg.StrokeColor(color);
+
+    public void StrokeColor(byte r, byte g, byte b, byte a = 255) => _nvg.StrokeColor(MewVGColor.RGBA(r, g, b, a));
+
+    public void StrokeColor(float r, float g, float b, float a = 1.0f) => _nvg.StrokeColor(MewVGColor.RGBAf(r, g, b, a));
+
+    public void StrokeWidth(float width) => _nvg.StrokeWidth(width);
+
+    public void MiterLimit(float limit) => _nvg.MiterLimit(limit);
+
+    public void LineCap(MewVGLineCap cap) => _nvg.LineCap(cap);
+
+    public void LineJoin(MewVGLineJoin join) => _nvg.LineJoin(join);
+
+    public void ShapeAntiAlias(bool enabled) => _nvg.ShapeAntiAlias(enabled);
+
+    public void GlobalAlpha(float alpha) => _nvg.GlobalAlpha(alpha);
+
+    public void GlobalCompositeOperation(MewVGCompositeOperation op) => _nvg.GlobalCompositeOperation(op);
+
+    public void FillRule(MewVGFillRule rule) => _nvg.FillRule(rule);
+
+    #endregion
+
+    #region Transforms
+
+    public void ResetTransform() => _nvg.ResetTransform();
+
+    public void Transform(in Matrix3x2 matrix) => _nvg.Transform(matrix.M11, matrix.M12, matrix.M21, matrix.M22, matrix.M31, matrix.M32);
+
+    public Matrix3x2 GetTransformMatrix() => _nvg.GetTransformMatrix();
+
+    public void SetTransformMatrix(in Matrix3x2 matrix) => _nvg.SetTransformMatrix(in matrix);
+
+    public void Translate(float x, float y) => _nvg.Translate(x, y);
+
+    public void Rotate(float angle) => _nvg.Rotate(angle);
+
+    public void Scale(float x, float y) => _nvg.Scale(x, y);
+
+    public void SkewX(float angle) => _nvg.SkewX(angle);
+
+    public void SkewY(float angle) => _nvg.SkewY(angle);
+
+    #endregion
+
+    #region Scissoring
+
+    public void Scissor(float x, float y, float w, float h) => _nvg.Scissor(x, y, w, h);
+
+    public void ResetScissor() => _nvg.ResetScissor();
+
+    public void IntersectScissor(float x, float y, float w, float h) => _nvg.IntersectScissor(x, y, w, h);
+
+    #endregion
+
+    #region Path Clipping
+
+    public void Clip() => _nvg.Clip();
+
+    public void ResetClip() => _nvg.ResetClip();
+
+    #endregion
+
+    #region Paths
+
+    public void BeginPath() => _nvg.BeginPath();
+
+    public void ClosePath() => _nvg.ClosePath();
+
+    public void MoveTo(float x, float y) => _nvg.MoveTo(x, y);
+
+    public void LineTo(float x, float y) => _nvg.LineTo(x, y);
+
+    public void BezierTo(float c1x, float c1y, float c2x, float c2y, float x, float y) => _nvg.BezierTo(c1x, c1y, c2x, c2y, x, y);
+
+    public void QuadTo(float cx, float cy, float x, float y) => _nvg.QuadTo(cx, cy, x, y);
+
+    public void ArcTo(float x1, float y1, float x2, float y2, float radius) => _nvg.ArcTo(x1, y1, x2, y2, radius);
+
+    public void Arc(float cx, float cy, float r, float a0, float a1, MewVGWinding dir) => _nvg.Arc(cx, cy, r, a0, a1, dir);
+
+    public void PathWinding(MewVGWinding dir) => _nvg.PathWinding(dir);
+
+    public void Rect(float x, float y, float w, float h) => _nvg.Rect(x, y, w, h);
+
+    public void RoundedRect(float x, float y, float w, float h, float r) => _nvg.RoundedRect(x, y, w, h, r);
+
+    public void RoundedRectVarying(float x, float y, float w, float h, float radTopLeft, float radTopRight, float radBottomRight, float radBottomLeft)
+        => _nvg.RoundedRectVarying(x, y, w, h, radTopLeft, radTopRight, radBottomRight, radBottomLeft);
+
+    public void Ellipse(float cx, float cy, float rx, float ry) => _nvg.Ellipse(cx, cy, rx, ry);
+
+    public void Circle(float cx, float cy, float r) => _nvg.Circle(cx, cy, r);
+
+    public void Fill() => _nvg.Fill();
+
+    public void Stroke() => _nvg.Stroke();
+
+    /// <summary>Current bezier flatten tolerance (depends on devicePxRatio).</summary>
+    public float TessTol => _nvg.TessTol;
+
+    /// <summary>
+    /// Build an object-space tessellation cache from the current path commands.
+    /// Call after BeginPath + path commands with identity transform active.
+    /// </summary>
+    public FrozenFillCache BuildFillCache(MewVGFillRule fillRule) => _nvg.BuildFillCache(NVGContext.MapFillRuleToTess(fillRule));
+
+    /// <summary>
+    /// Render a fill using cached object-space tessellation + current transform.
+    /// </summary>
+    public void FillFromCache(FrozenFillCache cache, MewVGFillRule fillRule) => _nvg.FillFromCache(cache, NVGContext.MapFillRuleToTess(fillRule));
+
+    #endregion
+
+    #region Images
+
+    public abstract int CreateImageRGBA(int width, int height, MewVGImageFlags imageFlags, ReadOnlySpan<byte> data);
+
+    public int CreateOwnedImageRGBA(int width, int height, MewVGImageFlags imageFlags, ReadOnlySpan<byte> data)
+    {
+        var image = CreateImageRGBA(width, height, imageFlags, data);
+        if (image != 0)
+        {
+            _ownedImages.Add(image);
+        }
+
+        return image;
+    }
+
+    public abstract int CreateImageAlpha(int width, int height, MewVGImageFlags imageFlags, ReadOnlySpan<byte> data);
+
+    /// <summary>
+    /// Creates an image from BGRA byte-order pixel data (B, G, R, A per pixel). Backends that
+    /// support BGRA upload natively (GL with <c>GL_BGRA</c> + <c>GL_UNSIGNED_INT_8_8_8_8_REV</c>,
+    /// Metal with <c>MTLPixelFormat.BGRA8Unorm</c>) skip the byte-order conversion entirely;
+    /// the default implementation falls back to a CPU swap into a temp RGBA buffer for backends
+    /// that don't override.
+    /// </summary>
+    /// <remarks>
+    /// Provided for callers (e.g. Direct2D / GDI / WIC sources, video decoders) whose pixel
+    /// format is natively BGRA. Using this avoids the per-frame swap + extra buffer that
+    /// <see cref="CreateImageRGBA"/> implicitly forces such callers to pay.
+    /// </remarks>
+    public virtual int CreateImageBGRA(int width, int height, MewVGImageFlags imageFlags, ReadOnlySpan<byte> data)
+    {
+        if (data.IsEmpty)
+        {
+            return CreateImageRGBA(width, height, imageFlags, data);
+        }
+
+        var rgba = NvgScratchPool<byte>.Shared.Rent(data.Length);
+        try
+        {
+            var rgbaSpan = rgba.AsSpan(0, data.Length);
+            SwapBgraRgba(data, rgbaSpan);
+            return CreateImageRGBA(width, height, imageFlags, rgbaSpan);
+        }
+        finally
+        {
+            NvgScratchPool<byte>.Shared.Return(rgba);
+        }
+    }
+
+    /// <summary>
+    /// Updates an image from BGRA byte-order pixel data. See <see cref="CreateImageBGRA"/>
+    /// for the rationale; the default implementation also falls back to a CPU swap.
+    /// </summary>
+    public virtual bool UpdateImageBGRA(int image, ReadOnlySpan<byte> data)
+    {
+        if (data.IsEmpty)
+        {
+            return UpdateImage(image, data);
+        }
+
+        var rgba = NvgScratchPool<byte>.Shared.Rent(data.Length);
+        try
+        {
+            var rgbaSpan = rgba.AsSpan(0, data.Length);
+            SwapBgraRgba(data, rgbaSpan);
+            return UpdateImage(image, rgbaSpan);
+        }
+        finally
+        {
+            NvgScratchPool<byte>.Shared.Return(rgba);
+        }
+    }
+
+    private static void SwapBgraRgba(ReadOnlySpan<byte> src, Span<byte> dst)
+    {
+        // BGRA byte 0/1/2/3 → RGBA byte 2/1/0/3 (swap R and B channels, keep G and A).
+        // Backends with native BGRA support override CreateImageBGRA / UpdateImageBGRA so
+        // this scalar fallback only runs on backends that genuinely need the conversion.
+        for (int i = 0; i < src.Length; i += 4)
+        {
+            dst[i + 0] = src[i + 2];
+            dst[i + 1] = src[i + 1];
+            dst[i + 2] = src[i + 0];
+            dst[i + 3] = src[i + 3];
+        }
+    }
+
+    public abstract bool UpdateImage(int image, ReadOnlySpan<byte> data);
+
+    public abstract bool ImageSize(int image, out int width, out int height);
+
+    public abstract void DeleteImage(int image);
+
+    public abstract int CreateImageFromHandle(int textureId, int width, int height, MewVGImageFlags flags);
+
+    /// <summary>Backend-agnostic external-texture wrapper. The handle is interpreted per
+    /// the active backend: GL → cast to int (texture id), Metal → MTLTexture pointer,
+    /// etc. Default implementation returns 0 (unsupported); concrete backends override
+    /// when they support zero-copy external texture wrapping. Caller MUST include
+    /// <see cref="MewVGImageFlags.NoDelete"/> in <paramref name="flags"/>.</summary>
+    public virtual int CreateImageFromNativeHandle(nint nativeHandle, int width, int height, MewVGImageFlags flags) => 0;
+
+    public abstract int ImageHandle(int image);
+
+    #endregion
+
+    #region Paints
+
+    public MewVGPaint LinearGradient(float sx, float sy, float ex, float ey, MewVGColor icol, MewVGColor ocol)
+        => _nvg.LinearGradient(sx, sy, ex, ey, icol, ocol);
+
+    public MewVGPaint GradientLinear(in Matrix3x2 gradientTransform, float startX, float startY, float endX, float endY, int spreadMethod, int image)
+        => _nvg.GradientLinear(in gradientTransform, startX, startY, endX, endY, spreadMethod, image);
+
+    public MewVGPaint RadialGradient(float cx, float cy, float inr, float outr, MewVGColor icol, MewVGColor ocol)
+        => _nvg.RadialGradient(cx, cy, inr, outr, icol, ocol);
+
+    public MewVGPaint GradientRadial(in Matrix3x2 gradientTransform, float centerX, float centerY, float focalX, float focalY, float radiusX, float radiusY, int spreadMethod, int image)
+        => _nvg.GradientRadial(in gradientTransform, centerX, centerY, focalX, focalY, radiusX, radiusY, spreadMethod, image);
+
+    public MewVGPaint BoxGradient(float x, float y, float w, float h, float r, float f, MewVGColor icol, MewVGColor ocol)
+        => _nvg.BoxGradient(x, y, w, h, r, f, icol, ocol);
+
+    public MewVGPaint ImagePattern(float ox, float oy, float ex, float ey, float angle, int image, float alpha)
+        => _nvg.ImagePattern(ox, oy, ex, ey, angle, image, alpha);
+
+    public void FillPaint(MewVGPaint paint) => _nvg.FillPaint(paint);
+
+    public void StrokePaint(MewVGPaint paint) => _nvg.StrokePaint(paint);
+
+    #endregion
+
+    public void Dispose()
+    {
+        if (_disposed)
+        {
+            return;
+        }
+
+        _disposed = true;
+        for (var i = 0; i < _ownedImages.Count; i++)
+        {
+            DeleteImage(_ownedImages[i]);
+        }
+
+        _ownedImages.Clear();
+        DisposeBackend();
+    }
+
+    protected abstract void DisposeBackend();
+}

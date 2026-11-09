@@ -1,0 +1,36 @@
+# Pinned native tools for MewStage. The lock and the restore script are committed; the binaries are fetched by
+# `restore-tools.py` into third_party/tools/<tool>/<version>/<platform>/ (gitignored) and SHA256-verified against
+# this file. Exact versions only, no ranges. Bump deliberately: change the version and URLs, delete the restored
+# folder, run the restore, and paste the hashes it prints.
+#
+# A fresh clone needs NONE of these to build and run: the cooked shader blobs are committed (assets/shaders/cooked).
+# dxc is needed only to re-cook shaders; mesa_lavapipe only to run the Vulkan tests on Windows without a GPU.
+
+schema = 1
+
+[dxc]                         # HLSL (SM6) -> DXIL (DX12) and -> SPIR-V (Vulkan, -fvk-use-dx-layout)
+purpose = "HLSL->DXIL + HLSL->SPIR-V (scripts/cook_shaders.py --dxc)"
+version = "1.9.2602.24"       # DirectX Shader Compiler release tag (Feb 2026 patch 1)
+  [dxc.win-x64]
+  url = "https://github.com/microsoft/DirectXShaderCompiler/releases/download/v1.9.2602.24/dxc_2026_05_27.zip"
+  exe = "bin/x64/dxc.exe"
+  sha256 = "cf658aacf070d3045e31b8f1f8a696c2945f37c1095019481ef7c513368db3b4"
+  [dxc.linux-x64]
+  url = "https://github.com/microsoft/DirectXShaderCompiler/releases/download/v1.9.2602.24/linux_dxc_2026_05_26.x86_64.tar.gz"
+  exe = "bin/dxc"
+  sha256 = "928b3e9986d11dc4279050e02340950c29bcbd1e5efb9d3ded9669dade37639d"
+  # The official Linux binary links against glibc >= 2.38 (Ubuntu 24.04 or newer). On an older host use the glslang
+  # mode of scripts/cook_shaders.py (SPIR-V only) or cook on Windows.
+
+[mesa_lavapipe]               # Mesa lavapipe: a software Vulkan driver, for the Vulkan tests on a Windows machine
+purpose = "Software Vulkan driver for the MEWSTAGE_VK_SMOKE tests on Windows; enabled per process by scripts/vk_lavapipe.py"
+version = "26.2.4"            # pal1000/mesa-dist-win release 26.2.4 (MIT)
+optional = true               # not restored by a plain run: use --only mesa_lavapipe
+# Only the two x64 lavapipe files are extracted. The .7z uses the BCJ2 filter, which py7zr cannot decode, so the
+# restore needs the 7-Zip command line (7z / 7zz / 7za on PATH, or the standard Windows install folder).
+# Never reference this folder from a .csproj/.props/.targets file: the driver is a test aid, never shipped.
+  [mesa_lavapipe.win-x64]
+  url = "https://github.com/pal1000/mesa-dist-win/releases/download/26.2.4/mesa3d-26.2.4-release-msvc.7z"
+  sha256 = "351fc8c8b695878ffb3eaa044b3ead08672a48b1a045e3c3e3975811df0f6695"   # GitHub's published asset digest
+  extract = ["x64/vulkan_lvp.dll", "x64/lvp_icd.x86_64.json"]
+  files_sha256 = { "vulkan_lvp.dll" = "0b33e35d4eabfdd16b6ecb12ef7f2c87467c0baed0925ed291ce5496e58bf1db", "lvp_icd.x86_64.json" = "5b867ac6fe25dca5f23a3479a18333df2577542a0ac565ba34a9666af03fdd92" }

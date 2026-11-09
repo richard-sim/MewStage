@@ -1,0 +1,50 @@
+MewStage vendor patch mewdock/0001 (third_party/NOTICE): MewDock tool groups can hide their caption bar.
+DockingManager gains ShowToolCaptions (default true = upstream behaviour); false makes ExtendedDock's tool-header
+factory return null, so a pinned / floating tool group draws no 26 px DockCaption (FlexTabSetView already lays out a
+group without one). A panel that carries its own header can then show ONE header. The auto-hide border reveal keeps
+its caption. Behaviour unchanged with the default. Component mewdock, -p1 from MewUI/extensions/MewUI.MewDock.
+
+--- a/DockingManager.cs
++++ b/DockingManager.cs
+@@ -45,6 +45,12 @@
+     /// The header is kept while the pane moves between groups, so it should bind to the pane's properties.</summary>
+     public Func<DockPane, UIElement?>? HeaderFactory { get; set; }
+ 
++    /// <summary>Whether pinned / floating tool groups show the caption bar (title, options, pin, close). MewStage vendor
++    /// patch mewdock/0001: an app whose panes carry their own header turns it off so a pane has one header; the pane verbs
++    /// (<see cref="DockPane.Float"/>, <see cref="DockPane.Close"/>, <see cref="DockPane.Unpin"/>) stay available to
++    /// that header. Read when a group's view is built: set it before <see cref="LoadLayout"/>. Default true.</summary>
++    public bool ShowToolCaptions { get; set; } = true;
++
+     internal DockModel? Model => _model;
+ 
+     public DockPane? ActivePane => _activePane;
+@@ -118,7 +124,7 @@
+         _model = model;
+         // Content of a tab the new layout still has (by id) stays with it; the rest is let go.
+         PruneHosts();
+-        _view = ExtendedDock.CreateView(model, ResolveHost, ResolveHeader, ConfigureTabMenuForNode, ConfigureGroupMenuForNode, RequestClose);
++        _view = ExtendedDock.CreateView(model, ResolveHost, ResolveHeader, ConfigureTabMenuForNode, ConfigureGroupMenuForNode, RequestClose, () => ShowToolCaptions);
+ 
+         _view.Content = _centerContent;
+         _model.ChangesCompleted += OnModelChanged;
+--- a/Extended/ExtendedDock.cs
++++ b/Extended/ExtendedDock.cs
+@@ -17,14 +17,15 @@
+         Func<TabNode, UIElement?>? header = null,
+         Action<TabNode, ContextMenu, CommandScope>? configureTabMenu = null,
+         Action<TabSetNode, ContextMenu, CommandScope>? configureGroupMenu = null,
+-        Action<TabNode>? requestClose = null)
++        Action<TabNode>? requestClose = null,
++        Func<bool>? showToolCaptions = null)
+     {
+         // No flags anywhere: the model behavior comes from the ExtendedDockModel type, the view behavior from the
+         // Extended view types this factory wires (ExtendedLayoutView / ExtendedBorderBar / ExtendedBorderButton).
+         FlexViewContext? context = null;
+         context = new FlexViewContext(host, header,
+             (border, ctx) => new ExtendedBorderBar(border, ctx),
+-            tabSet => DockCaption.ForTool(tabSet, context!.Close),
++            tabSet => showToolCaptions?.Invoke() == false ? null : DockCaption.ForTool(tabSet, context!.Close),   // MewStage vendor patch mewdock/0001
+             configureTabMenu,
+             configureGroupMenu,
+             requestClose);

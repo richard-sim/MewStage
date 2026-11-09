@@ -1,0 +1,1886 @@
+using System.Diagnostics;
+using System.Globalization;
+using System.Runtime.InteropServices;
+using System.Text;
+
+using Aprillz.MewUI.Animation;
+using Aprillz.MewUI.Diagnostics;
+using Aprillz.MewUI.Native;
+
+using NativeX11 = Aprillz.MewUI.Native.X11;
+
+namespace Aprillz.MewUI.Platform.Linux.X11;
+
+/// <summary>
+/// Linux (X11) platform host.
+/// </summary>
+public sealed class X11PlatformHost : IPlatformHost
+{
+    public const string PlatformIdentifier = "X11";
+
+    private static readonly EnvDebugLogger Logger = new("MEWUI_X11_DEBUG", "[X11][XError]");
+
+    private readonly Dictionary<nint, X11WindowBackend> _windows = new();
+    private readonly List<X11WindowBackend> _renderBackends = new(capacity: 8);
+    private bool _running;
+    private Application? _app;
+    private uint _systemDpi = 96u;
+    private ThemeVariant _lastSystemTheme = ThemeVariant.Light;
+    private long _lastThemePollTick;
+    private int _systemThemeDirty;
+    private LinuxGSettingsMonitor? _gsettingsThemeMonitor;
+    private LinuxDispatcher? _dispatcher;
+    private long _lastDpiPollTick;
+    private nint _resourceManagerAtom;
+    private nint _xsettingsAtom;
+    private nint _xsettingsSelectionAtom;
+    private nint _xsettingsOwnerWindow;
+    private nint _netWmCmSelectionAtom;
+    private nint _rootWindow;
+    // Refresh rate in Hz, 0 before it is read and -1 when RandR reports no usable rate.
+    private int _displayRefreshHz;
+
+    // Cursors are owned per-display, not per-window: each shape is created once, shared by every window
+    // (via XDefineCursor), and freed exactly once when the display closes. Freeing themed (libXcursor)
+    // font cursors repeatedly mid-session is unsafe - it corrupts libXcursor's per-display cache and a
+    // later free hits an already-invalid XID (BadCursor on X_FreeCursor). Create-once / free-once avoids it.
+    private readonly Dictionary<CursorType, nint> _cursorCache = new();
+
+    private int _xConnectionFd = -1;
+    private int _wakeReadFd = -1;
+    private int _wakeWriteFd = -1;
+    private bool _usePollWait;
+
+    internal const string SystemFontFamily = "sans-serif";
+
+    private X11EventClock? _eventClock;
+
+    internal X11EventClock EventClock => _eventClock ??= new();
+
+    public string DefaultFontFamily => SystemFontFamily;
+
+    public IReadOnlyList<string> DefaultFontFallbacks { get; } = BuildDefaultFontFallbacks();
+
+    private static string[] BuildDefaultFontFallbacks()
+    {
+        var locale = Rendering.FontFallback.ResolvedLocale;
+        var cjk = Rendering.FontFallback.OrderCjkByLocale(locale,
+            kr: "Noto Sans CJK KR", jp: "Noto Sans CJK JP",
+            sc: "Noto Sans CJK SC", tc: "Noto Sans CJK TC");
+
+        var chain = new List<string>(16) { "Noto Sans" };
+        chain.AddRange(cjk);
+        chain.AddRange([
+            "Noto Color Emoji",
+            "Noto Sans Arabic", "Noto Sans Hebrew",
+            "Noto Sans Devanagari", "Noto Sans Thai", "Noto Sans Bengali",
+            "DejaVu Sans", "Liberation Sans",
+            "Noto Sans Symbols", "Noto Sans Symbols 2", "Noto Sans Math",
+        ]);
+        return [.. chain];
+    }
+
+    public IMessageBoxService MessageBox { get; } = new X11MessageBoxService();
+
+    public IFileDialogService FileDialog { get; } = new X11FileDialogService();
+
+    public IShellIconProvider ShellIconProvider { get; } = new LinuxShellIconProvider();
+
+    public IMountedVolumeProvider MountedVolumeProvider { get; } = new UnixMountedVolumeProvider();
+
+    public IPlacesProvider PlacesProvider { get; } = new LinuxPlacesProvider();
+
+    public IClipboardService Clipboard { get; } = new LinuxClipboardService();
+
+    public IWindowBackend CreateWindowBackend(Window window) => new X11WindowBackend(this, window);
+
+    public IDispatcher CreateDispatcher(nint windowHandle) => new LinuxDispatcher();
+
+    public uint GetSystemDpi()
+    {
+        EnsureDisplay();
+        return _systemDpi;
+    }
+
+    public ThemeVariant GetSystemThemeVariant()
+    {
+        EnsureDisplay();
+        return DetectSystemThemeVariant();
+    }
+
+    public uint GetDpiForWindow(nint hwnd) => GetSystemDpi();
+
+    public bool EnablePerMonitorDpiAwareness() => false;
+
+    public int GetSystemMetricsForDpi(int nIndex, uint dpi) => 0;
+
+    internal void RegisterWindow(nint window, X11WindowBackend backend) => _windows[window] = backend;
+
+    internal void UnregisterWindow(nint window)
+    {
+        // Shutdown is decided by Application.UnregisterWindow (ShutdownMode-aware); the host only
+        // drops its routing entry here.
+        _windows.Remove(window);
+    }
+
+    public void Run(Application app, Window? mainWindow)
+    {
+        _running = true;
+        _app = app;
+
+        EnsureDisplay();
+
+        var previousContext = SynchronizationContext.Current;
+        try
+        {
+            var dispatcher = CreateDispatcher(0);
+            _dispatcher = dispatcher as LinuxDispatcher;
+            app.Dispatcher = dispatcher;
+            SynchronizationContext.SetSynchronizationContext(dispatcher as SynchronizationContext);
+            _dispatcher?.SetWake(SignalWake);
+
+            // GNOME/Wayland doesn't provide X11 notifications for theme changes.
+            // Best-effort: listen to gsettings notifications and wake the loop.
+            if (_gsettingsThemeMonitor == null)
+            {
+                _gsettingsThemeMonitor = new LinuxGSettingsMonitor("org.gnome.desktop.interface");
+                LinuxThemeDetector.GnomeChangesMonitored = _gsettingsThemeMonitor.Start(() =>
+                {
+                    Interlocked.Exchange(ref _systemThemeDirty, 1);
+                    SignalWake();
+                });
+            }
+
+            // Start after dispatcher is ready so timers/postbacks work immediately.
+            app.OnHostLoopStarting(mainWindow);
+
+            PumpLoop(null);
+        }
+        finally
+        {
+            // Application.Shutdown exits the loop with windows still alive; their GL and input-method
+            // teardown talks to the X server, so it must run BEFORE XCloseDisplay frees the Display.
+            // Backends cache the display pointer, making a later teardown a use-after-free.
+            foreach (var backend in _windows.Values.ToArray())
+            {
+                try { backend.Dispose(); } catch { }
+            }
+            _windows.Clear();
+
+            if (Display != 0)
+            {
+                FreeCursorCache();   // release shared cursors before the display goes away
+                try
+                {
+                    NativeX11.XCloseDisplay(Display);
+                }
+                catch
+                {
+                }
+                Display = 0;
+            }
+
+            CloseWakePipe();
+            _gsettingsThemeMonitor?.Dispose();
+            _gsettingsThemeMonitor = null;
+            LinuxThemeDetector.GnomeChangesMonitored = false;
+            _dispatcher = null;
+            _app = null;
+            app.Dispatcher = null;
+            SynchronizationContext.SetSynchronizationContext(previousContext);
+        }
+    }
+
+    /// <summary>
+    /// Runs the event/render loop until the app quits and, when <paramref name="keepRunning"/> is supplied,
+    /// until it returns false. Shared by <see cref="Run"/> and <see cref="RunNestedLoop"/>.
+    /// </summary>
+    private void PumpLoop(Func<bool>? keepRunning)
+    {
+        var app = _app!;
+        var scheduler = app.RenderLoopSettings;
+        long ticksPerSecond = Stopwatch.Frequency;
+        long lastFrameTicks = Stopwatch.GetTimestamp();
+
+        while (_running && (keepRunning == null || keepRunning()))
+        {
+            try
+            {
+                DrainAndProcessEvents();
+            }
+            catch (Exception ex)
+            {
+                if (!HandleLoopException(app, ex)) break;
+            }
+
+            if (scheduler.IsContinuous)
+            {
+                try
+                {
+                    RenderContinuousWindows(scheduler);
+                }
+                catch (Exception ex)
+                {
+                    if (!HandleLoopException(app, ex)) break;
+                }
+
+                try
+                {
+                    int fps = scheduler.EffectiveFrameCap(GetDisplayRefreshHz());
+                    if (fps > 0)
+                    {
+                        long frameTicks = ticksPerSecond / fps;
+                        WaitForFrameBudget(lastFrameTicks + frameTicks, ticksPerSecond);
+
+                        // Advance the deadline instead of restarting from now, so a frame that overran is
+                        // not paid for twice. A deadline further behind than one frame is abandoned rather
+                        // than chased, which would burst frames after a stall.
+                        lastFrameTicks += frameTicks;
+                        if (Stopwatch.GetTimestamp() - lastFrameTicks > frameTicks)
+                        {
+                            lastFrameTicks = Stopwatch.GetTimestamp();
+                        }
+                    }
+                    else
+                    {
+                        WaitForWorkOrEvents(timeoutOverrideMs: 0, ignoreRenderRequests: true);
+                    }
+                }
+                catch (Exception ex)
+                {
+                    if (!HandleLoopException(app, ex)) break;
+                }
+
+                continue;
+            }
+            else
+            {
+                try
+                {
+                    RenderInvalidatedWindows();
+                }
+                catch (Exception ex)
+                {
+                    if (!HandleLoopException(app, ex)) break;
+                }
+            }
+
+            WaitForWorkOrEvents();
+        }
+    }
+
+    public void RunNestedLoop(Func<bool> keepRunning)
+    {
+        ArgumentNullException.ThrowIfNull(keepRunning);
+        if (_running)
+        {
+            PumpLoop(keepRunning);
+        }
+    }
+
+    internal void RequestWake()
+        => SignalWake();
+
+    internal static nint GetEventWindow(in XEvent ev)
+    {
+        // Xlib event types
+        const int KeyPress = 2;
+        const int KeyRelease = 3;
+        const int ButtonPress = 4;
+        const int ButtonRelease = 5;
+        const int MotionNotify = 6;
+        const int EnterNotify = 7;
+        const int LeaveNotify = 8;
+        const int FocusIn = 9;
+        const int FocusOut = 10;
+        const int DestroyNotify = 17;
+        const int Expose = 12;
+        const int ConfigureNotify = 22;
+        const int ClientMessage = 33;
+        const int PropertyNotify = 28;
+        const int SelectionNotify = 31;
+
+        return ev.type switch
+        {
+            KeyPress or KeyRelease => ev.xkey.window,
+            ButtonPress or ButtonRelease => ev.xbutton.window,
+            MotionNotify => ev.xmotion.window,
+            EnterNotify or LeaveNotify => ev.xcrossing.window,
+            FocusIn or FocusOut => ev.xfocus.window,
+            DestroyNotify => ev.xdestroywindow.window,
+            Expose => ev.xexpose.window,
+            ConfigureNotify => ev.xconfigure.window,
+            ClientMessage => ev.xclient.window,
+            PropertyNotify => ev.xproperty.window,
+
+            // The answer to a selection conversion (a drop's payload) goes to the window that asked for it.
+            SelectionNotify => ev.xselection.requestor,
+            _ => 0
+        };
+    }
+
+    // GenericEvent (XInput2 etc.) carries its target window inside the cookie payload, not
+    // in any XEvent union field. Fetch once, read XIDeviceEvent.event, deliver to that one
+    // backend, then free - backend sees an already-fetched cookie and must NOT re-fetch/free.
+    private void DispatchGenericEvent(ref XEvent ev)
+    {
+        if (!NativeX11.XGetEventData(Display, ref ev.xcookie))
+            return;
+
+        try
+        {
+            if (ev.xcookie.data == 0) return;
+            var xiHeader = Marshal.PtrToStructure<XIDeviceEvent>(ev.xcookie.data);
+            if (xiHeader.@event != 0 && _windows.TryGetValue(xiHeader.@event, out var backend))
+            {
+                backend.ProcessEvent(ref ev);
+            }
+        }
+        finally
+        {
+            NativeX11.XFreeEventData(Display, ref ev.xcookie);
+        }
+    }
+
+    private void DrainAndProcessEvents()
+    {
+        while (_running && NativeX11.XPending(Display) != 0)
+        {
+            NativeX11.XNextEvent(Display, out var ev);
+            if (ev.type == 28) // PropertyNotify
+                HandlePropertyNotify(ev.xproperty);
+
+            if (ev.type == X11EventType.GenericEvent)
+            {
+                DispatchGenericEvent(ref ev);
+                continue;
+            }
+
+            var window = GetEventWindow(ev);
+            if (window != 0 && _windows.TryGetValue(window, out var backend))
+            {
+                var topModal = GetTopModalBackend();
+                if (topModal != null && (IsMouseEvent(ev.type) || IsFocusIn(ev.type)) &&
+                    !backend.Window.IsInModalScope(topModal.Window))
+                {
+                    topModal.Activate();
+                    continue;
+                }
+                backend.ProcessEvent(ref ev);
+            }
+        }
+
+        PollDpiChanges();
+        if (Interlocked.Exchange(ref _systemThemeDirty, 0) != 0)
+        {
+            LinuxThemeDetector.InvalidateGnomeThemeVariant();
+            TryUpdateSystemTheme(force: true);
+        }
+        else
+            TryUpdateSystemTheme();
+
+        _dispatcher?.ProcessWorkItems();
+    }
+
+    private bool HandleLoopException(Application app, Exception ex)
+    {
+        if (app.TryHandleDispatcherException(ex))
+            return true;
+
+        app.NotifyFatalDispatcherException(ex);
+        _running = false;
+        return false;
+    }
+
+    public void Quit(Application app)
+    {
+        var dispatcher = _dispatcher;
+        if (dispatcher != null && !dispatcher.IsOnUIThread)
+        {
+            // The loop parks in poll with a finite timeout, so marshalling signals the wake pipe and the
+            // request is observed at once instead of at the next timeout.
+            dispatcher.BeginInvoke(() => Quit(app));
+            return;
+        }
+
+        _running = false;
+    }
+
+    public Point GetCursorScreenPosition()
+    {
+        if (Display == 0) return default;
+        var root = NativeX11.XRootWindow(Display, NativeX11.XDefaultScreen(Display));
+        if (root == 0) return default;
+        if (NativeX11.XQueryPointer(Display, root,
+            out _, out _,
+            out int rootX, out int rootY,
+            out _, out _, out _))
+        {
+            return new Point(rootX, rootY);
+        }
+        return default;
+    }
+
+    public Rect GetWorkAreaForPoint(Point screenPositionPx)
+    {
+        if (Display == 0)
+            return default;
+        nint root = NativeX11.XRootWindow(Display, NativeX11.XDefaultScreen(Display));
+        if (NativeX11.XGetWindowAttributes(Display, root, out var attributes) == 0)
+            return default;
+        var rootBounds = new Rect(0, 0, attributes.width, attributes.height);
+        var monitor = X11MonitorGeometry.SelectMonitor(X11MonitorQuery.Read(Display, root), screenPositionPx, rootBounds);
+        int desktop = ReadCurrentDesktop(root);
+        var struts = ReadWorkAreaStruts(root, desktop);
+        if (struts.Count > 0)
+            return X11MonitorGeometry.ApplyStruts(monitor, rootBounds, struts);
+
+        // Older window managers may publish only the aggregate work area.
+        var workArea = ReadWindowValues(root, "_NET_WORKAREA");
+        int baseIndex = desktop <= (workArea.Length - 4) / 4 ? desktop * 4 : 0;
+        if (workArea.Length >= 4)
+        {
+            var desktopWorkArea = new Rect(workArea[baseIndex], workArea[baseIndex + 1],
+                workArea[baseIndex + 2], workArea[baseIndex + 3]);
+            return X11MonitorGeometry.IntersectWorkArea(monitor, desktopWorkArea);
+        }
+        return monitor;
+    }
+
+    private List<long[]> ReadWorkAreaStruts(nint root, int desktop)
+    {
+        var result = new List<long[]>();
+        foreach (long client in ReadWindowValues(root, "_NET_CLIENT_LIST"))
+        {
+            nint window = (nint)client;
+            if (NativeX11.XGetWindowAttributes(Display, window, out var attributes) == 0 || attributes.map_state != 2)
+                continue;
+            var windowDesktop = ReadWindowValues(window, "_NET_WM_DESKTOP");
+            if (windowDesktop.Length > 0 && (uint)windowDesktop[0] != uint.MaxValue && windowDesktop[0] != desktop)
+                continue;
+            var partial = ReadWindowValues(window, "_NET_WM_STRUT_PARTIAL");
+            if (partial.Length >= 12)
+            {
+                result.Add(partial);
+            }
+            else
+            {
+                var legacy = ReadWindowValues(window, "_NET_WM_STRUT");
+                if (legacy.Length == 4)
+                    result.Add(legacy);
+            }
+        }
+        return result;
+    }
+
+    private long[] ReadWindowValues(nint window, string name)
+    {
+        nint atom = NativeX11.XInternAtom(Display, name, true);
+        return atom == 0 ? [] : ReadCardinalArray(window, atom);
+    }
+
+    private int ReadCurrentDesktop(nint root)
+    {
+        nint atom = NativeX11.XInternAtom(Display, "_NET_CURRENT_DESKTOP", true);
+        if (atom == 0)
+        {
+            return 0;
+        }
+
+        var values = ReadCardinalArray(root, atom);
+        return values.Length > 0 && values[0] >= 0 ? (int)values[0] : 0;
+    }
+
+    // Reads a format-32 CARDINAL array property; returns [] when absent or malformed. Format-32 rides one
+    // C long per element (Xlib LP64 convention): 8 bytes each on 64-bit, 4 on 32-bit.
+    private long[] ReadCardinalArray(nint window, nint atom)
+    {
+        const nint AnyPropertyType = 0;
+        int status = NativeX11.XGetWindowProperty(
+            Display, window, atom, 0, 1024, false, AnyPropertyType,
+            out _, out int actualFormat, out nuint nitems, out _, out nint prop);
+
+        if (status != 0 || prop == 0 || actualFormat != 32 || nitems == 0)
+        {
+            if (prop != 0)
+            {
+                NativeX11.XFree(prop);
+            }
+
+            return [];
+        }
+
+        try
+        {
+            var result = new long[checked((int)nitems)];
+            unsafe
+            {
+                if (IntPtr.Size == 8)
+                {
+                    new ReadOnlySpan<long>((void*)prop, result.Length).CopyTo(result);
+                }
+                else
+                {
+                    var source = new ReadOnlySpan<int>((void*)prop, result.Length);
+                    for (int i = 0; i < result.Length; i++)
+                    {
+                        result[i] = source[i];
+                    }
+                }
+            }
+
+            return result;
+        }
+        finally
+        {
+            NativeX11.XFree(prop);
+        }
+    }
+
+    // An override-redirect, transparent, app-raised window gives a no-activate always-on-top overlay; the
+    // drag's pointer grab + the router skipping these windows cover click-through during a drag.
+    // Transparency only works while a compositing manager owns the _NET_WM_CM_Sn selection; without one the
+    // ARGB visual is not composited, so the overlay is created opaque instead.
+    public bool SupportsTransparentOverlay =>
+        Display != 0 && _netWmCmSelectionAtom != 0
+        && NativeX11.XGetSelectionOwner(Display, _netWmCmSelectionAtom) != 0;
+
+    public void DoEvents()
+    {
+        if (Display == 0)
+        {
+            return;
+        }
+
+        while (NativeX11.XPending(Display) != 0)
+        {
+            try
+            {
+                NativeX11.XNextEvent(Display, out var ev);
+                if (ev.type == 28) // PropertyNotify
+                {
+                    HandlePropertyNotify(ev.xproperty);
+                    // Fall through to also deliver PropertyNotify to the window backend
+                    // so it can track _NET_WM_STATE changes for WindowState sync.
+                }
+                if (ev.type == X11EventType.GenericEvent)
+                {
+                    DispatchGenericEvent(ref ev);
+                    continue;
+                }
+                var window = GetEventWindow(ev);
+                if (window != 0 && _windows.TryGetValue(window, out var backend))
+                {
+                    var topModal = GetTopModalBackend();
+                    if (topModal != null && (IsMouseEvent(ev.type) || IsFocusIn(ev.type)) &&
+                        !backend.Window.IsInModalScope(topModal.Window))
+                    {
+                        topModal.Activate();
+                        continue;
+                    }
+                    backend.ProcessEvent(ref ev);
+                }
+            }
+            catch (Exception ex)
+            {
+                if (!Application.IsRunning || !Application.Current.TryHandleDispatcherException(ex))
+                {
+                    if (Application.IsRunning)
+                        Application.Current.NotifyFatalDispatcherException(ex);
+                    _running = false;
+                    break;
+                }
+            }
+        }
+
+        PollDpiChanges();
+
+        _dispatcher?.ProcessWorkItems();
+
+        RenderInvalidatedWindows();
+    }
+
+    public void Dispose()
+    {
+        foreach (var backend in _windows.Values.ToArray())
+        {
+            backend.Dispose();
+        }
+
+        _windows.Clear();
+
+        if (Display != 0)
+        {
+            FreeCursorCache();   // release shared cursors before the display goes away
+            try
+            {
+                NativeX11.XCloseDisplay(Display);
+            }
+            catch
+            {
+            }
+            Display = 0;
+        }
+
+        CloseWakePipe();
+    }
+
+    /// <summary>
+    /// Returns the shared cursor for <paramref name="cursorType"/>, creating it once and caching it for the
+    /// lifetime of the display. Windows apply it via XDefineCursor and never free it (see <see cref="FreeCursorCache"/>).
+    /// </summary>
+    internal nint GetCursor(CursorType cursorType)
+    {
+        if (Display == 0)
+        {
+            return 0;
+        }
+
+        if (_cursorCache.TryGetValue(cursorType, out nint cached))
+        {
+            return cached;
+        }
+
+        nint cursor = cursorType == CursorType.None
+            ? CreateInvisibleCursor()
+            : NativeX11.XCreateFontCursor(Display, ShapeFor(cursorType));
+
+        if (cursor != 0)
+        {
+            _cursorCache[cursorType] = cursor;
+        }
+
+        return cursor;
+    }
+
+    // X11 standard cursor font shape constants (X11/cursorfont.h).
+    private static uint ShapeFor(CursorType cursorType)
+    {
+        const uint XC_left_ptr = 68;
+        const uint XC_xterm = 152;
+        const uint XC_watch = 150;
+        const uint XC_crosshair = 34;
+        const uint XC_sb_h_double_arrow = 108;
+        const uint XC_sb_v_double_arrow = 116;
+        const uint XC_fleur = 52;
+        const uint XC_X_cursor = 0;
+        const uint XC_hand2 = 60;
+        const uint XC_question_arrow = 92;
+        const uint XC_top_left_corner = 134;
+        const uint XC_top_right_corner = 136;
+        const uint XC_center_ptr = 22;
+
+        return cursorType switch
+        {
+            CursorType.Arrow => XC_left_ptr,
+            CursorType.IBeam => XC_xterm,
+            CursorType.Wait => XC_watch,
+            CursorType.Cross => XC_crosshair,
+            CursorType.UpArrow => XC_center_ptr,
+            CursorType.SizeNWSE => XC_top_left_corner,
+            CursorType.SizeNESW => XC_top_right_corner,
+            CursorType.SizeWE => XC_sb_h_double_arrow,
+            CursorType.SizeNS => XC_sb_v_double_arrow,
+            CursorType.SizeAll => XC_fleur,
+            CursorType.No => XC_X_cursor,
+            CursorType.Hand => XC_hand2,
+            CursorType.Help => XC_question_arrow,
+            _ => XC_left_ptr,
+        };
+    }
+
+    // A 1x1 fully-transparent pixmap cursor: the standard way to hide the pointer on X11.
+    private nint CreateInvisibleCursor()
+    {
+        var root = NativeX11.XRootWindow(Display, NativeX11.XDefaultScreen(Display));
+        Span<byte> emptyBits = stackalloc byte[1];
+        nint bitmap = NativeX11.XCreateBitmapFromData(Display, root, emptyBits, 1, 1);
+        if (bitmap == 0)
+        {
+            return 0;
+        }
+
+        var color = default(XColor);
+        nint cursor = NativeX11.XCreatePixmapCursor(Display, bitmap, bitmap, ref color, ref color, 0, 0);
+        NativeX11.XFreePixmap(Display, bitmap);
+        return cursor;
+    }
+
+    // Frees every shared cursor exactly once. Called just before XCloseDisplay so each XID is released by its
+    // single owner (the cache), never per-window - which is what previously double-freed/invalidated cursors.
+    private void FreeCursorCache()
+    {
+        if (Display != 0)
+        {
+            foreach (nint cursor in _cursorCache.Values)
+            {
+                if (cursor != 0)
+                {
+                    try { NativeX11.XFreeCursor(Display, cursor); }
+                    catch { }
+                }
+            }
+        }
+
+        _cursorCache.Clear();
+    }
+
+    private static bool _xErrorHandlerInstalled;
+
+    // Installs a process-wide non-fatal X error handler. Xlib's default handler prints the failed request and
+    // calls exit(); ours swallows the (mostly async, teardown-time) errors and returns so the process keeps
+    // running. Process-global, so install once.
+    private static unsafe void InstallXErrorHandler()
+    {
+        if (_xErrorHandlerInstalled)
+        {
+            return;
+        }
+
+        _xErrorHandlerInstalled = true;
+        NativeX11.XSetErrorHandler((nint)(delegate* unmanaged[Cdecl]<nint, nint, int>)&OnXError);
+    }
+
+    // Mirrors Xlib's XErrorEvent layout (natural alignment matches the C struct on both 32/64-bit).
+    [StructLayout(LayoutKind.Sequential)]
+    private struct XErrorEventNative
+    {
+        public int type;
+        public nint display;
+        public nuint resourceid;
+        public nuint serial;
+        public byte error_code;
+        public byte request_code;
+        public byte minor_code;
+    }
+
+    // Always returns 0 (continue instead of Xlib's default print-and-exit), but logs the error details.
+    // BadWindow/BadDrawable are demoted to opt-in debug logging: they arrive asynchronously in bursts
+    // during window teardown (requests already in flight against a destroyed XID) and are expected.
+    [UnmanagedCallersOnly(CallConvs = new[] { typeof(System.Runtime.CompilerServices.CallConvCdecl) })]
+    private static unsafe int OnXError(nint display, nint errorEventPtr)
+    {
+        try
+        {
+            var error = *(XErrorEventNative*)errorEventPtr;
+
+            Logger.Write($"code={error.error_code} request={error.request_code}.{error.minor_code} resource=0x{(ulong)error.resourceid:X} serial={(ulong)error.serial}");
+        }
+        catch
+        {
+            // Never throw across the native error-handler boundary.
+        }
+
+        return 0;
+    }
+
+    internal nint Display
+    {
+        get; private set;
+    }
+
+    private static bool _xInitThreadsDone;
+
+    internal void EnsureDisplay()
+    {
+        if (Display != 0)
+        {
+            return;
+        }
+
+        // Xlib locking must be enabled before the first XOpenDisplay: accessors (position, cursor, capture)
+        // can touch the shared Display from app threads while the event loop polls it.
+        if (!_xInitThreadsDone)
+        {
+            _xInitThreadsDone = true;
+            _ = NativeX11.XInitThreads();
+        }
+
+        Display = NativeX11.XOpenDisplay(0);
+        if (Display == 0)
+        {
+            throw new InvalidOperationException("XOpenDisplay failed.");
+        }
+
+        InstallXErrorHandler();   // log async X protocol errors instead of the default print-and-exit
+
+        int screen = NativeX11.XDefaultScreen(Display);
+        _rootWindow = NativeX11.XRootWindow(Display, screen);
+
+        _resourceManagerAtom = NativeX11.XInternAtom(Display, "RESOURCE_MANAGER", false);
+        _xsettingsAtom = NativeX11.XInternAtom(Display, "_XSETTINGS_SETTINGS", false);
+        _xsettingsSelectionAtom = NativeX11.XInternAtom(Display, "_XSETTINGS_S0", false);
+        var cmSelectionName = string.Create(CultureInfo.InvariantCulture, $"_NET_WM_CM_S{screen}");
+        _netWmCmSelectionAtom = NativeX11.XInternAtom(Display, cmSelectionName, false);
+        UpdateXsettingsOwner();
+
+        // Listen for root property changes (RESOURCE_MANAGER / XSETTINGS) to refresh DPI.
+        if (_rootWindow != 0)
+        {
+            NativeX11.XSelectInput(Display, _rootWindow, (nint)X11EventMask.PropertyChangeMask);
+        }
+
+        _systemDpi = TryGetXSettingsDpi(Display, _xsettingsOwnerWindow, _xsettingsAtom)
+            ?? TryGetXftDpi(Display, _rootWindow, _resourceManagerAtom)
+            ?? 96u;
+        _lastDpiPollTick = Environment.TickCount64;
+
+        _lastSystemTheme = DetectSystemThemeVariant();
+        _lastThemePollTick = Environment.TickCount64;
+
+        SetupWakePipe();
+    }
+
+    private void SetupWakePipe()
+    {
+        CloseWakePipe();
+
+        if (Display == 0)
+        {
+            return;
+        }
+
+        int xfd;
+        try
+        {
+            xfd = NativeX11.XConnectionNumber(Display);
+        }
+        catch
+        {
+            xfd = -1;
+        }
+
+        if (xfd <= 0)
+        {
+            _usePollWait = false;
+            _xConnectionFd = -1;
+            return;
+        }
+
+        unsafe
+        {
+            int* fds = stackalloc int[2];
+            if (LibC.Pipe(fds) != 0)
+            {
+                _usePollWait = false;
+                _xConnectionFd = -1;
+                return;
+            }
+
+            _wakeReadFd = fds[0];
+            _wakeWriteFd = fds[1];
+        }
+
+        _xConnectionFd = xfd;
+        _usePollWait = true;
+    }
+
+    private void CloseWakePipe()
+    {
+        var readFd = Interlocked.Exchange(ref _wakeReadFd, -1);
+        if (readFd >= 0)
+        {
+            try
+            {
+                LibC.Close(readFd);
+            }
+            catch
+            {
+            }
+        }
+
+        var writeFd = Interlocked.Exchange(ref _wakeWriteFd, -1);
+        if (writeFd >= 0)
+        {
+            try
+            {
+                LibC.Close(writeFd);
+            }
+            catch
+            {
+            }
+        }
+
+        _xConnectionFd = -1;
+        _usePollWait = false;
+    }
+
+    private void SignalWake()
+    {
+        int fd = _wakeWriteFd;
+        if (fd < 0)
+        {
+            return;
+        }
+
+        unsafe
+        {
+            byte b = 1;
+            _ = LibC.Write(fd, &b, 1);
+        }
+    }
+
+    private void DrainWakePipe()
+    {
+        int fd = _wakeReadFd;
+        if (fd < 0)
+        {
+            return;
+        }
+
+        unsafe
+        {
+            byte* buf = stackalloc byte[64];
+            _ = LibC.Read(fd, buf, 64);
+        }
+
+        _dispatcher?.ClearWakeRequest();
+    }
+
+    private bool AnyWindowNeedsRender()
+    {
+        foreach (var backend in _windows.Values)
+        {
+            if (backend.NeedsRender && backend.Display != 0 && backend.Handle != 0)
+            {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    private void RenderInvalidatedWindows()
+    {
+        if (_windows.Count == 0)
+        {
+            return;
+        }
+
+        _renderBackends.Clear();
+        foreach (var backend in _windows.Values)
+        {
+            if (backend.NeedsRender && backend.Display != 0 && backend.Handle != 0)
+            {
+                _renderBackends.Add(backend);
+            }
+        }
+
+        if (_renderBackends.Count == 0)
+        {
+            return;
+        }
+
+        for (int i = 0; i < _renderBackends.Count; i++)
+        {
+            _renderBackends[i].RenderIfNeeded();
+        }
+    }
+
+    private void RenderAllWindows()
+    {
+        if (_windows.Count == 0)
+        {
+            return;
+        }
+
+        _renderBackends.Clear();
+        foreach (var backend in _windows.Values)
+        {
+            if (backend.Display != 0 && backend.Handle != 0)
+            {
+                _renderBackends.Add(backend);
+            }
+        }
+
+        for (int i = 0; i < _renderBackends.Count; i++)
+        {
+            _renderBackends[i].RenderNow();
+        }
+    }
+
+    private void RenderContinuousWindows(RenderLoopSettings settings)
+    {
+        using var pulse = AnimationManager.Instance.BeginPulse(settings);
+
+        _renderBackends.Clear();
+        foreach (var backend in _windows.Values)
+        {
+            if (backend.Display != 0 && backend.Handle != 0 &&
+                pulse.ShouldRender(backend.Window, backend.NeedsRender))
+            {
+                _renderBackends.Add(backend);
+            }
+        }
+
+        for (int i = 0; i < _renderBackends.Count; i++)
+        {
+            _renderBackends[i].RenderNow();
+        }
+    }
+
+    /// <summary>
+    /// Blocks until the frame deadline, consuming whatever wakes the wait. Rendering itself produces X
+    /// events, so a wait that returned on a pending event and did not drain it would come back at once
+    /// and spend the rest of the budget spinning.
+    /// </summary>
+    private void WaitForFrameBudget(long deadlineTicks, long ticksPerSecond)
+    {
+        while (_running)
+        {
+            long remaining = deadlineTicks - Stopwatch.GetTimestamp();
+            if (remaining <= 0)
+            {
+                return;
+            }
+
+            int waitMs = (int)Math.Max(1, remaining * 1000 / ticksPerSecond);
+            WaitForWorkOrEvents(timeoutOverrideMs: waitMs, ignoreRenderRequests: true);
+            DrainAndProcessEvents();
+        }
+    }
+
+    /// <summary>
+    /// Returns the screen's refresh rate in Hz, or 0 when RandR is absent or reports no rate. Read once:
+    /// a mode change mid-run leaves the loop one stale cap, which is cheaper than a server round trip
+    /// per frame.
+    /// </summary>
+    private int GetDisplayRefreshHz()
+    {
+        if (_displayRefreshHz != 0)
+        {
+            return Math.Max(0, _displayRefreshHz);
+        }
+
+        _displayRefreshHz = -1;
+        if (Display == 0)
+        {
+            return 0;
+        }
+
+        try
+        {
+            if (XRandrExt.XRRQueryExtension(Display, out _, out _) != 0)
+            {
+                var root = NativeX11.XRootWindow(Display, NativeX11.XDefaultScreen(Display));
+                var config = XRandrExt.XRRGetScreenInfo(Display, root);
+                if (config != 0)
+                {
+                    short rate = XRandrExt.XRRConfigCurrentRate(config);
+                    XRandrExt.XRRFreeScreenConfigInfo(config);
+
+                    // A nested or virtual server can report 0 or 1, neither of which is a rate.
+                    if (rate > 1)
+                    {
+                        _displayRefreshHz = rate;
+                    }
+                }
+            }
+        }
+        catch (DllNotFoundException)
+        {
+            DiagLog.Write("[x11] libXrandr unavailable; the frame cap falls back to a fixed rate");
+        }
+        catch (EntryPointNotFoundException)
+        {
+            DiagLog.Write("[x11] RandR entry points unavailable; the frame cap falls back to a fixed rate");
+        }
+
+        return Math.Max(0, _displayRefreshHz);
+    }
+
+    private void WaitForWorkOrEvents(int? timeoutOverrideMs = null, bool ignoreRenderRequests = false)
+    {
+        if (Display == 0)
+        {
+            Thread.Sleep(1);
+            return;
+        }
+
+        if (NativeX11.XPending(Display) != 0)
+        {
+            return;
+        }
+
+        if (!ignoreRenderRequests && AnyWindowNeedsRender())
+        {
+            // Avoid a busy loop when a backend throttles rendering (e.g. software/VM).
+            // If the next render time is in the future, block in poll for that duration.
+            int minDelayMs = int.MaxValue;
+            foreach (var backend in _windows.Values)
+            {
+                if (!backend.NeedsRender)
+                {
+                    continue;
+                }
+
+                minDelayMs = Math.Min(minDelayMs, backend.GetRenderDelayMs());
+                if (minDelayMs == 0)
+                {
+                    break;
+                }
+            }
+
+            if (minDelayMs <= 0)
+            {
+                return;
+            }
+
+            timeoutOverrideMs = timeoutOverrideMs != null
+                ? Math.Min(timeoutOverrideMs.Value, minDelayMs)
+                : minDelayMs;
+
+            ignoreRenderRequests = true;
+        }
+
+        var dispatcher = _dispatcher;
+        if (dispatcher != null && dispatcher.HasPendingWork)
+        {
+            // Work can be posted while rendering/input handling. If we simply return here,
+            // the platform loop can become a busy loop. Pump a bounded amount of dispatcher
+            // work before deciding whether we still need to spin.
+            const int MaxPumps = 8;
+            for (int i = 0; i < MaxPumps; i++)
+            {
+                dispatcher.ProcessWorkItems();
+                if (!dispatcher.HasPendingWork)
+                {
+                    break;
+                }
+            }
+
+            if (dispatcher.HasPendingWork)
+            {
+                return;
+            }
+        }
+
+        if (!_running)
+        {
+            // Pumped work can request shutdown. Blocking in poll here would hold the loop for the whole
+            // timeout before it re-checks and exits.
+            return;
+        }
+
+        // If poll-based waiting isn't available, fall back to a modest sleep to avoid a busy loop.
+        if (!_usePollWait || _xConnectionFd < 0 || _wakeReadFd < 0)
+        {
+            Thread.Sleep(8);
+            return;
+        }
+
+        // Keep a finite timeout so DPI polling can still occur even if the DE doesn't notify (best-effort).
+        const int MaxWaitMs = 500;
+        int timeoutMs = timeoutOverrideMs ?? (dispatcher?.GetPollTimeoutMs(MaxWaitMs) ?? MaxWaitMs);
+
+        bool wakeSignaled = false;
+        unsafe
+        {
+            PollFd* fds = stackalloc PollFd[2];
+            fds[0] = new PollFd
+            {
+                fd = _xConnectionFd,
+                events = PollEvents.POLLIN
+            };
+            fds[1] = new PollFd
+            {
+                fd = _wakeReadFd,
+                events = PollEvents.POLLIN
+            };
+
+            _ = LibC.Poll(fds, 2, timeoutMs);
+            wakeSignaled = (fds[1].revents & PollEvents.POLLIN) != 0;
+        }
+
+        if (wakeSignaled)
+        {
+            DrainWakePipe();
+        }
+    }
+
+    private X11WindowBackend? GetTopModalBackend()
+    {
+        Window? topModal = null;
+        foreach (var backend in _windows.Values)
+        {
+            var candidate = backend.Window.GetTopModalChild();
+            if (candidate != null)
+            {
+                topModal = candidate;
+                break;
+            }
+        }
+
+        if (topModal == null)
+        {
+            return null;
+        }
+
+        foreach (var backend in _windows.Values)
+        {
+            if (ReferenceEquals(backend.Window, topModal))
+            {
+                return backend;
+            }
+        }
+
+        return null;
+    }
+
+    private static bool IsMouseEvent(int type)
+    {
+        return type is 4 or 5 or 6 or 7 or 8;
+    }
+
+    private static bool IsFocusIn(int type)
+    {
+        return type == 9;
+    }
+
+    private static uint? TryGetXftDpi(nint display, nint rootWindow, nint resourceManagerAtom)
+    {
+        if (display == 0 || rootWindow == 0 || resourceManagerAtom == 0)
+        {
+            return null;
+        }
+
+        try
+        {
+            // XResourceManagerString returns the RESOURCE_MANAGER value cached at XOpenDisplay,
+            // so read the root window property each time to observe DPI changes made after startup.
+            const nint ANY_PROPERTY_TYPE = 0;
+
+            int status = NativeX11.XGetWindowProperty(
+                display,
+                rootWindow,
+                resourceManagerAtom,
+                long_offset: 0,
+                long_length: 64 * 1024,
+                delete: false,
+                req_type: ANY_PROPERTY_TYPE,
+                out _,
+                out int actualFormat,
+                out nuint nitems,
+                out _,
+                out nint prop);
+
+            if (status != 0 || prop == 0 || actualFormat != 8 || nitems == 0)
+            {
+                if (prop != 0)
+                {
+                    NativeX11.XFree(prop);
+                }
+
+                return null;
+            }
+
+            try
+            {
+                NativeX11.XrmInitialize();
+
+                // XGetWindowProperty null-terminates the returned data, so prop is a valid C string.
+                nint db = NativeX11.XrmGetStringDatabase(prop);
+                if (db == 0)
+                {
+                    return null;
+                }
+
+                return ReadXftDpiFromDatabase(db);
+            }
+            finally
+            {
+                NativeX11.XFree(prop);
+            }
+        }
+        catch
+        {
+            return null;
+        }
+    }
+
+    private static uint? ReadXftDpiFromDatabase(nint db)
+    {
+        try
+        {
+            if (NativeX11.XrmGetResource(db, "Xft.dpi", "Xft.Dpi", out _, out var value) == 0)
+            {
+                return null;
+            }
+
+            if (value.addr == 0)
+            {
+                return null;
+            }
+
+            string? dpiText = Marshal.PtrToStringUTF8(value.addr);
+            if (string.IsNullOrWhiteSpace(dpiText))
+            {
+                return null;
+            }
+
+            if (!double.TryParse(dpiText.Trim(), NumberStyles.Float, CultureInfo.InvariantCulture, out var dpi))
+            {
+                return null;
+            }
+
+            if (dpi <= 0)
+            {
+                return null;
+            }
+
+            return (uint)Math.Clamp((int)Math.Round(dpi), 48, 480);
+        }
+        finally
+        {
+            NativeX11.XrmDestroyDatabase(db);
+        }
+    }
+
+    private void PollDpiChanges(bool force = false)
+    {
+        // Best-effort: X11 doesn't provide a universal per-monitor DPI signal.
+        // Poll Xft.dpi and broadcast when it changes.
+        const int PollIntervalMs = 500;
+
+        long now = Environment.TickCount64;
+        if (!force && now - _lastDpiPollTick < PollIntervalMs)
+        {
+            return;
+        }
+
+        _lastDpiPollTick = now;
+
+        uint? dpi = TryGetXSettingsDpi(Display, _xsettingsOwnerWindow, _xsettingsAtom);
+        dpi ??= TryGetXftDpi(Display, _rootWindow, _resourceManagerAtom);
+        if (dpi == null || dpi.Value == _systemDpi)
+        {
+            return;
+        }
+
+        uint old = _systemDpi;
+        _systemDpi = dpi.Value;
+
+        foreach (var backend in _windows.Values.ToArray())
+        {
+            backend.NotifyDpiChanged(old, _systemDpi);
+        }
+    }
+
+    private void TryUpdateSystemTheme(bool force = false)
+    {
+        // X11 doesn't have a single universal theme API. We do best-effort detection by reading
+        // XSettings (Gtk/ThemeName, Net/ThemeName) and GTK_THEME env override.
+        const int PollIntervalMs = 500;
+
+        var app = _app;
+        if (app == null || app.ThemeMode != ThemeVariant.System)
+        {
+            return;
+        }
+
+        long now = Environment.TickCount64;
+        if (!force && now - _lastThemePollTick < PollIntervalMs)
+        {
+            return;
+        }
+
+        _lastThemePollTick = now;
+
+        var current = DetectSystemThemeVariant();
+        if (current == _lastSystemTheme)
+        {
+            return;
+        }
+
+        _lastSystemTheme = current;
+        app.NotifySystemThemeChanged();
+    }
+
+    private void HandlePropertyNotify(in XPropertyEvent e)
+    {
+        if (e.window == _rootWindow)
+        {
+            if (_resourceManagerAtom != 0 && e.atom == _resourceManagerAtom)
+            {
+                PollDpiChanges(force: true);
+            }
+
+            // Selection owner can change when the DE restarts; refresh.
+            if (_xsettingsSelectionAtom != 0)
+            {
+                UpdateXsettingsOwner();
+                PollDpiChanges(force: true);
+                TryUpdateSystemTheme(force: true);
+            }
+            return;
+        }
+
+        if (_xsettingsOwnerWindow != 0 &&
+            e.window == _xsettingsOwnerWindow &&
+            _xsettingsAtom != 0 &&
+            e.atom == _xsettingsAtom)
+        {
+            PollDpiChanges(force: true);
+            TryUpdateSystemTheme(force: true);
+        }
+    }
+
+    private void UpdateXsettingsOwner()
+    {
+        if (Display == 0 || _xsettingsSelectionAtom == 0)
+        {
+            return;
+        }
+
+        var owner = NativeX11.XGetSelectionOwner(Display, _xsettingsSelectionAtom);
+        if (owner == _xsettingsOwnerWindow)
+        {
+            return;
+        }
+
+        _xsettingsOwnerWindow = owner;
+        if (_xsettingsOwnerWindow != 0)
+        {
+            // Subscribe to owner property changes for _XSETTINGS_SETTINGS.
+            NativeX11.XSelectInput(Display, _xsettingsOwnerWindow, (nint)X11EventMask.PropertyChangeMask);
+        }
+    }
+
+    private static uint? TryGetXSettingsDpi(nint display, nint xsettingsOwnerWindow, nint xsettingsSettingsAtom)
+    {
+        if (display == 0 || xsettingsOwnerWindow == 0 || xsettingsSettingsAtom == 0)
+        {
+            return null;
+        }
+
+        const nint AnyPropertyType = 0;
+
+        int status = NativeX11.XGetWindowProperty(
+            display,
+            xsettingsOwnerWindow,
+            xsettingsSettingsAtom,
+            long_offset: 0,
+            long_length: 64 * 1024, // long_length is in 32-bit chunks; but Xlib treats it as long count. Keep large.
+            delete: false,
+            req_type: AnyPropertyType,
+            out _,
+            out int actualFormat,
+            out nuint nitems,
+            out _,
+            out nint prop);
+
+        if (status != 0 || prop == 0 || actualFormat != 8 || nitems == 0)
+        {
+            if (prop != 0)
+            {
+                NativeX11.XFree(prop);
+            }
+
+            return null;
+        }
+
+        try
+        {
+            int len = checked((int)nitems);
+            unsafe
+            {
+                var bytes = new ReadOnlySpan<byte>((void*)prop, len);
+                return ParseXSettingsDpi(bytes);
+            }
+        }
+        finally
+        {
+            NativeX11.XFree(prop);
+        }
+    }
+
+    private ThemeVariant DetectSystemThemeVariant()
+    {
+        // 1) Environment override (GTK_THEME=Adwaita:dark etc).
+        var gtkTheme = Environment.GetEnvironmentVariable("GTK_THEME");
+        if (!string.IsNullOrWhiteSpace(gtkTheme) && ContainsDarkKeyword(gtkTheme))
+        {
+            return ThemeVariant.Dark;
+        }
+
+        // 2) XSettings: prefer-dark flag (GNOME/GTK commonly sets this even when theme name doesn't contain "dark").
+        // Key: Gtk/ApplicationPreferDarkTheme (int; 0 or 1).
+        int? preferDark = TryGetXSettingsInt(Display, _xsettingsOwnerWindow, _xsettingsAtom, "Gtk/ApplicationPreferDarkTheme");
+        if (preferDark is > 0)
+        {
+            return ThemeVariant.Dark;
+        }
+
+        // 3) XSettings: theme name (Gtk/ThemeName or Net/ThemeName) when available.
+        string? themeName = TryGetXSettingsString(Display, _xsettingsOwnerWindow, _xsettingsAtom, "Gtk/ThemeName")
+            ?? TryGetXSettingsString(Display, _xsettingsOwnerWindow, _xsettingsAtom, "Net/ThemeName");
+
+        if (!string.IsNullOrWhiteSpace(themeName) && ContainsDarkKeyword(themeName))
+        {
+            return ThemeVariant.Dark;
+        }
+
+        // 4) Fallback to config-file heuristics (GTK settings.ini / KDE kdeglobals).
+        return LinuxThemeDetector.DetectSystemThemeVariant();
+    }
+
+    private static bool ContainsDarkKeyword(string value)
+        => value.Contains("dark", StringComparison.OrdinalIgnoreCase) ||
+           value.Contains(":dark", StringComparison.OrdinalIgnoreCase) ||
+           value.EndsWith("-dark", StringComparison.OrdinalIgnoreCase);
+
+    private static string? TryGetXSettingsString(nint display, nint xsettingsOwnerWindow, nint xsettingsSettingsAtom, string key)
+    {
+        if (display == 0 || xsettingsOwnerWindow == 0 || xsettingsSettingsAtom == 0)
+        {
+            return null;
+        }
+
+        const nint AnyPropertyType = 0;
+        int status = NativeX11.XGetWindowProperty(
+            display,
+            xsettingsOwnerWindow,
+            xsettingsSettingsAtom,
+            long_offset: 0,
+            long_length: 64 * 1024,
+            delete: false,
+            req_type: AnyPropertyType,
+            out _,
+            out int actualFormat,
+            out nuint nitems,
+            out _,
+            out nint prop);
+
+        if (status != 0 || prop == 0 || actualFormat != 8 || nitems == 0)
+        {
+            if (prop != 0)
+            {
+                NativeX11.XFree(prop);
+            }
+
+            return null;
+        }
+
+        try
+        {
+            int len = checked((int)nitems);
+            unsafe
+            {
+                var bytes = new ReadOnlySpan<byte>((void*)prop, len);
+                return ParseXSettingsString(bytes, key);
+            }
+        }
+        finally
+        {
+            NativeX11.XFree(prop);
+        }
+    }
+
+    private static int? TryGetXSettingsInt(nint display, nint xsettingsOwnerWindow, nint xsettingsSettingsAtom, string key)
+    {
+        if (display == 0 || xsettingsOwnerWindow == 0 || xsettingsSettingsAtom == 0)
+        {
+            return null;
+        }
+
+        const nint AnyPropertyType = 0;
+        int status = NativeX11.XGetWindowProperty(
+            display,
+            xsettingsOwnerWindow,
+            xsettingsSettingsAtom,
+            long_offset: 0,
+            long_length: 64 * 1024,
+            delete: false,
+            req_type: AnyPropertyType,
+            out _,
+            out int actualFormat,
+            out nuint nitems,
+            out _,
+            out nint prop);
+
+        if (status != 0 || prop == 0 || actualFormat != 8 || nitems == 0)
+        {
+            if (prop != 0)
+            {
+                NativeX11.XFree(prop);
+            }
+
+            return null;
+        }
+
+        try
+        {
+            int len = checked((int)nitems);
+            unsafe
+            {
+                var bytes = new ReadOnlySpan<byte>((void*)prop, len);
+                return ParseXSettingsInt(bytes, key);
+            }
+        }
+        finally
+        {
+            NativeX11.XFree(prop);
+        }
+    }
+
+    private static string? ParseXSettingsString(ReadOnlySpan<byte> data, string key)
+    {
+        if (data.Length < 12)
+        {
+            return null;
+        }
+
+        bool littleEndian = data[0] switch
+        {
+            (byte)'l' => true,
+            (byte)'B' => false,
+            _ => BitConverter.IsLittleEndian
+        };
+
+        int offset = 4;
+        _ = ReadUInt32(data, ref offset, littleEndian); // serial
+        uint count = ReadUInt32(data, ref offset, littleEndian);
+
+        for (uint i = 0; i < count; i++)
+        {
+            if (offset + 4 > data.Length)
+            {
+                return null;
+            }
+
+            byte type = data[offset++];
+            offset++; // pad
+            ushort nameLen = ReadUInt16(data, ref offset, littleEndian);
+
+            if (offset + nameLen > data.Length)
+            {
+                return null;
+            }
+
+            string name = Encoding.ASCII.GetString(data.Slice(offset, nameLen));
+            offset += nameLen;
+            offset = Align4(offset);
+
+            _ = ReadUInt32(data, ref offset, littleEndian); // last_change_serial
+
+            if (type == 0)
+            {
+                // int
+                _ = ReadInt32(data, ref offset, littleEndian);
+                continue;
+            }
+
+            if (type == 2)
+            {
+                // color: 4 * uint16
+                offset += 8;
+                continue;
+            }
+
+            if (type != 1)
+            {
+                return null;
+            }
+
+            uint strLen = ReadUInt32(data, ref offset, littleEndian);
+            if (offset + strLen > data.Length)
+            {
+                return null;
+            }
+
+            if (string.Equals(name, key, StringComparison.Ordinal))
+            {
+                var raw = data.Slice(offset, checked((int)strLen));
+                var value = Encoding.UTF8.GetString(raw);
+                return value;
+            }
+
+            offset += checked((int)strLen);
+            offset = Align4(offset);
+        }
+
+        return null;
+    }
+
+    private static int? ParseXSettingsInt(ReadOnlySpan<byte> data, string key)
+    {
+        if (data.Length < 12)
+        {
+            return null;
+        }
+
+        bool littleEndian = data[0] switch
+        {
+            (byte)'l' => true,
+            (byte)'B' => false,
+            _ => BitConverter.IsLittleEndian
+        };
+
+        int offset = 4;
+        _ = ReadUInt32(data, ref offset, littleEndian); // serial
+        uint count = ReadUInt32(data, ref offset, littleEndian);
+
+        for (uint i = 0; i < count; i++)
+        {
+            if (offset + 4 > data.Length)
+            {
+                return null;
+            }
+
+            byte type = data[offset++];
+            offset++; // pad
+            ushort nameLen = ReadUInt16(data, ref offset, littleEndian);
+
+            if (offset + nameLen > data.Length)
+            {
+                return null;
+            }
+
+            string name = Encoding.ASCII.GetString(data.Slice(offset, nameLen));
+            offset += nameLen;
+            offset = Align4(offset);
+
+            _ = ReadUInt32(data, ref offset, littleEndian); // last_change_serial
+
+            if (type == 0)
+            {
+                int value = ReadInt32(data, ref offset, littleEndian);
+                if (string.Equals(name, key, StringComparison.Ordinal))
+                {
+                    return value;
+                }
+                continue;
+            }
+
+            if (type == 1)
+            {
+                // string
+                uint strLen = ReadUInt32(data, ref offset, littleEndian);
+                offset += checked((int)strLen);
+                offset = Align4(offset);
+                continue;
+            }
+
+            if (type == 2)
+            {
+                // color: 4 * uint16
+                offset += 8;
+                continue;
+            }
+
+            return null;
+        }
+
+        return null;
+    }
+
+    private static uint? ParseXSettingsDpi(ReadOnlySpan<byte> data)
+    {
+        if (data.Length < 12)
+        {
+            return null;
+        }
+
+        // XSETTINGS wire format: byte order ('l' or 'B'), 3 pad bytes, uint32 serial, uint32 n_settings, then entries.
+        bool littleEndian = data[0] switch
+        {
+            (byte)'l' => true,
+            (byte)'B' => false,
+            _ => BitConverter.IsLittleEndian
+        };
+
+        int offset = 4;
+        _ = ReadUInt32(data, ref offset, littleEndian); // serial
+        uint count = ReadUInt32(data, ref offset, littleEndian);
+
+        for (uint i = 0; i < count; i++)
+        {
+            if (offset + 4 > data.Length)
+            {
+                return null;
+            }
+
+            byte type = data[offset++];
+            offset++; // pad
+            ushort nameLen = ReadUInt16(data, ref offset, littleEndian);
+
+            if (offset + nameLen > data.Length)
+            {
+                return null;
+            }
+
+            string name = Encoding.ASCII.GetString(data.Slice(offset, nameLen));
+            offset += nameLen;
+            offset = Align4(offset);
+
+            _ = ReadUInt32(data, ref offset, littleEndian); // last_change_serial
+
+            // XSettings types: 0=int, 1=string, 2=color
+            if (type == 0)
+            {
+                int value = ReadInt32(data, ref offset, littleEndian);
+                if (string.Equals(name, "Xft/DPI", StringComparison.Ordinal))
+                {
+                    // Value is in 1/1024 DPI units.
+                    double dpi = value / 1024.0;
+                    if (dpi <= 0)
+                    {
+                        return null;
+                    }
+
+                    return (uint)Math.Clamp((int)Math.Round(dpi), 48, 480);
+                }
+            }
+            else if (type == 1)
+            {
+                uint strLen = ReadUInt32(data, ref offset, littleEndian);
+                offset += checked((int)strLen);
+                offset = Align4(offset);
+            }
+            else if (type == 2)
+            {
+                // 4 * uint16
+                offset += 8;
+            }
+            else
+            {
+                return null;
+            }
+        }
+
+        return null;
+    }
+
+    private static int Align4(int offset) => (offset + 3) & ~3;
+
+    private static ushort ReadUInt16(ReadOnlySpan<byte> data, ref int offset, bool littleEndian)
+    {
+        if (offset + 2 > data.Length)
+        {
+            throw new IndexOutOfRangeException();
+        }
+
+        ushort v = littleEndian
+            ? (ushort)(data[offset] | (data[offset + 1] << 8))
+            : (ushort)((data[offset] << 8) | data[offset + 1]);
+        offset += 2;
+        return v;
+    }
+
+    private static uint ReadUInt32(ReadOnlySpan<byte> data, ref int offset, bool littleEndian)
+    {
+        if (offset + 4 > data.Length)
+        {
+            throw new IndexOutOfRangeException();
+        }
+
+        uint v = littleEndian
+            ? (uint)(data[offset] | (data[offset + 1] << 8) | (data[offset + 2] << 16) | (data[offset + 3] << 24))
+            : (uint)((data[offset] << 24) | (data[offset + 1] << 16) | (data[offset + 2] << 8) | data[offset + 3]);
+        offset += 4;
+        return v;
+    }
+
+    private static int ReadInt32(ReadOnlySpan<byte> data, ref int offset, bool littleEndian)
+        => unchecked((int)ReadUInt32(data, ref offset, littleEndian));
+}

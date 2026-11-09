@@ -1,0 +1,27 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!--
+    Tier 3. A 3D viewport inside the UI: the control, its offscreen target, the compositor that adds the world passes
+    for every attached viewport and declares the result to the UI host as a sampled texture, and the readback used
+    by tests. Knows nothing about SDL.
+  -->
+
+  <PropertyGroup>
+    <RootNamespace>MewStage.Viewport</RootNamespace>
+    <AssemblyName>MewStage.Viewport</AssemblyName>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <InternalsVisibleTo Include="MewStage.Demo.Tests" />
+    <InternalsVisibleTo Include="MewStage.Ui.Tests" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\MewStage.Graphics\MewStage.Graphics.csproj" />
+    <ProjectReference Include="..\MewStage.Rendering\MewStage.Rendering.csproj" />
+    <ProjectReference Include="..\MewStage.Ui.Backend\MewStage.Ui.Backend.csproj" />
+    <ProjectReference Include="..\..\third_party\MewUI\src\MewUI\MewUI.csproj" />
+  </ItemGroup>
+
+</Project>

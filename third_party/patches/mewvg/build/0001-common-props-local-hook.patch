@@ -1,0 +1,19 @@
+MewStage vendor patch build/0001 (third_party/NOTICE): give MewVG's build/MewVG.Common.props the same local-override
+hook MewUI's build/MewUI.Common.props has (an optional build/MewVG.Local.props imported BEFORE the target frameworks
+are set), so MewStage can build net10.0 only. No change when the file is absent.
+
+--- a/build/MewVG.Common.props
++++ b/build/MewVG.Common.props
+@@ -8,7 +8,12 @@
+     <MewVGRootNamespace>Aprillz.MewVG</MewVGRootNamespace>
+     <MewVGTargetFrameworks>net8.0;net10.0</MewVGTargetFrameworks>
+     <MewVGPackageLicenseExpression>MIT</MewVGPackageLicenseExpression>
++  </PropertyGroup>
+ 
++  <!-- MewStage vendor patch build/0001 (third_party/NOTICE): the local override hook MewUI.Common.props already has. -->
++  <Import Project="MewVG.Local.props" Condition="Exists('$(MSBuildThisFileDirectory)MewVG.Local.props')" />
++
++  <PropertyGroup>
+     <TargetFrameworks>$(MewVGTargetFrameworks)</TargetFrameworks>
+     <Version>$(MewVGVersion)</Version>
+     <RootNamespace>$(MewVGRootNamespace)</RootNamespace>

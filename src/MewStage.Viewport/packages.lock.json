@@ -1,0 +1,185 @@
+{
+  "version": 1,
+  "dependencies": {
+    "net10.0": {
+      "Microsoft.NET.ILLink.Tasks": {
+        "type": "Direct",
+        "requested": "[10.0.14, )",
+        "resolved": "10.0.14",
+        "contentHash": "YlTamXppEQls6DYWt7RdUuwWDb0lyw/vXCaGeQpLCpsLmfwGuCkOz/vIGgMTV7ECsJcavkCOkxZXv9s8rdAHkQ=="
+      },
+      "Cyotek.Drawing.BitmapFont": {
+        "type": "Transitive",
+        "resolved": "2.0.4",
+        "contentHash": "iA6WehGVdMUuNbfsQQDq/Bt+mMd/OqHjiMUtKFLIQd/0pyYh4ehT7FEjTxN9/4OXNKQZsp9bAJgltP2nnswUJg=="
+      },
+      "FontStashSharp": {
+        "type": "Transitive",
+        "resolved": "1.3.9",
+        "contentHash": "wzk1Dm7zaGEEUjLWlKV70lxZCS5vMTV+rxIfjjk8ILIaHQRmnVuBcvP8n0DeuRHaLMdETMWsdJLLnNK3km/9Rg==",
+        "dependencies": {
+          "Cyotek.Drawing.BitmapFont": "2.0.4",
+          "FontStashSharp.Base": "1.1.9",
+          "FontStashSharp.Rasterizers.StbTrueTypeSharp": "1.1.9",
+          "StbImageSharp": "2.30.15"
+        }
+      },
+      "FontStashSharp.Base": {
+        "type": "Transitive",
+        "resolved": "1.1.9",
+        "contentHash": "/AjkOcPNijs8vyNgcCj3FfBJbVWmsSH744hqkhLfBt8qspDz/tEoD+U09my5u9eRBX6zX+RLQ/gdCvwy+ZBOtg=="
+      },
+      "FontStashSharp.Rasterizers.StbTrueTypeSharp": {
+        "type": "Transitive",
+        "resolved": "1.1.9",
+        "contentHash": "yi5iuTERem46uyHC5p+jRi3Jh8dKWzgNWLqcvHciGlyVHD1cWFdERgnxshZU4xWB2hRGnogxaCudCirbMpg4eQ==",
+        "dependencies": {
+          "FontStashSharp.Base": "1.1.9",
+          "StbTrueTypeSharp": "1.26.12"
+        }
+      },
+      "Microsoft.DotNet.PlatformAbstractions": {
+        "type": "Transitive",
+        "resolved": "3.1.6",
+        "contentHash": "jek4XYaQ/PGUwDKKhwR8K47Uh1189PFzMeLqO83mXrXQVIpARZCcfuDedH50YDTepBkfijCZN5U/vZi++erxtg=="
+      },
+      "Microsoft.Extensions.DependencyModel": {
+        "type": "Transitive",
+        "resolved": "8.0.0",
+        "contentHash": "NSmDw3K0ozNDgShSIpsZcbFIzBX4w28nDag+TfaQujkXGazBm+lid5onlWoCBy4VsLxqnnKjEBbGSJVWJMf43g=="
+      },
+      "SharpGen.Runtime": {
+        "type": "Transitive",
+        "resolved": "2.4.2-beta",
+        "contentHash": "niTtWAUov1F7wZGAlVeEvW+Tnqvg5yTmhI7rxmYu2Utoyu2TbC9tWWpUpMs0PQg5lu5svoYpCAztNjxCqMFP/w=="
+      },
+      "SharpGen.Runtime.COM": {
+        "type": "Transitive",
+        "resolved": "2.4.2-beta",
+        "contentHash": "9lxDFMiepqo3lJQzMSjECCIONeCc2f3Drokgj6HtrTLZcJSftNgcLbD6/iXYj2iphkwgrZb1oLsDOZxoFZkawQ==",
+        "dependencies": {
+          "SharpGen.Runtime": "2.4.2-beta"
+        }
+      },
+      "Silk.NET.Core": {
+        "type": "Transitive",
+        "resolved": "2.21.0",
+        "contentHash": "U8gATeEGvSIc1ogSdG/LKr6SLgOjkis7Oo/QzCq+aOoGjw4tHYRVpm02V+pHp/qlQhziBbdQ/Vl5d58cmFY+PA==",
+        "dependencies": {
+          "Microsoft.DotNet.PlatformAbstractions": "3.1.6",
+          "Microsoft.Extensions.DependencyModel": "8.0.0"
+        }
+      },
+      "Silk.NET.Vulkan": {
+        "type": "Transitive",
+        "resolved": "2.21.0",
+        "contentHash": "Sm9AsGdKg4sz3xUockXwS743+h3fIkfTUnkPA58A2pzTv5k7aHUYy2zoll1VYj6V6VYLSjWo7hA/XWXSYEMn2w==",
+        "dependencies": {
+          "Silk.NET.Core": "2.21.0"
+        }
+      },
+      "Silk.NET.Vulkan.Extensions.EXT": {
+        "type": "Transitive",
+        "resolved": "2.21.0",
+        "contentHash": "EFlG4wKh8nV211BPP+4m+Y+Hw4q8ttOfA1bz6F+AJCVh2DTmpRx88GFgrHXEO23+MvjLC12LZwAKNXvwWawD7Q==",
+        "dependencies": {
+          "Silk.NET.Core": "2.21.0",
+          "Silk.NET.Vulkan": "2.21.0"
+        }
+      },
+      "Silk.NET.Vulkan.Extensions.KHR": {
+        "type": "Transitive",
+        "resolved": "2.21.0",
+        "contentHash": "lYogbhkd25f7zwuHbBLlLOr5j/WQ7QUTbs7Pzyh5y3TJE8mKB/LO6smYqY7YARBrxzVVtrkFnWFiwXvhZRlUvQ==",
+        "dependencies": {
+          "Silk.NET.Core": "2.21.0",
+          "Silk.NET.Vulkan": "2.21.0"
+        }
+      },
+      "StbImageSharp": {
+        "type": "Transitive",
+        "resolved": "2.30.15",
+        "contentHash": "7QqbupVhz2kcFUPTgMw4iHR9rYDHGundzzee19Mwmd1typ2Lnv8EVJcLJxlkeBM2+4ex0NwsMtdbGSJctp1XCQ=="
+      },
+      "StbTrueTypeSharp": {
+        "type": "Transitive",
+        "resolved": "1.26.12",
+        "contentHash": "hCc6/OsfcPa5VsLECcEU2m78WOshBrKwK42nAodSm9Z5wH68f7n66SoiRLCdGCkDaqbWz2TlX4zYHIjogj1HJA=="
+      },
+      "Vortice.Direct3D12": {
+        "type": "Transitive",
+        "resolved": "3.8.2",
+        "contentHash": "O/xp6LGcTZMrrXz+Io0VixYnREwxnLidk1xt2mYT2oHoOGpzg/RwcdBss4tOHgY+J7/C5pgp23+2MYrg/J+7eQ==",
+        "dependencies": {
+          "SharpGen.Runtime": "2.4.2-beta",
+          "Vortice.DXGI": "3.8.2"
+        }
+      },
+      "Vortice.DirectX": {
+        "type": "Transitive",
+        "resolved": "3.8.3",
+        "contentHash": "nKwSavv0w5rDF7prSefqAVPDcTyqrfZxKFMVfttiXPfm62VdA/1d+b3PhCZpW4xO7jXczXDwjQdWgD1zGsvM8w==",
+        "dependencies": {
+          "SharpGen.Runtime": "2.4.2-beta",
+          "SharpGen.Runtime.COM": "2.4.2-beta",
+          "Vortice.Mathematics": "2.1.0"
+        }
+      },
+      "Vortice.DXGI": {
+        "type": "Transitive",
+        "resolved": "3.8.3",
+        "contentHash": "MbAUnTeQ6WD99ctAdrj5CQO2I7oaax0Kt2eVdWSUj0bYP9Ed0726+s7dIHe4+tqhpmINW/dcPt0mNtc72o+E0w==",
+        "dependencies": {
+          "SharpGen.Runtime": "2.4.2-beta",
+          "Vortice.DirectX": "3.8.3"
+        }
+      },
+      "Vortice.Mathematics": {
+        "type": "Transitive",
+        "resolved": "2.1.0",
+        "contentHash": "KK+SjNSuKdP+zbavekubi+vaeb1Jo4k87ZF6CMkVWjr6RjJwc8peVtmgzXXDIMy4ZC3ZISyk3llY3q65ISOkBQ=="
+      },
+      "Aprillz.MewUI.Core": {
+        "type": "Project"
+      },
+      "Aprillz.MewVG.Core": {
+        "type": "Project"
+      },
+      "mewstage.graphics": {
+        "type": "Project"
+      },
+      "mewstage.input": {
+        "type": "Project"
+      },
+      "mewstage.rendering": {
+        "type": "Project",
+        "dependencies": {
+          "MewStage.Graphics": "[1.0.0, )",
+          "Silk.NET.Vulkan": "[2.21.0, )",
+          "Silk.NET.Vulkan.Extensions.EXT": "[2.21.0, )",
+          "Silk.NET.Vulkan.Extensions.KHR": "[2.21.0, )",
+          "Vortice.DXGI": "[3.8.3, )",
+          "Vortice.Direct3D12": "[3.8.2, )"
+        }
+      },
+      "mewstage.ui.backend": {
+        "type": "Project",
+        "dependencies": {
+          "Aprillz.MewUI.Core": "[0.22.1, )",
+          "Aprillz.MewVG.Core": "[0.10.1, )",
+          "FontStashSharp": "[1.3.9, )",
+          "MewStage.Graphics": "[1.0.0, )",
+          "MewStage.Input": "[1.0.0, )",
+          "MewStage.Rendering": "[1.0.0, )",
+          "MewStage.Ui.Navigation": "[1.0.0, )"
+        }
+      },
+      "mewstage.ui.navigation": {
+        "type": "Project",
+        "dependencies": {
+          "Aprillz.MewUI.Core": "[0.22.1, )"
+        }
+      }
+    }
+  }
+}

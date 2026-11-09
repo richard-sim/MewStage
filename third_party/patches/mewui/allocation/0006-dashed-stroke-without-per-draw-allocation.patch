@@ -1,0 +1,100 @@
+MewStage vendor patch allocation/0006 (third_party/NOTICE): a dashed stroke allocates nothing per draw.
+NvgStrokeHelper (linked into the MewStage backend) built a new List<DashSegment> per dashed stroke and a new
+PathGeometry per dashed line / rect / ellipse / rounded rect; the flattened segments now go into a per-thread list,
+line / rect / ellipse paths into a per-thread scratch path, and rounded-rect paths are cached per thread by their
+geometry (bounded, cleared when full). A re-recorded frame of a dashed line + rect + rounded rect + ellipse then
+costs the same as the frame drawn with a solid pen, and a replayed frame is 0 B. Behaviour unchanged.
+
+--- a/Shared/Rendering/MewVG/NvgStrokeHelper.cs
++++ b/Shared/Rendering/MewVG/NvgStrokeHelper.cs
+@@ -146,7 +146,9 @@
+         if (style.DashArray is not { Count: > 0 } dashes)
+             return;
+ 
+-        var segments = FlattenPath(path);
++        // MewStage vendor patch allocation/0006: the flattened segments go into a reused per-thread list (no List per stroke).
++        var segments = t_segments ??= new List<DashSegment>();
++        FlattenPath(path, segments);
+         if (segments.Count == 0) return;
+ 
+         float thickness = (float)pen.Thickness;
+@@ -292,7 +294,7 @@
+     /// </summary>
+     public static void DrawDashedLine(MewVGContext vg, float x0, float y0, float x1, float y1, Pen pen, Rect strokeBounds)
+     {
+-        var path = new PathGeometry();
++        var path = ScratchPath();
+         path.MoveTo(x0, y0);
+         path.LineTo(x1, y1);
+         DrawDashedStroke(vg, path, pen, strokeBounds);
+@@ -303,7 +305,7 @@
+     /// </summary>
+     public static void DrawDashedRect(MewVGContext vg, float x, float y, float w, float h, Pen pen, Rect strokeBounds)
+     {
+-        var path = new PathGeometry();
++        var path = ScratchPath();
+         path.MoveTo(x, y);
+         path.LineTo(x + w, y);
+         path.LineTo(x + w, y + h);
+@@ -317,7 +319,16 @@
+     /// </summary>
+     public static void DrawDashedRoundedRect(MewVGContext vg, float x, float y, float w, float h, float r, Pen pen, Rect strokeBounds)
+     {
+-        var path = PathGeometry.FromRoundedRect(new Rect(x, y, w, h), r);
++        // MewStage vendor patch allocation/0006: the rounded-rect path is cached per thread by its geometry (a steady UI redraws the same
++        // rectangles every frame); the cache is bounded and starts over when full.
++        var cache = t_roundedRects ??= new Dictionary<(float, float, float, float, float), PathGeometry>();
++        var key = (x, y, w, h, r);
++        if (!cache.TryGetValue(key, out var path))
++        {
++            if (cache.Count >= MaxCachedRoundedRects) cache.Clear();
++            path = PathGeometry.FromRoundedRect(new Rect(x, y, w, h), r);
++            cache[key] = path;
++        }
+         DrawDashedStroke(vg, path, pen, strokeBounds);
+     }
+ 
+@@ -326,7 +337,7 @@
+     /// </summary>
+     public static void DrawDashedEllipse(MewVGContext vg, float cx, float cy, float rx, float ry, Pen pen, Rect strokeBounds)
+     {
+-        var path = new PathGeometry();
++        var path = ScratchPath();
+         // Approximate ellipse with 4 bezier curves (standard approach)
+         const float kappa = 0.5522847498f;
+         float ox = rx * kappa, oy = ry * kappa;
+@@ -343,9 +354,23 @@
+     /// Flattens a PathGeometry into line segments for dash computation.
+     /// Bezier curves are subdivided into line approximations.
+     /// </summary>
+-    private static List<DashSegment> FlattenPath(PathGeometry path)
++    // MewStage vendor patch allocation/0006 (third_party/NOTICE): per-thread scratch so a dashed stroke allocates nothing per draw (the
++    // editor redraws its dashed MOCK outlines and drop targets every frame: 1144 B per frame measured before).
++    [ThreadStatic] private static List<DashSegment>? t_segments;
++    [ThreadStatic] private static PathGeometry? t_path;
++    [ThreadStatic] private static Dictionary<(float, float, float, float, float), PathGeometry>? t_roundedRects;
++    private const int MaxCachedRoundedRects = 256;
++
++    private static PathGeometry ScratchPath()
+     {
+-        var result = new List<DashSegment>();
++        var p = t_path ??= new PathGeometry();
++        p.Clear();
++        return p;
++    }
++
++    private static void FlattenPath(PathGeometry path, List<DashSegment> result)
++    {
++        result.Clear();
+         float curX = 0, curY = 0;
+         float moveX = 0, moveY = 0;
+ 
+@@ -386,8 +411,6 @@
+                     break;
+             }
+         }
+-
+-        return result;
+     }
+ 
+     private static void FlattenBezier(List<DashSegment> result,

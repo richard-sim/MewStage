@@ -1,0 +1,121 @@
+MewStage vendor patch text/0001 (third_party/NOTICE): a paragraph's LetterSpacing widened the layout's columns but a
+backend run was still drawn whole, at the font's own advances, so letter-spaced text drew unspaced. A letter-spaced
+text run is now drawn one grapheme at a time at its column (paint spans per grapheme, decorations over the run).
+Unspaced text is unchanged. A grapheme's run box is at least its own measured advance: a negative kerning pair
+narrows the column, and a backend that rasterizes a run into its box plus the ink overhang it measures from the
+glyphs' own advances (MewVG Win32 / X11, GDI, Direct2D) cut the glyph at the kerned column.
+
+--- a/Text/ManagedTextRenderContext.cs
++++ b/Text/ManagedTextRenderContext.cs
+@@ -122,6 +122,15 @@
+                     continue;
+                 }
+ 
++                if (managed.Snapshot.Paragraph.LetterSpacing != 0)
++                {
++                    // MewStage vendor patch text/0001: letter spacing widens the layout's columns, but a backend run draws
++                    // its glyphs at the font's own advances, so a letter-spaced run drawn whole puts its glyphs
++                    // back together. Each grapheme is drawn at its own column instead.
++                    DrawLetterSpacedRun(managed, line, line.RunStart + index, in run, origin, bounds, in options);
++                    continue;
++                }
++
+                 var realized = GetOrCreateRun(
+                     managed, run.TextStart, run.TextLength, run.Font, run.Width, bounds.Height, options.Transient);
+                 if (realized is not null)
+@@ -461,6 +470,67 @@
+         }
+     }
+ 
++    /// <summary>
++    /// MewStage vendor patch text/0001: draws a letter-spaced text run one grapheme at a time, each at the column the layout
++    /// gave it (font advance, kerning and the spacing). Paint spans colour per grapheme; decorations span the run.
++    /// A grapheme's run box is at least its own advance: a negative kerning pair narrows the column, but kerning
++    /// moves the next grapheme, not this one's ink, and a backend that rasterizes a run into its box (plus the ink
++    /// overhang it measures from the glyphs' own advances) would otherwise cut the glyph at the kerned column.
++    /// </summary>
++    private void DrawLetterSpacedRun(
++        ManagedTextLayout managed,
++        ManagedTextLine line,
++        int runIndex,
++        in ManagedTextRun run,
++        Point origin,
++        Rect runBounds,
++        in TextDrawOptions options)
++    {
++        var spans = options.PaintSpans.Span;
++        int[] boundaries = managed.GetRunBoundaries(runIndex);
++        double spacing = managed.Snapshot.Paragraph.LetterSpacing;
++        for (int index = 0; index < boundaries.Length; index++)
++        {
++            int start = boundaries[index];
++            int end = index + 1 < boundaries.Length ? boundaries[index + 1] : run.TextEnd;
++            if (end <= start)
++            {
++                continue;
++            }
++
++            double left = managed.GetColumnX(in run, start);
++            double width = Math.Max(1, managed.GetColumnX(in run, end) - left - spacing);
++            Rect bounds = GetBaselineAlignedBounds(line, origin, left, width, run.Baseline, run.BaselineOffset, run.MeasuredHeight);
++            var realized = GetOrCreateRun(managed, start, end - start, run.Font, width, bounds.Height, options.Transient,
++                atLeastOwnAdvance: true);
++            if (realized is null)
++            {
++                continue;
++            }
++
++            try
++            {
++                Color color = GetSpanForeground(spans, start) ?? options.Foreground;
++                DrawRun(realized, bounds.Position, color, EffectiveOwner(in options));
++            }
++            finally
++            {
++                if (options.Transient)
++                {
++                    realized.Dispose();
++                }
++            }
++        }
++
++        DrawRunDecoration(
++            managed.Snapshot.GetStyle(run.TextStart),
++            origin.X + run.X,
++            origin.X + run.X + run.Width,
++            runBounds,
++            run.Baseline,
++            options.Foreground);
++    }
++
+     /// <summary>Resolves the foreground at a text index; later spans win where ranges overlap.</summary>
+     internal static Color? GetSpanForeground(ReadOnlySpan<TextPaintSpan> spans, int index)
+     {
+@@ -482,7 +552,8 @@
+         IFont font,
+         double width,
+         double height,
+-        bool transient)
++        bool transient,
++        bool atLeastOwnAdvance = false)
+     {
+         var key = new RunRealizationKey(layout, textStart, textLength, font, Math.Round(width, 6), Math.Round(height, 6));
+         if (!transient)
+@@ -495,8 +566,16 @@
+             return cached;
+         }
+ 
++        var text = layout.Snapshot.Text.AsSpan(textStart, textLength);
++        if (atLeastOwnAdvance && _context is GraphicsContextBase measure)
++        {
++            // MewStage vendor patch text/0001: measured only when the run is realized (a cache hit keys on the column). Every
++            // backend context derives from GraphicsContextBase; one that did not would keep the column box.
++            width = Math.Max(width, measure.MeasureText(text, font).Width);
++        }
++
+         var backendRun = _backend.CreateRun(
+-            layout.Snapshot.Text.AsSpan(textStart, textLength),
++            text,
+             font,
+             Math.Max(1, width),
+             Math.Max(1, height));

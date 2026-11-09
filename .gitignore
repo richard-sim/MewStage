@@ -1,0 +1,27 @@
+# Build output
+bin/
+obj/
+artifacts/
+publish/
+TestResults/
+*.binlog
+
+# IDE
+.vs/
+.idea/
+*.user
+*.suo
+*.swp
+.vscode/*
+!.vscode/launch.json
+!.vscode/tasks.json
+
+# Vendoring and tool caches (restored by third_party/tools/*.py)
+third_party/.vendor-cache/
+third_party/tools/dxc/
+third_party/tools/mesa_lavapipe/
+
+# Local scratch
+.sync/
+.tools/
+*.log

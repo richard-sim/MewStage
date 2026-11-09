@@ -1,0 +1,70 @@
+MewStage vendor patch multi-host/0001 (third_party/NOTICE): one process may run several embedded MewUI hosts, on
+different threads (test runners run test classes in parallel) or one after another on the same thread. Three statics
+assumed one UI per process: VisualTree's and LogicalTree's traversal scratch lists (two walks on two threads
+corrupted each other: ArgumentOutOfRange / NullReference inside VisualTree.Visit) and
+Application.DefaultGraphicsFactory, which every embedded host overwrote, so a host's elements (which resolve the
+factory through it outside Application.Run) measured text with ANOTHER host's factory and two threads shared that
+factory's text engine (duplicate-key exceptions in ManagedTextEngine's font caches). The scratch lists are
+[ThreadStatic]; an internal Application.ThreadGraphicsFactory (per thread) wins over the process default and the
+MewStage backend binds each host's factory to its UI thread. Behaviour for a single host unchanged.
+
+--- a/Elements/VisualTree.cs
++++ b/Elements/VisualTree.cs
+@@ -9,8 +9,10 @@
+ /// </summary>
+ public static class VisualTree
+ {
+-    // Reused scratch for iterative traversal; the visual tree is walked only on the UI thread.
+-    private static List<Element>? _stack;
++    // Reused scratch for iterative traversal. Per thread (MewStage vendor patch multi-host/0001): a visual tree is walked only on its own
++    // UI thread, but one process can host several embedded UIs on different threads (tests), and a shared scratch
++    // list let two walks corrupt each other.
++    [ThreadStatic] private static List<Element>? _stack;
+ 
+     // Single static delegate - no per-call allocation.
+     // Pushes children onto the reused stack for iterative processing.
+--- a/Elements/LogicalTree.cs
++++ b/Elements/LogicalTree.cs
+@@ -10,7 +10,8 @@
+ public static class LogicalTree
+ {
+     // Reused scratch for iterative traversal; the logical tree is walked only on the UI thread.
+-    private static List<Element>? _stack;
++    // Per thread (MewStage vendor patch multi-host/0001), as VisualTree's: a tree is walked only on its own UI thread.
++    [ThreadStatic] private static List<Element>? _stack;
+ 
+     // Single static delegate - no per-call allocation.
+     private static readonly Func<Element, bool> _collector = static child =>
+--- a/Core/Application.cs
++++ b/Core/Application.cs
+@@ -279,8 +279,8 @@
+     {
+         // Application owns the single process-wide factory: the provider is invoked once and cached (no
+         // per-class singleton). It is process-scoped, so it is not cleared or disposed across runs.
+-        get => _defaultGraphicsFactory ??= (_graphicsFactoryProvider ?? throw new InvalidOperationException(
+-            "No graphics backend registered. Add a backend package (Aprillz.MewUI.Backend.Direct2D / Gdi / MewVG.*)."))();
++        get => t_threadGraphicsFactory ?? (_defaultGraphicsFactory ??= (_graphicsFactoryProvider ?? throw new InvalidOperationException(
++            "No graphics backend registered. Add a backend package (Aprillz.MewUI.Backend.Direct2D / Gdi / MewVG.*)."))());
+         internal set
+         {
+             ArgumentNullException.ThrowIfNull(value);
+@@ -289,6 +289,19 @@
+         }
+     }
+ 
++    // MewStage vendor patch multi-host/0001: an embedded host binds ITS factory to the thread it runs its UI on, so that thread's elements
++    // (which resolve the factory through DefaultGraphicsFactory outside Application.Run) measure and draw with it even
++    // when another host in the same process - on another thread, or created later on this one - set the process
++    // default. Null = the process default.
++    [ThreadStatic] private static IGraphicsFactory? t_threadGraphicsFactory;
++
++    /// <summary>The graphics factory this thread's UI uses ahead of the process default (null = none bound).</summary>
++    internal static IGraphicsFactory? ThreadGraphicsFactory
++    {
++        get => t_threadGraphicsFactory;
++        set => t_threadGraphicsFactory = value;
++    }
++
+     // Tooling assemblies decorate the platform host through this seam, registered from their own
+     // composition entry point before the first host access. Registration can precede the platform
+     // Register() call in Main; the wrap is applied when the host is finally resolved.

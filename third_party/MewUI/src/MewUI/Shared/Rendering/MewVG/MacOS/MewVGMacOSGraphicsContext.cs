@@ -1,0 +1,778 @@
+using System.Runtime.CompilerServices;
+
+using Aprillz.MewUI.Rendering.CoreText;
+using Aprillz.MewUI.Text;
+using Aprillz.MewVG;
+using Aprillz.MewVG.Interop;
+
+namespace Aprillz.MewUI.Rendering.MewVG;
+
+internal sealed partial class MewVGMacOSGraphicsContext
+{
+    private static readonly nint ClsMTLRenderPassDescriptor = ObjCRuntime.GetClass("MTLRenderPassDescriptor");
+
+    private static readonly nint SelAlloc = ObjCRuntime.Selectors.alloc;
+    private static readonly nint SelInit = ObjCRuntime.Selectors.init;
+    private static readonly nint SelRelease = ObjCRuntime.Selectors.release;
+    private static readonly nint SelRetain = ObjCRuntime.RegisterSelector("retain");
+
+    private static readonly nint SelNextDrawable = ObjCRuntime.RegisterSelector("nextDrawable");
+    private static readonly nint SelTexture = ObjCRuntime.RegisterSelector("texture");
+    private static readonly nint SelCommandBuffer = ObjCRuntime.RegisterSelector("commandBuffer");
+    private static readonly nint SelRenderCommandEncoderWithDescriptor = ObjCRuntime.RegisterSelector("renderCommandEncoderWithDescriptor:");
+    private static readonly nint SelEndEncoding = ObjCRuntime.RegisterSelector("endEncoding");
+    private static readonly nint SelCommit = ObjCRuntime.RegisterSelector("commit");
+    private static readonly nint SelWaitUntilScheduled = ObjCRuntime.RegisterSelector("waitUntilScheduled");
+    private static readonly nint SelPresent = ObjCRuntime.RegisterSelector("present");
+    private static readonly nint SelRenderPassDescriptor = ObjCRuntime.RegisterSelector("renderPassDescriptor");
+    private static readonly nint SelColorAttachments = ObjCRuntime.RegisterSelector("colorAttachments");
+    private static readonly nint SelObjectAtIndexedSubscript = ObjCRuntime.RegisterSelector("objectAtIndexedSubscript:");
+    private static readonly nint SelSetTexture = ObjCRuntime.RegisterSelector("setTexture:");
+    private static readonly nint SelSetLoadAction = ObjCRuntime.RegisterSelector("setLoadAction:");
+    private static readonly nint SelSetStoreAction = ObjCRuntime.RegisterSelector("setStoreAction:");
+    private static readonly nint SelSetClearColor = ObjCRuntime.RegisterSelector("setClearColor:");
+    private static readonly nint ClsNSAutoreleasePool = ObjCRuntime.GetClass("NSAutoreleasePool");
+
+    private readonly IMetalFrameSession _frameSession;
+    private readonly MewVGMetalTextCache _textCache;
+    private readonly Action<GpuInteropInvalidatedEventArgs>? _gpuInteropInvalidated;
+
+    private nint _drawable;
+    private nint _commandBuffer;
+    private nint _encoder;
+    private nint _currentFrameDevice;
+    private readonly HashSet<GpuDeviceIdentity> _reportedExternalMismatches = new();
+    private bool _beganFrame;
+    private nint _framePool; // Frame-spanning autorelease pool: created in BeginFrame, drained in EndFrame.
+
+    private MewVGMacOSGraphicsContext(
+        IMetalFrameSession frameSession,
+        Action<GpuInteropInvalidatedEventArgs>? gpuInteropInvalidated)
+    {
+        _frameSession = frameSession;
+        _vg = frameSession.Vg;
+        _textCache = frameSession.TextCache;
+        _gpuInteropInvalidated = gpuInteropInvalidated;
+    }
+
+    internal static MewVGMacOSGraphicsContext CreateForWindow(
+        MewVGMetalWindowResources resources,
+        MewVGMetalOffscreenSurfaceProvider offscreenProvider,
+        Action<GpuInteropInvalidatedEventArgs>? gpuInteropInvalidated)
+        => new(new MetalWindowFrameSession(resources, offscreenProvider), gpuInteropInvalidated);
+
+    /// <summary>
+    /// Builds a graphics context that renders into <paramref name="target"/>'s
+    /// GPU MTLTexture instead of a window's <c>CAMetalLayer</c> drawable. The
+    /// supplied <paramref name="offscreen"/> surface must have been acquired
+    /// via <see cref="MewVGMetalOffscreenSurfaceProvider.AcquireSurface"/>; the
+    /// context takes ownership and returns it to the pool on Dispose.
+    /// </summary>
+    internal static MewVGMacOSGraphicsContext CreateForOffscreen(
+        MewVGMetalOffscreenSurface offscreen,
+        MewVGMetalPixelRenderSurface target,
+        MewVGMetalOffscreenSurfaceProvider offscreenProvider)
+        => new(new MetalOffscreenFrameSession(offscreen, target, offscreenProvider), gpuInteropInvalidated: null);
+
+    partial void DestroyPlatform()
+    {
+        _frameSession.DisposeContext(this);
+    }
+
+    partial void BeginFramePlatform()
+    {
+        // Drain any lingering pool from a previous frame, then create a fresh
+        // frame-spanning pool.  This pool lives until EndFramePlatform so that
+        // *all* autoreleased ObjC objects created during rendering (by Metal
+        // framework internals, NanoVG, or text rasterisation) are drained at
+        // the end of each frame instead of accumulating until the outer
+        // run-loop pool drains.
+        DrainFramePool();
+        _framePool = CreateFramePool();
+
+        _drawable = 0;
+        _commandBuffer = 0;
+        _encoder = 0;
+        _currentFrameDevice = 0;
+        _beganFrame = false;
+
+        if (!_frameSession.TryBeginFrame(_viewportWidthPx, _viewportHeightPx, out var frame))
+        {
+            return;
+        }
+
+        _drawable = frame.Drawable;
+        _currentFrameDevice = frame.Device;
+
+        nint cmdBuf = ObjCRuntime.SendMessage(frame.CommandQueue, SelCommandBuffer);
+        if (cmdBuf == 0)
+        {
+            return;
+        }
+
+        RetainIfNotNull(cmdBuf);
+        _commandBuffer = cmdBuf;
+
+        // Ensure the NanoVG coverage-AA scratch attachment matches the viewport.
+        // The texture is owned by the renderer (single instance, resized on demand)
+        // and is attached as color[1] of the main render pass so transparent
+        // strokes/fills can write coverage and composite within one encoder.
+        nint coverageTexture = _vg.EnsureCoverageTexture(_viewportWidthPx, _viewportHeightPx);
+        // The path clip lives in color[2] the same way (see MNVGcontext.ClipPixelFormat).
+        nint clipTexture = _vg.EnsureClipMaskTexture(_viewportWidthPx, _viewportHeightPx);
+
+        nint passDesc = CreateRenderPass(
+            frame.ColorTexture,
+            coverageTexture,
+            clipTexture,
+            frame.PreserveColorContents);
+        if (passDesc == 0)
+        {
+            return;
+        }
+
+        nint encoder = ObjCRuntime.SendMessage(_commandBuffer, SelRenderCommandEncoderWithDescriptor, passDesc);
+        if (encoder == 0)
+        {
+            return;
+        }
+
+        RetainIfNotNull(encoder);
+        _encoder = encoder;
+
+        _vg.SetRenderEncoder(_encoder, _commandBuffer);
+        _vg.BeginFrame((float)_viewportWidthDip, (float)_viewportHeightDip, (float)DpiScale);
+        _vg.ResetTransform();
+        _vg.ResetScissor();
+        _beganFrame = true;
+    }
+
+    partial void EndFramePlatform()
+    {
+        bool didRender = false;
+
+        try
+        {
+            if (_encoder != 0 && _commandBuffer != 0 && _beganFrame &&
+                (_frameSession.IsOffscreen || _drawable != 0))
+            {
+                _vg.EndFrame();
+                didRender = true;
+
+                ObjCRuntime.SendMessageNoReturn(_encoder, SelEndEncoding);
+                ObjCRuntime.SendMessageNoReturn(_commandBuffer, SelCommit);
+                _frameSession.AfterCommit(_commandBuffer, _drawable);
+            }
+            else if (_encoder != 0)
+            {
+                ObjCRuntime.SendMessageNoReturn(_encoder, SelEndEncoding);
+            }
+        }
+        finally
+        {
+            if (didRender)
+            {
+                try
+                {
+                    _vg.FrameCompleted();
+                }
+                catch
+                {
+                    // Best-effort: avoid deadlocking the internal frame semaphore if rendering fails mid-frame.
+                }
+            }
+
+            ReleaseIfNotNull(_encoder);
+            ReleaseIfNotNull(_commandBuffer);
+            ReleaseIfNotNull(_drawable);
+            _encoder = 0;
+            _commandBuffer = 0;
+            _drawable = 0;
+            _beganFrame = false;
+
+            // Main frame only: NVG.Flush has just consumed any draw calls
+            // that referenced images disposed mid-frame (filter composites
+            // and LRU-evicted text glyph atlases). Now it's safe to actually
+            // delete their MTLTextures.
+            _frameSession.ReleasePendingFrameResources();
+
+            // Drain the frame-spanning autorelease pool.
+            // This releases all autoreleased ObjC objects created since BeginFrame,
+            // preventing accumulation when the run-loop pool doesn't drain between
+            // high-frequency frame ticks (e.g. MaxFPS = 288).
+            DrainFramePool();
+        }
+    }
+
+    private readonly record struct MetalFrame(
+        nint Device,
+        nint ColorTexture,
+        nint CommandQueue,
+        nint Drawable,
+        bool PreserveColorContents);
+
+    private interface IMetalFrameSession
+    {
+        MewVGMetal Vg { get; }
+
+        MewVGMetalTextCache TextCache { get; }
+
+        bool IsOffscreen { get; }
+
+        bool TryBeginFrame(int viewportWidthPx, int viewportHeightPx, out MetalFrame frame);
+
+        void AfterCommit(nint commandBuffer, nint drawable);
+
+        void ReleasePendingFrameResources();
+
+        void DisposeContext(MewVGMacOSGraphicsContext context);
+    }
+
+    private sealed class MetalWindowFrameSession : IMetalFrameSession
+    {
+        private readonly MewVGMetalWindowResources _resources;
+        private readonly MewVGMetalOffscreenSurfaceProvider _offscreenProvider;
+
+        public MetalWindowFrameSession(MewVGMetalWindowResources resources, MewVGMetalOffscreenSurfaceProvider offscreenProvider)
+        {
+            _resources = resources;
+            _offscreenProvider = offscreenProvider;
+        }
+
+        public MewVGMetal Vg => _resources.Vg;
+
+        public MewVGMetalTextCache TextCache => _resources.TextCache;
+
+        public bool IsOffscreen => false;
+
+        public bool TryBeginFrame(int viewportWidthPx, int viewportHeightPx, out MetalFrame frame)
+        {
+            frame = default;
+
+            nint drawable = ObjCRuntime.SendMessage(_resources.Layer, SelNextDrawable);
+            if (drawable == 0)
+            {
+                return false;
+            }
+
+            RetainIfNotNull(drawable);
+
+            nint colorTexture = ObjCRuntime.SendMessage(drawable, SelTexture);
+            if (colorTexture == 0)
+            {
+                ReleaseIfNotNull(drawable);
+                return false;
+            }
+
+            // Window frames go on the device's shared queue, the one offscreen surfaces draw on, so a
+            // surface drawn earlier in the frame is finished on the GPU before this frame reads it.
+            nint queue = _offscreenProvider.TryGetSharedCommandQueue(_resources.Device);
+            frame = new MetalFrame(
+                _resources.Device,
+                colorTexture,
+                queue != 0 ? queue : _resources.CommandQueue,
+                drawable,
+                PreserveColorContents: false);
+            return true;
+        }
+
+        public void AfterCommit(nint commandBuffer, nint drawable)
+        {
+            ObjCRuntime.SendMessageNoReturn(commandBuffer, SelWaitUntilScheduled);
+            ObjCRuntime.SendMessageNoReturn(drawable, SelPresent);
+        }
+
+        public void ReleasePendingFrameResources()
+        {
+            // Per-NVG drain: only delete image-ids belonging to the window's NVG. Worker
+            // offscreen NVG entries stay queued until the worker session's EndFrame.
+            _offscreenProvider.ReleasePendingImagesForVg(_resources.Vg);
+            TextCache.ReleasePendingDeletes();
+            NvgStrokeHelper.ReleasePendingGradientLutDeletes(_resources.Vg);
+        }
+
+        public void DisposeContext(MewVGMacOSGraphicsContext context)
+            => _resources.InvalidateCachedContext(context);
+    }
+
+    private sealed class MetalOffscreenFrameSession : IMetalFrameSession
+    {
+        private readonly MewVGMetalOffscreenSurface _offscreen;
+        private readonly MewVGMetalPixelRenderSurface _target;
+        private readonly MewVGMetalOffscreenSurfaceProvider _offscreenProvider;
+
+        public MetalOffscreenFrameSession(
+            MewVGMetalOffscreenSurface offscreen,
+            MewVGMetalPixelRenderSurface target,
+            MewVGMetalOffscreenSurfaceProvider offscreenProvider)
+        {
+            _offscreen = offscreen;
+            _target = target;
+            _offscreenProvider = offscreenProvider;
+        }
+
+        public MewVGMetal Vg => _offscreen.Vg;
+
+        public MewVGMetalTextCache TextCache => _offscreen.TextCache;
+
+        public bool IsOffscreen => true;
+
+        public bool TryBeginFrame(int viewportWidthPx, int viewportHeightPx, out MetalFrame frame)
+        {
+            _target.EnsureGpuTextures(_offscreen.Device, _offscreen.CommandQueue);
+            frame = new MetalFrame(
+                _offscreen.Device,
+                _target.ColorTexture,
+                _offscreen.CommandQueue,
+                0,
+                _target.PreserveContentsOnBeginFrame);
+            return frame.ColorTexture != 0;
+        }
+
+        public void AfterCommit(nint commandBuffer, nint drawable)
+        {
+            // No completion wait: every consumer of the rendered texture draws on this same shared
+            // queue (window frames, other offscreen passes, filter passes), and a queue runs its command
+            // buffers in commit order. CPU consumers (Lock / CopyPixels / GetPixelSpan) wait for this
+            // command buffer through the deferred readback before copying the texture.
+            _offscreen.TrackFrame(commandBuffer);
+            _target.RequestDeferredReadback(commandBuffer);
+        }
+
+        public void ReleasePendingFrameResources()
+        {
+            // Per-NVG drain for the offscreen NVG that just rendered. We're inside its
+            // EndFrame on the thread that owns it - only safe time to call DeleteImage on
+            // this NVG without racing the window NVG mid-frame on another thread.
+            _offscreenProvider.ReleasePendingImagesForVg(_offscreen.Vg);
+            NvgStrokeHelper.ReleasePendingGradientLutDeletes(_offscreen.Vg);
+        }
+
+        public void DisposeContext(MewVGMacOSGraphicsContext context)
+            => _offscreenProvider.ReturnSurface(_offscreen);
+    }
+
+    private static nint CreateRenderPass(
+        nint drawableTexture,
+        nint coverageTexture,
+        nint clipTexture,
+        bool preserveColorContents)
+    {
+        if (ClsMTLRenderPassDescriptor == 0 || SelRenderPassDescriptor == 0)
+        {
+            return 0;
+        }
+
+        nint passDesc = ObjCRuntime.SendMessage(ClsMTLRenderPassDescriptor, SelRenderPassDescriptor);
+        if (passDesc == 0)
+        {
+            return 0;
+        }
+
+        // colorAttachments[0]
+        nint colorAttachments = ObjCRuntime.SendMessage(passDesc, SelColorAttachments);
+        nint color0 = colorAttachments != 0 ? ObjCRuntime.SendMessage(colorAttachments, SelObjectAtIndexedSubscript, (UInt64)0) : 0;
+        if (color0 != 0)
+        {
+            ObjCRuntime.SendMessageNoReturn(color0, SelSetTexture, drawableTexture);
+            ObjCRuntime.SendMessageNoReturn(
+                color0,
+                SelSetLoadAction,
+                (UInt64)(preserveColorContents ? MTLLoadAction.Load : MTLLoadAction.Clear));
+            ObjCRuntime.SendMessageNoReturn(color0, SelSetStoreAction, (UInt64)MTLStoreAction.Store);
+
+            ObjCRuntime.SendMessageNoReturn(color0, SelSetClearColor, new MTLClearColor(0, 0, 0, 0));
+        }
+
+        // colorAttachments[1] - coverage AA scratch (alpha8 / R8). Present so
+        // transparent stroke / fill calls can build coverage and composite within
+        // the same render encoder via FB fetch (no tile flush). Memoryless on
+        // Apple Silicon: never lands in DRAM. Cleared per frame so subsequent
+        // strokes on the same frame start from 0.
+        if (coverageTexture != 0)
+        {
+            nint color1 = colorAttachments != 0 ? ObjCRuntime.SendMessage(colorAttachments, SelObjectAtIndexedSubscript, (UInt64)1) : 0;
+            if (color1 != 0)
+            {
+                ObjCRuntime.SendMessageNoReturn(color1, SelSetTexture, coverageTexture);
+                ObjCRuntime.SendMessageNoReturn(color1, SelSetLoadAction, (UInt64)MTLLoadAction.Clear);
+                ObjCRuntime.SendMessageNoReturn(color1, SelSetStoreAction, (UInt64)MTLStoreAction.DontCare);
+                ObjCRuntime.SendMessageNoReturn(color1, SelSetClearColor, new MTLClearColor(0, 0, 0, 0));
+            }
+        }
+
+        // colorAttachments[2] - the path clip (RG8). .r is the clip coverage every draw multiplies
+        // by, so it clears to 1 (no clip); .g is scratch for building the next clip.
+        if (clipTexture != 0)
+        {
+            nint color2 = colorAttachments != 0 ? ObjCRuntime.SendMessage(colorAttachments, SelObjectAtIndexedSubscript, (UInt64)2) : 0;
+            if (color2 != 0)
+            {
+                ObjCRuntime.SendMessageNoReturn(color2, SelSetTexture, clipTexture);
+                ObjCRuntime.SendMessageNoReturn(color2, SelSetLoadAction, (UInt64)MTLLoadAction.Clear);
+                ObjCRuntime.SendMessageNoReturn(color2, SelSetStoreAction, (UInt64)MTLStoreAction.DontCare);
+                ObjCRuntime.SendMessageNoReturn(color2, SelSetClearColor, new MTLClearColor(1, 0, 0, 0));
+            }
+        }
+
+        return passDesc;
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static void RetainIfNotNull(nint obj)
+    {
+        if (obj == 0 || SelRetain == 0)
+        {
+            return;
+        }
+
+        _ = ObjCRuntime.SendMessage(obj, SelRetain);
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static void ReleaseIfNotNull(nint obj)
+    {
+        if (obj == 0 || SelRelease == 0)
+        {
+            return;
+        }
+
+        ObjCRuntime.SendMessageNoReturn(obj, SelRelease);
+    }
+
+    #region Text Rendering
+
+    private Size MeasureTextCore(ReadOnlySpan<char> text, IFont font)
+    {
+        if (text.IsEmpty) return Size.Empty;
+        if (font is not CoreTextFont ct) return new Size(text.Length * 8, 16);
+        int maxWidthPx = 0;
+        var sizePx = CoreTextText.Measure(ct, text, maxWidthPx, TextWrapping.NoWrap, (uint)Math.Round(DpiScale * 96.0));
+        return new Size(sizePx.Width / DpiScale, sizePx.Height / DpiScale);
+    }
+
+    private Size MeasureTextCore(ReadOnlySpan<char> text, IFont font, double maxWidth)
+    {
+        if (text.IsEmpty) return Size.Empty;
+        if (font is not CoreTextFont ct) return new Size(text.Length * 8, 16);
+        int maxWidthPx = maxWidth <= 0 ? 0 : Math.Max(1, LayoutRounding.CeilToPixelInt(maxWidth, DpiScale));
+        var sizePx = CoreTextText.Measure(ct, text, maxWidthPx, TextWrapping.Wrap, (uint)Math.Round(DpiScale * 96.0));
+        return new Size(sizePx.Width / DpiScale, sizePx.Height / DpiScale);
+    }
+
+    public override Size MeasureText(ReadOnlySpan<char> text, IFont font)
+        => MeasureTextCore(text, font);
+
+    public override Size MeasureText(ReadOnlySpan<char> text, IFont font, double maxWidth)
+        => MeasureTextCore(text, font, maxWidth);
+
+    public override BackendTextLayout CreateBackendTextLayout(ReadOnlySpan<char> text,
+        BackendTextFormat format, in BackendTextLayoutConstraints constraints)
+    {
+        var bounds = constraints.Bounds;
+        var safeBounds = new Rect(bounds.X, bounds.Y,
+            double.IsPositiveInfinity(bounds.Width) ? 0 : bounds.Width,
+            double.IsPositiveInfinity(bounds.Height) ? 0 : bounds.Height);
+
+        Size measured;
+        if (format.Wrapping == TextWrapping.NoWrap)
+        {
+            measured = MeasureTextCore(text, format.Font);
+        }
+        else
+        {
+            double maxWidth = safeBounds.Width > 0 ? safeBounds.Width : MeasureTextCore(text, format.Font).Width;
+            measured = MeasureTextCore(text, format.Font, maxWidth);
+        }
+
+        double effectiveMaxWidth = safeBounds.Width > 0 ? safeBounds.Width : measured.Width;
+
+        return new BackendTextLayout
+        {
+            MeasuredSize = measured,
+            EffectiveBounds = safeBounds,
+            EffectiveMaxWidth = effectiveMaxWidth,
+            ContentHeight = measured.Height
+        };
+    }
+
+    protected override TextInkOverhang MeasureRunInkOverhang(ReadOnlySpan<char> text, IFont font, BackendTextLayout layout)
+        => font is CoreTextFont coreTextFont
+            ? CoreTextText.MeasureRunInk(coreTextFont, text, (uint)Math.Round(DpiScale * 96.0), layout.EffectiveBounds.Width)
+            : TextInkOverhang.None;
+
+    public override void DrawBackendTextLayout(ReadOnlySpan<char> text,
+        BackendTextFormat format, BackendTextLayout layout, Color color)
+        => DrawTextLayoutCore(text, format, layout, color, owner: null);
+
+    public override void DrawBackendTextLayout(ReadOnlySpan<char> text,
+        BackendTextFormat format, BackendTextLayout layout, Color color, object? owner)
+        => DrawTextLayoutCore(text, format, layout, color, owner);
+
+    private void DrawTextLayoutCore(ReadOnlySpan<char> text,
+        BackendTextFormat format, BackendTextLayout layout, Color color, object? owner)
+    {
+        if (text.IsEmpty) return;
+        if (format.Font is not CoreTextFont ct) return;
+
+        var bounds = layout.EffectiveBounds;
+        // A text-engine run rasterizes into a bitmap grown by its ink overhang, with the run box inset
+        // inside it, and its visible rect reaches that far past the box.
+        var inkInset = TextInkInsetPx.FromOverhang(layout.InkOverhang, DpiScale);
+        double inkLeft = inkInset.Left / DpiScale;
+        double inkTop = inkInset.Top / DpiScale;
+        double inkRight = inkInset.Right / DpiScale;
+        double inkBottom = inkInset.Bottom / DpiScale;
+
+        double targetWidthDip = layout.MeasuredSize.Width;
+        if (bounds.Width > 0 && !double.IsInfinity(bounds.Width) && !double.IsNaN(bounds.Width))
+        {
+            if (format.Wrapping != TextWrapping.NoWrap)
+                targetWidthDip = bounds.Width;
+            else if (format.Trimming != TextTrimming.None)
+                targetWidthDip = Math.Min(targetWidthDip, bounds.Width);
+        }
+
+        int widthPx = Math.Max(1, LayoutRounding.CeilToPixelInt(targetWidthDip, DpiScale));
+
+        double targetHeightDip = layout.MeasuredSize.Height;
+        if (bounds.Height > 0 && !double.IsInfinity(bounds.Height) && !double.IsNaN(bounds.Height))
+            targetHeightDip = Math.Min(targetHeightDip, bounds.Height);
+        int heightPx = Math.Max(1, LayoutRounding.CeilToPixelInt(targetHeightDip, DpiScale));
+
+        if (_clipBoundsWorld.HasValue)
+        {
+            var c = _clipBoundsWorld.Value;
+            var textWorld = TransformRectToWorldAABB(new Rect(bounds.X - inkLeft, bounds.Y - inkTop,
+                widthPx / DpiScale + inkLeft + inkRight, heightPx / DpiScale + inkTop + inkBottom));
+            if (textWorld.Right <= c.X || textWorld.X >= c.Right || textWorld.Bottom <= c.Y || textWorld.Y >= c.Bottom)
+                return;
+        }
+
+        double drawX = bounds.X;
+        double drawY = bounds.Y;
+        double widthDip = widthPx / DpiScale;
+        double heightDip = heightPx / DpiScale;
+
+        if (bounds.Width > 0)
+        {
+            drawX = format.HorizontalAlignment switch
+            {
+                TextAlignment.Center => bounds.X + (bounds.Width - widthDip) / 2.0,
+                TextAlignment.Right => bounds.X + (bounds.Width - widthDip),
+                _ => bounds.X
+            };
+        }
+
+        if (bounds.Height > 0)
+        {
+            drawY = format.VerticalAlignment switch
+            {
+                TextAlignment.Center => bounds.Y + (bounds.Height - heightDip) / 2.0,
+                TextAlignment.Bottom => bounds.Y + (bounds.Height - heightDip),
+                _ => bounds.Y
+            };
+        }
+
+        if (_textPixelSnap)
+        {
+            var snappedOrigin = RenderingUtil.SnapTextOriginToDevice(new Point(drawX, drawY), _transform, DpiScale);
+            drawX = snappedOrigin.X;
+            drawY = snappedOrigin.Y;
+        }
+        drawX -= inkLeft;
+        drawY -= inkTop;
+
+        int imageId;
+        int bitmapWidthPx;
+        int bitmapHeightPx;
+        bool ok = ReferenceEquals(owner, Aprillz.MewUI.Text.TransientText.Owner)
+            ? _textCache.TryGetOrCreateTransient(
+                ct,
+                text,
+                widthPx,
+                heightPx,
+                (uint)Math.Round(DpiScale * 96.0),
+                color,
+                format.HorizontalAlignment,
+                TextAlignment.Top,
+                format.Wrapping,
+                format.Trimming,
+                inkInset,
+                out imageId,
+                out bitmapWidthPx,
+                out bitmapHeightPx)
+            : owner != null
+            ? _textCache.TryGetOrCreateOwned(
+                owner,
+                ct,
+                text,
+                widthPx,
+                heightPx,
+                (uint)Math.Round(DpiScale * 96.0),
+                color,
+                format.HorizontalAlignment,
+                TextAlignment.Top,
+                format.Wrapping,
+                format.Trimming,
+                inkInset,
+                out imageId,
+                out bitmapWidthPx,
+                out bitmapHeightPx)
+            : _textCache.TryGetOrCreate(
+                ct,
+                text,
+                widthPx,
+                heightPx,
+                (uint)Math.Round(DpiScale * 96.0),
+                color,
+                format.HorizontalAlignment,
+                TextAlignment.Top,
+                format.Wrapping,
+                format.Trimming,
+                inkInset,
+                out imageId,
+                out bitmapWidthPx,
+                out bitmapHeightPx);
+        if (!ok)
+        {
+            return;
+        }
+
+        double bitmapWidthDip = bitmapWidthPx / DpiScale;
+        double bitmapHeightDip = bitmapHeightPx / DpiScale;
+        var paint = _vg.ImagePattern((float)drawX, (float)drawY, (float)bitmapWidthDip, (float)bitmapHeightDip, 0, imageId, 1.0f);
+
+        double rectX = drawX;
+        double rectY = drawY;
+        double rectW = Math.Max(widthDip, Math.Min(bitmapWidthDip, widthDip + (bitmapWidthDip - widthDip)));
+        double rectH = heightDip + inkTop + inkBottom;
+        double snapTolerance = 2.0 / DpiScale;
+        if (bounds.Width > 0 && !double.IsInfinity(bounds.Width))
+        {
+            double minLeft = bounds.X - inkLeft;
+            if (rectX < minLeft)
+            {
+                double leftClip = minLeft - rectX;
+                rectW -= leftClip;
+                rectX = minLeft;
+            }
+            double maxRight = bounds.X + bounds.Width + inkRight;
+            if (rectX + rectW > maxRight + snapTolerance)
+                rectW = maxRight - rectX;
+        }
+        if (bounds.Height > 0 && !double.IsInfinity(bounds.Height))
+        {
+            double maxBottom = bounds.Y + bounds.Height + inkBottom;
+            if (rectY + rectH > maxBottom)
+                rectH = maxBottom - rectY;
+        }
+
+        _vg.BeginPath();
+        _vg.Rect((float)rectX, (float)rectY, (float)rectW, (float)rectH);
+        _vg.FillPaint(paint);
+        _vg.Fill();
+    }
+
+    #endregion
+
+    #region Image Rendering
+
+    public override void DrawImage(IImage image, Point location)
+    {
+        image = ImageResource.ResolveBackendImage(image);
+        DrawImageCore(image, new Rect(location.X, location.Y, image.PixelWidth / DpiScale, image.PixelHeight / DpiScale));
+    }
+
+    protected override void DrawImageCore(IImage image, Rect destRect)
+        => DrawImageCore(image, destRect, new Rect(0, 0, image.PixelWidth, image.PixelHeight));
+
+    protected override void DrawImageCore(IImage image, Rect destRect, Rect sourceRect)
+    {
+        if (image is MewVGExternalRasterImage extImage)
+        {
+            var lease = EnsureExternalAcquired(extImage.Source);
+            if (!IsExternalRasterLeaseCompatible(lease))
+            {
+                return;
+            }
+
+            int extImageId = extImage.GetOrCreateImageId(_vg, lease, GetImageFlags());
+            if (extImageId == 0) return;
+            DrawImagePattern(extImageId, destRect, alpha: 1f, sourceRect: sourceRect,
+                image.PixelWidth, image.PixelHeight);
+            return;
+        }
+
+        if (image is not MewVGImage mew)
+        {
+            return;
+        }
+
+        int imageId = mew.GetOrCreateImageId(_vg, GetImageFlags());
+        if (imageId == 0)
+        {
+            return;
+        }
+
+        DrawImagePattern(imageId, destRect, alpha: 1f, sourceRect: sourceRect, mew.PixelWidth, mew.PixelHeight);
+    }
+
+    private bool IsExternalRasterLeaseCompatible(IExternalRasterLease lease)
+    {
+        // No-opinion bail-outs: nothing to compare against, or lease doesn't expose affinity.
+        // The pointer equality check below is the real signal - cross-API pointer collisions
+        // (a GL share-group handle matching a Metal device pointer) don't happen in practice,
+        // so we no longer need a typed-backend discriminator to gate this check.
+        if (_currentFrameDevice == 0 ||
+            lease is not IGpuResourceAffinityProvider affinityProvider ||
+            affinityProvider.Affinity?.Device is not { } sourceDevice ||
+            sourceDevice.IsEmpty)
+        {
+            return true;
+        }
+
+        // MetalDevice* identifies the Metal device; both IdLow and NativeHandle carry the
+        // pointer value so structural equality holds across copies.
+        var targetDevice = _currentFrameDevice == 0
+            ? default
+            : new GpuDeviceIdentity((ulong)_currentFrameDevice, 0, _currentFrameDevice);
+        if (sourceDevice.IdLow == targetDevice.IdLow && sourceDevice.IdHigh == targetDevice.IdHigh)
+        {
+            return true;
+        }
+
+        if (_reportedExternalMismatches.Add(sourceDevice))
+        {
+            _gpuInteropInvalidated?.Invoke(new GpuInteropInvalidatedEventArgs(
+                GpuInteropInvalidationReason.ExternalResourceMismatch,
+                renderTargetDeviceChanged: true,
+                externalResourceMismatch: true));
+        }
+
+        return false;
+    }
+
+    #endregion
+
+    private static nint CreateFramePool()
+    {
+        if (ClsNSAutoreleasePool == 0 || SelAlloc == 0 || SelInit == 0)
+        {
+            return 0;
+        }
+
+        nint pool = ObjCRuntime.SendMessage(ClsNSAutoreleasePool, SelAlloc);
+        return pool != 0 ? ObjCRuntime.SendMessage(pool, SelInit) : 0;
+    }
+
+    private void DrainFramePool()
+    {
+        nint pool = _framePool;
+        if (pool != 0)
+        {
+            _framePool = 0;
+            ObjCRuntime.SendMessageNoReturn(pool, SelRelease);
+        }
+    }
+}

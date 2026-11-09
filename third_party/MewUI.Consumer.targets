@@ -1,0 +1,37 @@
+<Project>
+  <!-- MewStage-authored (outside every vendored component, so vendor.py never touches it).
+
+       Import at the END of a project that USES MewUI: the demo executable or a test host. It gives that project what
+       a NuGet consumer gets from the Aprillz.MewUI.Core package, which a ProjectReference does not carry:
+         * the binding-path source generator (reflection-free Bind paths; NativeAOT-safe), as an analyzer;
+         * upstream's build/Aprillz.MewUI.Core.targets: the runtime feature switches (Trim="true", so a trimmed /
+           NativeAOT publish drops the disabled graphs via ILLink.Substitutions.xml) and the interceptor namespace the
+           generator needs.
+
+       MewStageUiHost = Embedded : an embedded host (the tests that drive the backend directly). No OS windows of
+                                   MewUI's own, no Hot Reload agent: DevTools, Hot Reload, managed file dialogs, touch
+                                   gestures and MEWUI_*_DEBUG environment logging are OFF unless the project sets them
+                                   first.
+       MewStageUiHost = Tool     : upstream defaults (DevTools and environment logging on in Debug, Hot Reload on). The
+                                   demo executable uses this so the in-window DevTools work in Debug JIT builds; a
+                                   NativeAOT publish gets no DevTools regardless (the gate needs dynamic code). -->
+
+  <PropertyGroup Condition="'$(MewStageUiHost)' == 'Embedded'">
+    <MewUIHotReload Condition="'$(MewUIHotReload)' == ''">false</MewUIHotReload>
+    <MewUIDevTools Condition="'$(MewUIDevTools)' == ''">false</MewUIDevTools>
+    <MewUIEnvironmentDebugLogging Condition="'$(MewUIEnvironmentDebugLogging)' == ''">false</MewUIEnvironmentDebugLogging>
+    <MewUIManagedFileDialogs Condition="'$(MewUIManagedFileDialogs)' == ''">false</MewUIManagedFileDialogs>
+    <MewUITouch Condition="'$(MewUITouch)' == ''">false</MewUITouch>
+  </PropertyGroup>
+
+  <Target Name="_MewStageUiHostRequired" BeforeTargets="Build" Condition="'$(MewStageUiHost)' != 'Embedded' And '$(MewStageUiHost)' != 'Tool'">
+    <Error Text="Set MewStageUiHost to Embedded or Tool before importing MewUI.Consumer.targets (actual: '$(MewStageUiHost)')." />
+  </Target>
+
+  <ItemGroup>
+    <ProjectReference Include="$(MSBuildThisFileDirectory)MewUI\src\MewUI.Generators\MewUI.Generators.csproj"
+                      OutputItemType="Analyzer" ReferenceOutputAssembly="false" PrivateAssets="all" />
+  </ItemGroup>
+
+  <Import Project="$(MSBuildThisFileDirectory)MewUI\build\Aprillz.MewUI.Core.targets" />
+</Project>

@@ -1,0 +1,507 @@
+// Copyright (c) 2017 Ollix (Original)
+// Copyright (c) 2024 .NET Port
+// MIT License
+
+using System.Numerics;
+using System.Runtime.InteropServices;
+
+namespace Aprillz.MewVG;
+
+/// <summary>
+/// Image flags for MewVG images.
+/// </summary>
+[Flags]
+public enum MewVGImageFlags
+{
+    /// <summary>
+    /// No flags.
+    /// </summary>
+    None = 0,
+
+    /// <summary>
+    /// Generate mipmaps during creation of the image.
+    /// </summary>
+    GenerateMipmaps = 1 << 0,
+
+    /// <summary>
+    /// Repeat image in X direction.
+    /// </summary>
+    RepeatX = 1 << 1,
+
+    /// <summary>
+    /// Repeat image in Y direction.
+    /// </summary>
+    RepeatY = 1 << 2,
+
+    /// <summary>
+    /// Flip the image vertically.
+    /// </summary>
+    FlipY = 1 << 3,
+
+    /// <summary>
+    /// Image data has premultiplied alpha.
+    /// </summary>
+    Premultiplied = 1 << 4,
+
+    /// <summary>
+    /// Use nearest filtering instead of linear.
+    /// </summary>
+    Nearest = 1 << 5,
+
+    /// <summary>
+    /// Do not delete Metal texture handle.
+    /// </summary>
+    NoDelete = 1 << 16,
+}
+
+/// <summary>
+/// Texture types.
+/// </summary>
+internal enum NVGtextureType
+{
+    /// <summary>
+    /// Alpha texture.
+    /// </summary>
+    Alpha = 0x01,
+
+    /// <summary>
+    /// RGBA texture (red byte first in source data).
+    /// </summary>
+    RGBA = 0x02,
+
+    /// <summary>
+    /// BGRA texture (blue byte first in source data). Backends that support native BGRA upload
+    /// (GL <c>GL_BGRA</c>, Metal <c>BGRA8Unorm</c>) avoid the per-frame channel-swap that
+    /// callers with BGRA-native sources (Direct2D, GDI, video decoders) would otherwise pay.
+    /// </summary>
+    BGRA = 0x03,
+}
+
+/// <summary>
+/// Legacy texture enum used by older ports.
+/// </summary>
+internal enum NVGtexture
+{
+    Alpha = 0,
+    RGBA = 1,
+    BGRA = 2,
+}
+
+internal enum NVGpaintKind
+{
+    Default = 0,
+    GradientRadial = 1,
+    GradientLinear = 2,
+}
+
+/// <summary>
+/// Winding direction.
+/// </summary>
+public enum MewVGWinding
+{
+    /// <summary>
+    /// Counter-clockwise winding for solid shapes.
+    /// </summary>
+    CCW = 1,
+
+    /// <summary>
+    /// Clockwise winding for holes.
+    /// </summary>
+    CW = 2,
+}
+
+/// <summary>
+/// Fill rule used for path topology resolution.
+/// </summary>
+public enum MewVGFillRule
+{
+    /// <summary>
+    /// Non-zero winding rule.
+    /// </summary>
+    NonZero = 0,
+
+    /// <summary>
+    /// Even-odd rule.
+    /// </summary>
+    EvenOdd = 1,
+}
+
+/// <summary>
+/// Solidity types.
+/// </summary>
+internal enum NVGsolidity
+{
+    /// <summary>
+    /// Solid shape (CCW).
+    /// </summary>
+    Solid = 1,
+
+    /// <summary>
+    /// Hole shape (CW).
+    /// </summary>
+    Hole = 2,
+}
+
+/// <summary>
+/// Line cap styles.
+/// </summary>
+public enum MewVGLineCap
+{
+    /// <summary>
+    /// Butt line cap.
+    /// </summary>
+    Butt = 0,
+
+    /// <summary>
+    /// Round line cap.
+    /// </summary>
+    Round = 1,
+
+    /// <summary>
+    /// Square line cap.
+    /// </summary>
+    Square = 2,
+}
+
+/// <summary>
+/// Line join styles.
+/// </summary>
+public enum MewVGLineJoin
+{
+    /// <summary>
+    /// Round line join.
+    /// </summary>
+    Round = 1,
+
+    /// <summary>
+    /// Bevel line join.
+    /// </summary>
+    Bevel = 3,
+
+    /// <summary>
+    /// Miter line join.
+    /// </summary>
+    Miter = 4,
+}
+
+/// <summary>
+/// Text horizontal alignment.
+/// </summary>
+[Flags]
+internal enum NVGalign
+{
+    /// <summary>
+    /// Default, align text horizontally to left.
+    /// </summary>
+    Left = 1 << 0,
+
+    /// <summary>
+    /// Align text horizontally to center.
+    /// </summary>
+    Center = 1 << 1,
+
+    /// <summary>
+    /// Align text horizontally to right.
+    /// </summary>
+    Right = 1 << 2,
+
+    /// <summary>
+    /// Align text vertically to top.
+    /// </summary>
+    Top = 1 << 3,
+
+    /// <summary>
+    /// Align text vertically to middle.
+    /// </summary>
+    Middle = 1 << 4,
+
+    /// <summary>
+    /// Align text vertically to bottom.
+    /// </summary>
+    Bottom = 1 << 5,
+
+    /// <summary>
+    /// Align text vertically to baseline.
+    /// </summary>
+    Baseline = 1 << 6,
+}
+
+/// <summary>
+/// Blend factors for composite operations.
+/// </summary>
+internal enum NVGblendFactor
+{
+    Zero = 1 << 0,
+    One = 1 << 1,
+    SrcColor = 1 << 2,
+    OneMinusSrcColor = 1 << 3,
+    DstColor = 1 << 4,
+    OneMinusDstColor = 1 << 5,
+    SrcAlpha = 1 << 6,
+    OneMinusSrcAlpha = 1 << 7,
+    DstAlpha = 1 << 8,
+    OneMinusDstAlpha = 1 << 9,
+    SrcAlphaSaturate = 1 << 10,
+}
+
+/// <summary>
+/// Composite operations.
+/// </summary>
+public enum MewVGCompositeOperation
+{
+    SourceOver,
+    SourceIn,
+    SourceOut,
+    Atop,
+    DestinationOver,
+    DestinationIn,
+    DestinationOut,
+    DestinationAtop,
+    Lighter,
+    Copy,
+    Xor,
+}
+
+/// <summary>
+/// RGBA color structure.
+/// </summary>
+[StructLayout(LayoutKind.Sequential)]
+public struct MewVGColor
+{
+    public float R;
+    public float G;
+    public float B;
+    public float A;
+
+    public MewVGColor(float r, float g, float b, float a)
+    {
+        R = r;
+        G = g;
+        B = b;
+        A = a;
+    }
+
+    public static MewVGColor RGB(byte r, byte g, byte b) => RGBA(r, g, b, 255);
+
+    public static MewVGColor RGBf(float r, float g, float b) => RGBAf(r, g, b, 1.0f);
+
+    public static MewVGColor RGBA(byte r, byte g, byte b, byte a) => new MewVGColor(r / 255.0f, g / 255.0f, b / 255.0f, a / 255.0f);
+
+    public static MewVGColor RGBAf(float r, float g, float b, float a) => new MewVGColor(r, g, b, a);
+
+    public static MewVGColor HSL(float h, float s, float l) => HSLA(h, s, l, 255);
+
+    public static MewVGColor HSLA(float h, float s, float l, byte a)
+    {
+        float hueToRgb(float p, float q, float t)
+        {
+            if (t < 0)
+            {
+                t += 1;
+            }
+
+            if (t > 1)
+            {
+                t -= 1;
+            }
+
+            if (t < 1.0f / 6.0f)
+            {
+                return p + (q - p) * 6.0f * t;
+            }
+
+            if (t < 1.0f / 2.0f)
+            {
+                return q;
+            }
+
+            if (t < 2.0f / 3.0f)
+            {
+                return p + (q - p) * (2.0f / 3.0f - t) * 6.0f;
+            }
+
+            return p;
+        }
+
+        h = h % 1.0f;
+        if (h < 0.0f)
+        {
+            h += 1.0f;
+        }
+
+        s = Math.Clamp(s, 0.0f, 1.0f);
+        l = Math.Clamp(l, 0.0f, 1.0f);
+
+        float r, g, b;
+        if (s == 0)
+        {
+            r = g = b = l;
+        }
+        else
+        {
+            var q = l < 0.5f ? l * (1 + s) : l + s - l * s;
+            var p = 2 * l - q;
+            r = hueToRgb(p, q, h + 1.0f / 3.0f);
+            g = hueToRgb(p, q, h);
+            b = hueToRgb(p, q, h - 1.0f / 3.0f);
+        }
+
+        return new MewVGColor(r, g, b, a / 255.0f);
+    }
+
+    public static MewVGColor Lerp(MewVGColor c0, MewVGColor c1, float t)
+    {
+        t = Math.Clamp(t, 0.0f, 1.0f);
+        var oneminu = 1.0f - t;
+        return new MewVGColor(
+            c0.R * oneminu + c1.R * t,
+            c0.G * oneminu + c1.G * t,
+            c0.B * oneminu + c1.B * t,
+            c0.A * oneminu + c1.A * t);
+    }
+
+    public MewVGColor WithAlpha(byte a) => new MewVGColor(R, G, B, a / 255.0f);
+
+    public MewVGColor WithAlphaf(float a) => new MewVGColor(R, G, B, a);
+
+    public Vector4 ToVector4() => new Vector4(R, G, B, A);
+
+    public Vector4 ToPremultiplied() => new Vector4(R * A, G * A, B * A, A);
+
+    public static readonly MewVGColor White = new(1.0f, 1.0f, 1.0f, 1.0f);
+    public static readonly MewVGColor Black = new(0.0f, 0.0f, 0.0f, 1.0f);
+    public static readonly MewVGColor Transparent = new(0.0f, 0.0f, 0.0f, 0.0f);
+}
+
+/// <summary>
+/// Paint style for fills and strokes.
+/// </summary>
+public struct MewVGPaint
+{
+    internal Buffer6<float> Xform; // [6] - 2x3 transform matrix
+    internal Buffer2<float> Extent; // [2] - extent
+    internal float Radius;
+    internal float Feather;
+    internal MewVGColor InnerColor;
+    internal MewVGColor OuterColor;
+    internal int Image;
+    internal Buffer2<float> Center; // [2] - center for radial gradients
+    internal Buffer2<float> Focal; // [2] - normalized focal point for radial gradients
+    internal Buffer2<float> Radius2; // [2] - radii for radial gradients
+    internal int SpreadMethod;
+    internal int PaintKind;
+}
+
+/// <summary>
+/// Composite operation state.
+/// </summary>
+[StructLayout(LayoutKind.Sequential)]
+internal struct NVGcompositeOperationState
+{
+    public int SrcRGB;
+    public int DstRGB;
+    public int SrcAlpha;
+    public int DstAlpha;
+}
+
+/// <summary>
+/// Glyph position info.
+/// </summary>
+[StructLayout(LayoutKind.Sequential)]
+internal struct NVGglyphPosition
+{
+    /// <summary>
+    /// Pointer to the input string.
+    /// </summary>
+    public nint Str;
+
+    /// <summary>
+    /// X coordinate of the glyph in the input string.
+    /// </summary>
+    public float X;
+
+    /// <summary>
+    /// The bounds of the glyph box.
+    /// </summary>
+    public float MinX, MaxX;
+}
+
+/// <summary>
+/// Text row info.
+/// </summary>
+[StructLayout(LayoutKind.Sequential)]
+internal struct NVGtextRow
+{
+    /// <summary>
+    /// Pointer to the input text where the row starts.
+    /// </summary>
+    public nint Start;
+
+    /// <summary>
+    /// Pointer to the input text where the row ends (one past the last character).
+    /// </summary>
+    public nint End;
+
+    /// <summary>
+    /// Pointer to the beginning of the next row.
+    /// </summary>
+    public nint Next;
+
+    /// <summary>
+    /// Logical width of the row.
+    /// </summary>
+    public float Width;
+
+    /// <summary>
+    /// Actual bounds of the row (can be wider than the logical width).
+    /// </summary>
+    public float MinX, MaxX;
+}
+
+/// <summary>
+/// Vertex structure used internally.
+/// </summary>
+[StructLayout(LayoutKind.Sequential)]
+internal struct NVGvertex
+{
+    public float X;
+    public float Y;
+    public float U;
+    public float V;
+
+    public NVGvertex(float x, float y, float u, float v)
+    {
+        X = x;
+        Y = y;
+        U = u;
+        V = v;
+    }
+}
+
+/// <summary>
+/// Path structure used internally.
+/// </summary>
+[StructLayout(LayoutKind.Sequential)]
+internal unsafe struct NVGpath
+{
+    public int First;
+    public int Count;
+    public byte Closed;
+    public int NBevel;
+    public NVGvertex* Fill;
+    public int NFill;
+    public NVGvertex* Stroke;
+    public int NStroke;
+    public int Winding;
+    public int Convex;
+}
+
+/// <summary>
+/// Scissor structure used internally.
+/// </summary>
+[StructLayout(LayoutKind.Sequential)]
+internal struct NVGscissor
+{
+    public Buffer6<float> Transform;
+    public Buffer2<float> Extent;
+}

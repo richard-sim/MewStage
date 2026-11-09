@@ -1,0 +1,44 @@
+﻿<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFrameworks>
+      net462;
+      netstandard2.0;
+      net8.0;
+      net8.0-windows; <!-- https://github.com/Live-Charts/LiveCharts2/issues/1772  -->
+    </TargetFrameworks>
+
+    <AssemblyName>LiveChartsCore</AssemblyName>
+    <RootNamespace>LiveChartsCore</RootNamespace>
+    <PathToPackAssets>../../</PathToPackAssets>
+  </PropertyGroup>
+
+  <Import Project="../../nuget.props" />  
+  <PropertyGroup>
+    <Description>
+      $(Description) This package contains only the core of the library, you probably need another package that is compatible with you UI framework, unless you are building a custom package.
+    </Description>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <EmbeddedResource Include="Geo/world.geojson">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </EmbeddedResource>
+  </ItemGroup>
+
+  <PropertyGroup Condition="'$(TargetFramework)' == 'net462'">
+    <DefineConstants>$(DefineConstants);STRONG_NAMED_ASSEMBLIES</DefineConstants>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Condition="'$(TargetFramework)' == 'net462' OR '$(TargetFramework)' == 'netstandard2.0'" Include="System.Text.Json" Version="8.0.5" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="../../generators/LiveChartsGenerators/LiveChartsGenerators.csproj">
+      <OutputItemType>Analyzer</OutputItemType>
+      <ReferenceOutputAssembly>false</ReferenceOutputAssembly>
+    </ProjectReference>
+  </ItemGroup>
+
+</Project>

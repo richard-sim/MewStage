@@ -1,0 +1,28 @@
+{
+  "version": 1,
+  "dependencies": {
+    "net10.0": {
+      "Microsoft.NET.ILLink.Tasks": {
+        "type": "Direct",
+        "requested": "[10.0.14, )",
+        "resolved": "10.0.14",
+        "contentHash": "YlTamXppEQls6DYWt7RdUuwWDb0lyw/vXCaGeQpLCpsLmfwGuCkOz/vIGgMTV7ECsJcavkCOkxZXv9s8rdAHkQ=="
+      },
+      "Tmds.DBus.Generator": {
+        "type": "Direct",
+        "requested": "[0.94.2, )",
+        "resolved": "0.94.2",
+        "contentHash": "xTa/0OhUvZo/fI3BctvqF0O9AdCRtUCegf/ApQwQI1TDnskj8WhHnYw0sLO9opQzPyFBiaSkpFZpP/gnfNfvvg=="
+      },
+      "Tmds.DBus.Protocol": {
+        "type": "Direct",
+        "requested": "[0.94.2, )",
+        "resolved": "0.94.2",
+        "contentHash": "AePc2k7vqIXCR/a6hsG4afO22LuSaGLR3tLUBPWkZAH2mhLu/PL3/dYABEniWV7QHzV444No8IiTRV4+oCq37g=="
+      },
+      "Aprillz.MewUI.Core": {
+        "type": "Project"
+      }
+    }
+  }
+}

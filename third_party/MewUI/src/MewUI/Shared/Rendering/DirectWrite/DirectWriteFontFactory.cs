@@ -1,0 +1,185 @@
+using Aprillz.MewUI.Native;
+using Aprillz.MewUI.Native.Com;
+using Aprillz.MewUI.Native.DirectWrite;
+using Aprillz.MewUI.Resources;
+using Aprillz.MewUI.Text;
+
+namespace Aprillz.MewUI.Rendering.DirectWrite;
+
+/// <summary>
+/// Owns the DirectWrite factory and the font family resolution shared by every backend that
+/// creates <see cref="DirectWriteFont"/>. Holds no rendering state, so a backend can use it
+/// without taking on Direct2D.
+/// </summary>
+internal sealed unsafe class DirectWriteFontFactory : IDisposable
+{
+    private nint _factory;
+    private bool _disposed;
+
+    // Cache: family name to a DirectWrite custom font collection built from a registered file.
+    private readonly Dictionary<string, nint> _privateFontCollections = new(StringComparer.OrdinalIgnoreCase);
+
+    /// <summary>The shared <c>IDWriteFactory</c>, created on first access. Never 0 once returned.</summary>
+    internal nint Factory
+    {
+        get
+        {
+            ObjectDisposedException.ThrowIf(_disposed, this);
+            if (_factory == 0)
+            {
+                int hr = Native.DirectWrite.DWrite.DWriteCreateFactory(
+                    DWRITE_FACTORY_TYPE.SHARED, Native.DirectWrite.DWrite.IID_IDWriteFactory, out _factory);
+                if (hr < 0 || _factory == 0)
+                {
+                    throw new InvalidOperationException($"DWriteCreateFactory failed: 0x{hr:X8}");
+                }
+            }
+
+            return _factory;
+        }
+    }
+
+    internal DirectWriteFont CreateFont(string family, double size, FontWeight weight,
+        bool italic, bool underline, bool strikethrough, uint dpi = 96, bool gridFitMetrics = false)
+    {
+        var (primary, listed) = SelectFamilyCandidates(ValidateFamilyName(family));
+        var (resolvedFamily, fontCollection) = ResolveWithCollection(primary);
+        return new DirectWriteFont(resolvedFamily, size, weight, italic, underline, strikethrough,
+            Factory, fontCollection, dpi, gridFitMetrics)
+        {
+            ListedFallbacks = [.. listed.Select(name => ResolveWithCollection(name)).Select(resolved => new ListedFontFamily(resolved.Family, resolved.FontCollection))],
+        };
+    }
+
+    /// <summary>
+    /// Picks the first installed family from a comma-separated list to draw with, and the installed families after
+    /// it to supply what it lacks. A single name, or a list with none installed, draws with its first name.
+    /// </summary>
+    internal (string Primary, string[] Listed) SelectFamilyCandidates(string family)
+    {
+        if (!FontFamilyList.IsList(family))
+        {
+            return (family, []);
+        }
+
+        string[] candidates = FontFamilyList.Split(family);
+        var installed = candidates.Where(candidate => FontRegistry.Resolve(candidate) != null || IsSystemFamilyInstalled(candidate)).ToArray();
+        if (installed.Length == 0)
+        {
+            return (candidates.Length > 0 ? candidates[0] : family, []);
+        }
+
+        return (installed[0], installed[1..]);
+    }
+
+    internal static string ValidateFamilyName(string? family)
+    {
+        if (string.IsNullOrWhiteSpace(family))
+        {
+            throw new ArgumentException("Font family must be provided by the caller.", nameof(family));
+        }
+
+        return family.Trim();
+    }
+
+    /// <summary>Forces DirectWrite to re-read the system font set, picking up newly installed families.</summary>
+    internal void RefreshSystemFontCollection()
+    {
+        int hr = DWriteVTable.GetSystemFontCollection((IDWriteFactory*)Factory, out var collection, checkForUpdates: true);
+        if (hr >= 0 && collection != 0)
+        {
+            ComHelpers.Release(collection);
+        }
+    }
+
+    internal (string Family, nint FontCollection) ResolveWithCollection(string familyOrPath)
+    {
+        familyOrPath = ValidateFamilyName(familyOrPath);
+        var resolved = FontRegistry.Resolve(familyOrPath);
+        if (resolved != null)
+        {
+            // The GDI text path may still be the one that draws this font, and its family lookup
+            // only sees files that were registered with GDI.
+            // MewStage vendor patch text/0003: every face of the family, so DirectWrite (and GDI) match the weight and style
+            // among them; with one file the family had one face.
+            var files = FontRegistry.ResolveFiles(resolved.Value.FamilyName);
+            if (OperatingSystem.IsWindows())
+            {
+                foreach (var file in files)
+                {
+                    Win32Fonts.EnsurePrivateFontFamily(file);
+                }
+            }
+
+            var fontCollection = GetOrCreatePrivateCollection(resolved.Value.FamilyName, files);
+            return (resolved.Value.FamilyName, fontCollection);
+        }
+
+        if (OperatingSystem.IsWindows() && FontResources.LooksLikeFontFilePath(familyOrPath))
+        {
+            var path = Path.GetFullPath(familyOrPath);
+            Win32Fonts.EnsurePrivateFontFamily(path);
+            var family = FontResources.TryGetParsedFamilyName(path, out var parsed) && !string.IsNullOrWhiteSpace(parsed)
+                ? parsed
+                : Path.GetFileNameWithoutExtension(path);
+            var fontCollection = GetOrCreatePrivateCollection(family, [path]);
+            return (family, fontCollection);
+        }
+
+        return (familyOrPath, 0);
+    }
+
+    private bool IsSystemFamilyInstalled(string family)
+    {
+        if (DWriteVTable.GetSystemFontCollection((IDWriteFactory*)Factory, out nint collection, false) < 0 || collection == 0)
+        {
+            return false;
+        }
+
+        try
+        {
+            return DWriteVTable.FindFamilyName(collection, family, out _, out int exists) >= 0 && exists != 0;
+        }
+        finally
+        {
+            ComHelpers.Release(collection);
+        }
+    }
+
+    private nint GetOrCreatePrivateCollection(string familyName, IReadOnlyList<string> filePaths)
+    {
+        // MewStage vendor patch text/0003: keyed by the family AND its file count, so a face registered after the family's
+        // first use gets a collection that includes it (the earlier one stays owned here until Dispose).
+        string key = familyName + "|" + filePaths.Count.ToString(System.Globalization.CultureInfo.InvariantCulture);
+        if (_privateFontCollections.TryGetValue(key, out var cached))
+        {
+            return cached;
+        }
+
+        var collection = DWritePrivateFontCollection.CreateCollection((IDWriteFactory*)Factory, [.. filePaths]);
+        if (collection != 0)
+        {
+            _privateFontCollections[key] = collection;
+        }
+
+        return collection;
+    }
+
+    public void Dispose()
+    {
+        if (_disposed)
+        {
+            return;
+        }
+
+        _disposed = true;
+        foreach (var collection in _privateFontCollections.Values)
+        {
+            ComHelpers.Release(collection);
+        }
+        _privateFontCollections.Clear();
+
+        ComHelpers.Release(_factory);
+        _factory = 0;
+    }
+}

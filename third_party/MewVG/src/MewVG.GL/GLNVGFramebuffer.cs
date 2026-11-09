@@ -1,0 +1,84 @@
+// OpenGL framebuffer utilities (ported from nanovg_gl_utils.h)
+
+namespace Aprillz.MewVG;
+
+internal sealed class GLNVGFramebuffer : IDisposable
+{
+    private int _defaultFbo = -1;
+
+    private readonly MewVGGL _ctx;
+    private bool _disposed;
+
+    public int Framebuffer { get; private set; }
+
+    public int Texture { get; private set; }
+
+    public int Image { get; private set; }
+
+    private GLNVGFramebuffer(MewVGGL ctx)
+    {
+        _ctx = ctx;
+    }
+
+    public static GLNVGFramebuffer? Create(MewVGGL ctx, int width, int height, MewVGImageFlags imageFlags)
+    {
+        GL.EnsureLoaded();
+        var fb = new GLNVGFramebuffer(ctx);
+
+        var defaultFbo = GL.GetInteger(GetPName.FramebufferBinding);
+
+        fb.Image = ctx.CreateImageRGBA(width, height, imageFlags | MewVGImageFlags.FlipY | MewVGImageFlags.Premultiplied, ReadOnlySpan<byte>.Empty);
+        fb.Texture = ctx.ImageHandle(fb.Image);
+
+        fb.Framebuffer = GL.GenFramebuffer();
+        GL.BindFramebuffer(FramebufferTarget.Framebuffer, fb.Framebuffer);
+
+        GL.FramebufferTexture2D(FramebufferTarget.Framebuffer, FramebufferAttachment.ColorAttachment0, TextureTarget.Texture2D, fb.Texture, 0);
+
+        var status = GL.CheckFramebufferStatus(FramebufferTarget.Framebuffer);
+        if (status != FramebufferErrorCode.FramebufferComplete)
+        {
+            GL.BindFramebuffer(FramebufferTarget.Framebuffer, defaultFbo);
+            fb.Dispose();
+            return null;
+        }
+
+        GL.BindFramebuffer(FramebufferTarget.Framebuffer, defaultFbo);
+        return fb;
+    }
+
+    public void Bind()
+    {
+        GL.EnsureLoaded();
+        if (_defaultFbo == -1)
+        {
+            _defaultFbo = GL.GetInteger(GetPName.FramebufferBinding);
+        }
+
+        GL.BindFramebuffer(FramebufferTarget.Framebuffer, Framebuffer != 0 ? Framebuffer : _defaultFbo);
+    }
+
+    public void Dispose()
+    {
+        if (_disposed)
+        {
+            return;
+        }
+
+        _disposed = true;
+
+        if (Framebuffer != 0)
+        {
+            GL.DeleteFramebuffer(Framebuffer);
+        }
+
+        if (Image > 0)
+        {
+            _ctx.DeleteImage(Image);
+        }
+
+        Framebuffer = 0;
+        Texture = 0;
+        Image = -1;
+    }
+}

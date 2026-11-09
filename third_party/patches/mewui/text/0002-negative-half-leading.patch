@@ -1,0 +1,22 @@
+MewStage vendor patch text/0002 (third_party/NOTICE): the half-leading of a line box may be negative, as in CSS. A
+paragraph LineHeight below the text's own height (a display face at line-height .85) now centres the text on the
+line box with equal overhang; clamping at zero pushed it down by half the difference. Without a paragraph
+LineHeight the line box is never smaller than the text, so default layout is unchanged.
+
+--- a/Text/ManagedTextEngine.cs
++++ b/Text/ManagedTextEngine.cs
+@@ -337,9 +337,13 @@
+     /// Splits the room a line box has beyond the text's own ascent and descent evenly above and below it,
+     /// the way a CSS line box does. Given to the descent side alone, a font with line gap - or a line
+     /// height the paragraph set - holds its text against the top of the box.
++    /// MewStage vendor patch text/0002: the half-leading may be negative, as in CSS. A paragraph line height below the
++    /// text's own height (a display face at line-height .85) centres the text on the line box and lets its
++    /// ascent and descent overhang it equally; clamping at zero pushed the text down by half the difference.
++    /// Without a paragraph line height the line box is at least the text's height, so nothing changes there.
+     /// </summary>
+     private static double ApplyHalfLeading(double baseline, double lineHeight, double textHeight)
+-        => baseline + (Math.Max(0, lineHeight - textHeight) / 2);
++        => baseline + ((lineHeight - textHeight) / 2);
+ 
+     private double ResolveLineCapHeight(
+         ManagedTextLine line,

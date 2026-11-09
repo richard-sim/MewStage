@@ -1,0 +1,370 @@
+using System.Collections.Concurrent;
+
+using Aprillz.MewUI.Platform;
+using Aprillz.MewUI.Rendering.Filters;
+using Aprillz.MewUI.Resources;
+using Aprillz.MewUI.Text;
+
+namespace Aprillz.MewUI.Rendering.MewVG;
+
+#if MEWUI_MEWVG_MACOS
+public sealed partial class MewVGMacOSGraphicsFactory
+
+#elif MEWUI_MEWVG_X11
+public sealed partial class MewVGX11GraphicsFactory 
+
+#else
+public sealed partial class MewVGWin32GraphicsFactory 
+#endif
+    : IGraphicsFactory, ITextBackendFactory, IRenderDevice, IGpuInteropInvalidationSource, IWindowResourceReleaser, IWindowSurfacePresenter,
+      IBackendRenderCacheMaintenance
+{
+    public event EventHandler<GpuInteropInvalidatedEventArgs>? GpuInteropInvalidated;
+
+    public ITextEngine TextEngine => TextServices.GetEngine(this);
+
+    internal void RaiseGpuInteropInvalidated(GpuInteropInvalidatedEventArgs e)
+    {
+        unchecked { _renderDeviceGeneration++; }
+        _renderResourceCache.Maintain(RenderCacheMaintenanceMode.DeviceLost);
+        GpuInteropInvalidated?.Invoke(this, e);
+    }
+
+
+#if MEWUI_MEWVG_MACOS
+    internal MewVGMacOSGraphicsFactory() { }
+#elif MEWUI_MEWVG_X11
+    internal MewVGX11GraphicsFactory() { }
+#else
+    internal MewVGWin32GraphicsFactory() { }
+#endif
+
+    private readonly ConcurrentDictionary<nint, IDisposable> _windows = new();
+    private readonly RenderResourceCache _renderResourceCache = new();
+    private readonly ulong _renderDeviceId = RenderDeviceIdentity.AllocateDeviceId();
+    private uint _renderDeviceGeneration;
+
+    public RenderDeviceIdentity RenderIdentity => new(_renderDeviceId, _renderDeviceGeneration);
+
+
+    /// <summary>
+    /// When <see langword="true"/>, CPU pixel sources (<see cref="IPixelBufferSource"/>) are
+    /// uploaded to GL textures via a Pixel Buffer Object ring + fence sync instead of a
+    /// blocking <c>glTexImage2D</c>. The upload becomes async DMA so the producer thread
+    /// returns immediately; the next sample waits on the fence to ensure the upload landed.
+    /// <para/>
+    /// Tradeoffs:
+    /// <list type="bullet">
+    ///   <item>+ frees the producer thread (no GPU stall on upload)</item>
+    ///   <item>+ smoother frame pacing for animated CPU sources (plasma, charts, color picker)</item>
+    ///   <item>– 1 frame of latency between version bump and on-screen update (double-PBO ring)</item>
+    ///   <item>– per-image PBO allocation (small fixed GPU memory overhead)</item>
+    /// </list>
+    /// Default <see langword="false"/> while the implementation lands; flip to true after
+    /// jitter measurement on representative workloads.
+    /// </summary>
+    /// <remarks>
+    /// Internal - exposed only to MewUI.dll callers (<c>MewVGImage</c>) and test surface.
+    /// Public callers should not depend on this knob; if a stable opt-in is needed it
+    /// will go through <c>IGraphicsFactory</c> as a versioned option.
+    /// </remarks>
+    internal bool UseAsyncPboUpload { get; set; } = true;
+
+    public IFont CreateFont(string family, double size, FontWeight weight = FontWeight.Normal,
+        bool italic = false, bool underline = false, bool strikethrough = false)
+        => CreateFontCore(family, size, weight, italic, underline, strikethrough);
+
+    public IFont CreateFont(string family, double size, uint dpi, FontWeight weight = FontWeight.Normal,
+        bool italic = false, bool underline = false, bool strikethrough = false)
+        => CreateFontCore(family, size, dpi, weight, italic, underline, strikethrough);
+
+    private partial IFont CreateFontCore(string family, double size, FontWeight weight, bool italic, bool underline, bool strikethrough);
+
+    private partial IFont CreateFontCore(string family, double size, uint dpi, FontWeight weight, bool italic, bool underline, bool strikethrough);
+
+    public IImage CreateImageView(IPixelBufferSource source)
+    {
+        if (UseAsyncPboUpload && QualifiesForPboUpload(source))
+        {
+            IImage? asyncImage = null;
+            TryCreateAsyncUploadImage(source, ref asyncImage);
+            if (asyncImage is not null) return asyncImage;
+        }
+
+        return new MewVGImage(source, GetImageDisposeHandler());
+    }
+
+    /// <summary>
+    /// Platform hook for the async (PBO+fence) upload variant. GL-backed builds
+    /// (Win32, X11) wrap the source as a <c>PboFenceUploader</c>-backed external
+    /// texture; Metal builds leave the parameter unset and the caller falls back
+    /// to the default sync upload path. Failure is silent (no exception bubbles
+    /// out) - async is a performance opt-in, never required for correctness.
+    /// </summary>
+    partial void TryCreateAsyncUploadImage(IPixelBufferSource source, ref IImage? image);
+
+    /// <summary>
+    /// Routes to async PBO upload only when the producer explicitly flags itself as
+    /// streaming. Static sources (file-decoded PNG, opaque <c>WriteableBitmap</c> drawn
+    /// once) stay on the sync path so <see cref="ImageScaleQuality.HighQuality"/> can
+    /// emit mipmaps. Readback sources skip PBO because the lock-time sync barrier
+    /// already dominates.
+    /// </summary>
+    private static bool QualifiesForPboUpload(IPixelBufferSource source)
+    {
+        if (!source.IsStreaming) return false;
+        if (source.LockMode == LockMode.Readback) return false;
+        return true;
+    }
+
+    private IImage CreateExternalRasterImage(IExternalRasterSource source)
+        => new MewVGExternalRasterImage(source);
+
+    public IImageFilterExecutor CreateImageFilterExecutor()
+    {
+        IImageFilterExecutor? executor = null;
+        TryCreateImageFilterExecutor(ref executor);
+        return executor ?? new CpuImageFilterExecutor();
+    }
+
+    /// <summary>
+    /// Per-platform hook to install a backend-specific filter executor (e.g. OpenGL shaders
+    /// on Win32/X11, Metal on macOS). Leave <paramref name="executor"/> null to fall back to
+    /// the CPU reference implementation.
+    /// </summary>
+    partial void TryCreateImageFilterExecutor(ref IImageFilterExecutor? executor);
+
+    private Action<MewVGImage>? GetImageDisposeHandler()
+    {
+        Action<MewVGImage>? handler = null;
+        TryGetImageDisposeHandler(ref handler);
+        return handler;
+    }
+
+    public IGraphicsContext CreateContext(IRenderTarget target)
+    {
+        ArgumentNullException.ThrowIfNull(target);
+
+        if (target is IRenderSurface surface)
+        {
+            target = RenderSurfaceResource.ResolveBackendSurface(surface);
+        }
+
+        if (target is WindowRenderTarget windowTarget)
+        {
+            return CreateContextCore(windowTarget);
+        }
+
+        IGraphicsContext? context = null;
+        bool handled = false;
+        TryCreateContextForTarget(target, ref handled, ref context);
+        if (handled && context != null)
+        {
+            return context;
+        }
+
+        throw new NotSupportedException($"Unsupported render target type: {target.GetType().Name}");
+    }
+
+    partial void TryCreateContextForTarget(IRenderTarget target, ref bool handled, ref IGraphicsContext? context);
+
+    private IGraphicsContext CreateContextCore(WindowRenderTarget target)
+    {
+        var surface = target.Surface;
+        if (surface == null)
+        {
+            throw new ArgumentException("Invalid window surface.");
+        }
+
+        var handle = surface.Handle;
+        if (handle == 0)
+        {
+            throw new ArgumentException("Invalid window surface handles.");
+        }
+
+        var resources = _windows.GetOrAdd(handle, _ => CreateWindowResources(surface));
+        return CreateContextCore(target, resources);
+    }
+
+    ITextBackendMeasurementContext ITextBackendFactory.CreateTextMeasurementContext(uint dpi)
+        => CreateMeasurementContextCore(dpi);
+
+    private IRenderSurface CreatePixelSurface(int pixelWidth, int pixelHeight, double dpiScale, bool hasAlpha)
+    {
+        IRenderSurface? rt = null;
+        bool handled = false;
+        TryCreatePixelSurface(pixelWidth, pixelHeight, dpiScale, hasAlpha, ref handled, ref rt);
+        if (handled && rt != null)
+        {
+            return rt;
+        }
+
+        throw new NotSupportedException("MewVG backend does not support pixel render surfaces on this platform.");
+    }
+
+    public IRenderResourceCache? ResourceCache => _renderResourceCache;
+
+    public IRenderEffectDevice? Effects => null;
+
+    public IRenderSurface CreateSurface(RenderSurfaceDescriptor descriptor)
+    {
+        var surface = CreatePixelSurface(
+            descriptor.PixelWidth,
+            descriptor.PixelHeight,
+            descriptor.DpiScale,
+            descriptor.RequiredCapabilities.HasFlag(SurfaceCapabilities.Alpha));
+        ConfigureDescribedSurface(surface, descriptor);
+        return surface;
+    }
+
+    /// <summary>Lets a platform tune a surface to what its descriptor says it is for.</summary>
+    partial void ConfigureDescribedSurface(IRenderSurface surface, RenderSurfaceDescriptor descriptor);
+
+    public IGraphicsContext CreateContext(IRenderSurface surface)
+    {
+        surface = RenderSurfaceResource.ResolveBackendSurface(surface);
+        return surface.Capabilities.HasFlag(SurfaceCapabilities.Renderable)
+            ? CreateContext((IRenderTarget)surface)
+            : throw new NotSupportedException(
+                $"{GetType().Name} can only create contexts for renderable surfaces.");
+    }
+
+    public IImage CreateImageView(IRenderSurface surface)
+    {
+        int logicalWidth = surface.PixelWidth;
+        int logicalHeight = surface.PixelHeight;
+        surface = RenderSurfaceResource.ResolveBackendSurface(surface);
+        var image = surface is IPixelBufferSource pixelSource
+            ? CreateImageView(pixelSource)
+            : throw new NotSupportedException(
+                $"{GetType().Name} can only create image views for pixel-backed surfaces.");
+        // A recorded frame outlives the owner that made this view, so the surface release waits for
+        // the last view instead of freeing the pixels the tree still draws.
+        if (surface is IRetainableSurface retainableSurface)
+        {
+            image = ImageResource.WrapSurfaceView(image, retainableSurface);
+        }
+        return ImageResource.WrapLogical(image, logicalWidth, logicalHeight);
+    }
+
+    public IImage CreateImageView(IExternalRasterSource source)
+        => CreateExternalRasterImage(source);
+
+    public bool TryReadPixels(IRenderSurface source, Span<byte> destination, int destinationStrideBytes)
+        => RenderDeviceFactoryHelpers.TryReadPixels(source, destination, destinationStrideBytes);
+
+    public IRenderOperation RequestReadback(IRenderSurface source)
+        => RenderDeviceFactoryHelpers.RequestReadback(source);
+
+    public IRenderOperation FlushAsyncWork() => RenderOperation.Completed;
+
+    void IBackendRenderCacheMaintenance.TrimBackendCaches(RenderCacheTrimReason reason)
+    {
+#if MEWUI_MEWVG_MACOS
+        MewVGMacOSGraphicsContext.TrimSharedGeometryCache();
+#elif MEWUI_MEWVG_X11
+        MewVGX11GraphicsContext.TrimSharedGeometryCache();
+#else
+        MewVGWin32GraphicsContext.TrimSharedGeometryCache();
+#endif
+
+        foreach (var resources in _windows.Values)
+        {
+            if (resources is IMewVGWindowCacheMaintenance maintenance)
+            {
+                maintenance.TrimCaches();
+            }
+        }
+    }
+
+    void IBackendRenderCacheMaintenance.MaintainBackendCaches(RenderCacheMaintenanceMode mode)
+    {
+        if (mode is RenderCacheMaintenanceMode.MemoryPressure
+            or RenderCacheMaintenanceMode.WindowClosed
+            or RenderCacheMaintenanceMode.DeviceLost
+            or RenderCacheMaintenanceMode.Shutdown)
+        {
+            ((IBackendRenderCacheMaintenance)this).TrimBackendCaches(
+                mode == RenderCacheMaintenanceMode.DeviceLost
+                    ? RenderCacheTrimReason.DeviceLost
+                    : mode == RenderCacheMaintenanceMode.MemoryPressure
+                        ? RenderCacheTrimReason.MemoryPressure
+                        : RenderCacheTrimReason.Manual);
+        }
+    }
+
+    public void Dispose()
+    {
+        ImageSource.RetireRealizationsForFactory(this);
+        TextServices.ReleaseIfCreated(this);
+        _renderResourceCache.Dispose();
+
+        foreach (var (_, resources) in _windows)
+            resources.Dispose();
+        _windows.Clear();
+        DisposePlatformResources();
+    }
+
+    public void ReleaseWindowResources(nint windowHandle)
+    {
+        if (windowHandle == 0)
+        {
+            return;
+        }
+
+        if (_windows.TryRemove(windowHandle, out var resources))
+        {
+            resources.Dispose();
+        }
+
+        TryReleaseWindowResources(windowHandle);
+    }
+
+    private partial IDisposable CreateWindowResources(IWindowSurface surface);
+
+    private partial IGraphicsContext CreateContextCore(WindowRenderTarget target, IDisposable resources);
+
+    private partial ITextBackendMeasurementContext CreateMeasurementContextCore(uint dpi);
+
+    partial void TryReleaseWindowResources(nint hwnd);
+
+    partial void TryCreatePixelSurface(int pixelWidth, int pixelHeight, double dpiScale, bool hasAlpha, ref bool handled, ref IRenderSurface? renderTarget);
+
+    partial void TryGetImageDisposeHandler(ref Action<MewVGImage>? handler);
+
+    partial void DisposePlatformResources();
+
+    public bool Present(Window window, IWindowSurface surface, double opacity)
+    {
+        bool handled = false;
+        bool result = false;
+        TryPresentWindowSurface(window, surface, opacity, ref handled, ref result);
+        return handled && result;
+    }
+
+    partial void TryPresentWindowSurface(Window window, IWindowSurface surface, double opacity, ref bool handled, ref bool result);
+
+    /// <summary>
+    /// Activates the platform-specific worker rendering context on the calling thread
+    /// (Win32/X11: shared GL HGLRC; macOS Metal: no-op since MTLDevice is thread-free).
+    /// Returns an <see cref="IDisposable"/> that releases the activation when disposed.
+    /// Required wrapper for any worker thread that intends to call <see cref="IRenderDevice.CreateSurface"/>
+    /// or <see cref="IRenderDevice.CreateContext(IRenderSurface)"/>.
+    /// </summary>
+    public IDisposable AcquireBackgroundRenderScope() => AcquireBackgroundRenderScopeCore();
+
+    private partial IDisposable AcquireBackgroundRenderScopeCore();
+}
+
+/// <summary>Returned from backends whose <see cref="IGraphicsFactory.AcquireBackgroundRenderScope"/>
+/// has nothing per-thread to manage (D2D MULTI_THREADED, Metal, CPU/GDI).</summary>
+internal sealed class MewVGNoOpRenderScope : IDisposable
+{
+    public static readonly MewVGNoOpRenderScope Instance = new();
+    public void Dispose() { }
+}
+
+internal interface IMewVGWindowCacheMaintenance
+{
+    void TrimCaches();
+}

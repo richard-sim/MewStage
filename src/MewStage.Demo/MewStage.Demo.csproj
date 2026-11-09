@@ -1,0 +1,84 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!--
+    Tier 4. The executable: the start page and the three modes (Overlay, Workbench, Kit), the demo's controls, styles
+    and view models. It runs JIT in development, where MewUI's DevTools and Hot Reload need dynamic code, and
+    publishes NativeAOT with
+      dotnet publish src/MewStage.Demo -c Release -r win-x64 -p:PublishAot=true
+    (docs/architecture.md, "AOT").
+  -->
+
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <RootNamespace>MewStage.Demo</RootNamespace>
+    <AssemblyName>MewStage.Demo</AssemblyName>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <ApplicationIcon></ApplicationIcon>
+    <RollForward>LatestMajor</RollForward>
+  </PropertyGroup>
+
+  <!-- NativeAOT publish settings, applied only when PublishAot is requested on the command line. -->
+  <PropertyGroup Condition="'$(PublishAot)' == 'true'">
+    <TrimMode>full</TrimMode>
+    <OptimizationPreference>Speed</OptimizationPreference>
+    <StripSymbols>false</StripSymbols>
+    <!-- Two NuGet packages are not trim / AOT annotated and the ILCompiler reports them: SharpGen.Runtime (under
+         Vortice, the DX12 bindings) rolls up to IL2104, Silk.NET.Core (the Vulkan bindings) to IL3053. Those two
+         roll-up codes are silenced; the individual findings under Silk.NET stay VISIBLE as warnings instead of
+         errors: IL3000 / IL3002 are its DefaultPathResolver reading Assembly.Location and the deps.json, which a
+         single-file app cannot do. Harmless here: the Vulkan loader is found through the OS and AppContext.
+         BaseDirectory, the deps-based lookup returns null and falls back. Every other IL code is still an error. -->
+    <NoWarn>$(NoWarn);IL2104;IL3053</NoWarn>
+    <WarningsNotAsErrors>$(WarningsNotAsErrors);IL3000;IL3002</WarningsNotAsErrors>
+    <PublishReferencesDocumentationFiles>false</PublishReferencesDocumentationFiles>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <InternalsVisibleTo Include="MewStage.Demo.Tests" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\MewStage.Graphics\MewStage.Graphics.csproj" />
+    <ProjectReference Include="..\MewStage.Rendering\MewStage.Rendering.csproj" />
+    <ProjectReference Include="..\MewStage.Input\MewStage.Input.csproj" />
+    <ProjectReference Include="..\MewStage.Ui.Navigation\MewStage.Ui.Navigation.csproj" />
+    <ProjectReference Include="..\MewStage.Ui.Backend\MewStage.Ui.Backend.csproj" />
+    <ProjectReference Include="..\MewStage.Scene\MewStage.Scene.csproj" />
+    <ProjectReference Include="..\MewStage.Viewport\MewStage.Viewport.csproj" />
+    <ProjectReference Include="..\MewStage.Host\MewStage.Host.csproj" />
+    <ProjectReference Include="..\..\third_party\MewUI\src\MewUI\MewUI.csproj" />
+    <ProjectReference Include="..\..\third_party\MewUI\src\MewUI.Platform.Win32\MewUI.Platform.Win32.csproj" />
+    <ProjectReference Include="..\..\third_party\MewUI\src\MewUI.Platform.X11\MewUI.Platform.X11.csproj" />
+    <ProjectReference Include="..\..\third_party\MewUI\src\MewUI.Backend.MewVG.Win32\MewUI.Backend.MewVG.Win32.csproj" />
+    <ProjectReference Include="..\..\third_party\MewUI\src\MewUI.Backend.MewVG.X11\MewUI.Backend.MewVG.X11.csproj" />
+    <ProjectReference Include="..\..\third_party\MewUI\src\MewUI.Preview\MewUI.Preview.csproj" />
+    <ProjectReference Include="..\..\third_party\MewUI\extensions\MewUI.MewDock\MewUI.MewDock.csproj" />
+    <ProjectReference Include="..\..\third_party\MewUI\extensions\MewUI.Svg\MewUI.Svg.csproj" />
+    <ProjectReference Include="..\..\third_party\MewUI\extensions\MewUI.Geometry\MewUI.Geometry.csproj" />
+    <!-- MewCharts compiles LiveCharts2's engine from source with LiveCharts2's own source generator, and upstream's
+         csproj drops that generator when PublishAot is true (the global property reaches every referenced project
+         in a publish). Without it the partial MotionProperty members have no implementation and the build fails,
+         so the publish property is kept out of this one reference: the library builds as it does for a JIT run and
+         the ILCompiler then compiles it like every other assembly (docs/architecture.md, "AOT"). -->
+    <ProjectReference Include="..\..\third_party\MewUI\extensions\MewUI.MewCharts\MewUI.MewCharts.csproj" GlobalPropertiesToRemove="PublishAot" />
+  </ItemGroup>
+
+  <!-- A publish folder is self-contained: the whole of assets/ (fonts, icons, the cooked shaders; the .hlsl sources
+       and the manifest are small and travel too) is copied to <publish>/assets, which AssetPaths treats as the
+       packaged root. A build copies nothing: dotnet run finds the repository's assets by walking up. -->
+  <Target Name="MewStagePublishAssets" AfterTargets="Publish">
+    <ItemGroup>
+      <_MewStageAsset Include="$(MSBuildThisFileDirectory)..\..\assets\**\*" />
+    </ItemGroup>
+    <Copy SourceFiles="@(_MewStageAsset)" DestinationFiles="@(_MewStageAsset->'$(PublishDir)assets\%(RecursiveDir)%(Filename)%(Extension)')" SkipUnchangedFiles="true" />
+    <Message Importance="high" Text="MewStage: copied @(_MewStageAsset->Count()) asset files to $(PublishDir)assets" />
+  </Target>
+
+  <!-- MewUI consumer wiring (binding generator + feature switches): third_party/MewUI.Consumer.targets. Tool = upstream
+       defaults, so DevTools are on in Debug JIT builds. -->
+  <PropertyGroup>
+    <MewStageUiHost>Tool</MewStageUiHost>
+  </PropertyGroup>
+  <Import Project="$(MSBuildThisFileDirectory)..\..\third_party\MewUI.Consumer.targets" />
+
+</Project>

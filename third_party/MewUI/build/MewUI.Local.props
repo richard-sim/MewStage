@@ -1,0 +1,11 @@
+<Project>
+  <!-- MewStage-authored; preserved by tools/vendor.py (never overwritten). This is upstream's own local-override
+       hook: build/MewUI.Common.props imports it BEFORE it sets TargetFrameworks.
+       * net10.0 only: MewStage builds one framework (the root Directory.Build.props), not upstream's net8.0;net10.0.
+       * MewVGProjectPath: the MewVG backends then take ProjectReferences to the vendored MewVG tree instead of
+         PackageReferences to the Aprillz.MewVG.* packages. -->
+  <PropertyGroup>
+    <MewUITargetFrameworks>net10.0</MewUITargetFrameworks>
+    <MewVGProjectPath>$(MSBuildThisFileDirectory)..\..\MewVG</MewVGProjectPath>
+  </PropertyGroup>
+</Project>

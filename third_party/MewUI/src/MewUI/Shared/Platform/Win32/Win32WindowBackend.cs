@@ -1,0 +1,3329 @@
+using System.Buffers;
+using System.Runtime.InteropServices;
+using System.Text;
+
+using Aprillz.MewUI.Diagnostics;
+using Aprillz.MewUI.Input;
+using Aprillz.MewUI.Native;
+using Aprillz.MewUI.Native.Constants;
+using Aprillz.MewUI.Native.Structs;
+using Aprillz.MewUI.Resources;
+
+namespace Aprillz.MewUI.Platform.Win32;
+
+internal sealed class Win32WindowBackend : IWindowBackend
+{
+    private static readonly EnvDebugLogger ImeLogger = new("MEWUI_IME_DEBUG", "[Win32][IME]");
+    private const int GwlHwndParent = -8;
+    private static readonly object HiddenTaskbarOwnerLock = new();
+    private static nint s_hiddenTaskbarOwner;
+
+    private readonly Win32PlatformHost _host;
+
+    internal Window Window { get; }
+
+    private readonly ClickCountTracker _clickCountTracker = new();
+    private readonly int[] _lastPressClickCounts = new int[5];
+    private nint _hIconSmall;
+    private nint _hIconBig;
+    private bool _initialEraseDone;
+    private bool _presented;
+    private double _opacity = 1.0;
+    private bool _allowsTransparency;
+    private nint _dropTargetCom;
+    private nint _nativeOwnerHandle;
+
+    private readonly TextInputSuppression _textInputSuppression = new();
+    private nint _savedImeContext;
+    private uint _savedConversion;
+    private uint _savedSentence;
+    private nint _currentCursor;
+    private bool _cursorHidden;
+    private bool _isTrackingMouseLeave;
+    private bool _isFullScreen;
+    private RECT _savedFullScreenRect;
+    private const uint MonitorDefaultToPrimary = 1;
+    private const uint MonitorDefaultToNearest = 2;
+
+    // Set while a DPI transition inside the OS move loop has left the loop's tracked rectangle a
+    // scale behind. The loop re-applies that rectangle after every mouse move, so a fit window
+    // stays at the old scale's size until the rectangle itself is corrected.
+    private bool _moveLoopRectIsStale;
+
+
+
+    internal bool NeedsRender { get; private set; }
+
+    public nint Handle { get; private set; }
+
+    private readonly Win32TitleBarThemeSynchronizer _titleBarThemeSync = new();
+
+    internal Win32WindowBackend(Win32PlatformHost host, Window window)
+    {
+        _host = host;
+        Window = window;
+        window.PlatformReportsLostFrames = true;
+    }
+
+    // SetWindowPos activates the target window unless SWP_NOACTIVATE is passed; a pure style/frame
+    // refresh must never activate (it would e.g. yank a non-activating popup to the foreground).
+    private const uint SWP_NOACTIVATE_ON_REFRESH = 0x0010;
+
+    public void SetResizable(bool resizable)
+    {
+        if (Handle == 0)
+        {
+            return;
+        }
+
+        ApplyResizeMode();
+
+        // Clamp the current window size if it violates the new constraints.
+        var ws = Window.WindowSize;
+        double curW = Window.Width;
+        double curH = Window.Height;
+        double clampedW = Math.Clamp(curW, ws.MinWidth, ws.MaxWidth);
+        double clampedH = Math.Clamp(curH, ws.MinHeight, ws.MaxHeight);
+        if (clampedW != curW || clampedH != curH)
+        {
+            SetClientSize(clampedW, clampedH);
+        }
+    }
+
+    public void CreateSurface()
+    {
+        if (Handle != 0)
+        {
+            return;
+        }
+
+        CreateWindow();
+    }
+
+    public void PresentSurface()
+    {
+        if (_presented)
+        {
+            User32.ShowWindow(Handle, ShowWindowCommands.SW_SHOW);
+            return;
+        }
+        _presented = true;
+
+        ApplyResolvedStartupPosition();
+
+        // No SW_* command maps to fullscreen. Apply the fullscreen geometry while the window is still
+        // hidden so the first paint is already full-screen (avoids a small-window-then-grow flash).
+        if (Window.WindowState == Controls.WindowState.FullScreen)
+        {
+            EnterFullScreen();
+        }
+
+        var showCmd = Window.IsNonActivatingSurface
+            // Non-activating surfaces must not take activation away from the owner window.
+            ? ShowWindowCommands.SW_SHOWNOACTIVATE
+            : Window.WindowState switch
+            {
+                Controls.WindowState.Maximized => ShowWindowCommands.SW_SHOWMAXIMIZED,
+                Controls.WindowState.Minimized => ShowWindowCommands.SW_SHOWMINIMIZED,
+                _ => ShowWindowCommands.SW_SHOW,
+            };
+
+        // Maximize/minimize set the window geometry as part of the reveal, so painting beforehand would
+        // paint at the wrong (restored) size. For those, reveal first then force a synchronous paint at
+        // the final size. Every other case paints while still hidden so the first on-screen frame is the
+        // fully-laid-out content (including Loaded-time changes) with no flash.
+        if (showCmd is ShowWindowCommands.SW_SHOWMAXIMIZED or ShowWindowCommands.SW_SHOWMINIMIZED)
+        {
+            User32.ShowWindow(Handle, showCmd);
+            User32.UpdateWindow(Handle);
+        }
+        else
+        {
+            RenderNow();
+            User32.ShowWindow(Handle, showCmd);
+        }
+    }
+
+    public void Hide()
+    {
+        if (Handle != 0)
+        {
+            User32.ShowWindow(Handle, ShowWindowCommands.SW_HIDE);
+        }
+    }
+
+    public void BeginDragMove()
+    {
+        if (Handle == 0) return;
+        User32.ReleaseCapture();
+        _ = User32.SendMessage(Handle, WindowMessages.WM_NCLBUTTONDOWN, (nint)2 /* HTCAPTION */, 0);
+    }
+
+    public void BeginDragResize(Controls.ResizeEdge edge)
+    {
+        if (Handle == 0) return;
+        int htCode = edge switch
+        {
+            Controls.ResizeEdge.Left => 10,        // HTLEFT
+            Controls.ResizeEdge.Right => 11,       // HTRIGHT
+            Controls.ResizeEdge.Top => 12,         // HTTOP
+            Controls.ResizeEdge.TopLeft => 13,     // HTTOPLEFT
+            Controls.ResizeEdge.TopRight => 14,    // HTTOPRIGHT
+            Controls.ResizeEdge.Bottom => 15,      // HTBOTTOM
+            Controls.ResizeEdge.BottomLeft => 16,  // HTBOTTOMLEFT
+            Controls.ResizeEdge.BottomRight => 17, // HTBOTTOMRIGHT
+            _ => 15,
+        };
+        User32.ReleaseCapture();
+        _ = User32.SendMessage(Handle, WindowMessages.WM_NCLBUTTONDOWN, (nint)htCode, 0);
+    }
+
+    public void SetWindowState(Controls.WindowState state)
+    {
+        if (Handle == 0) return;
+
+        if (state == Controls.WindowState.FullScreen)
+        {
+            EnterFullScreen();
+            return;
+        }
+
+        if (_isFullScreen)
+        {
+            ExitFullScreen();
+        }
+
+        var cmd = state switch
+        {
+            Controls.WindowState.Minimized => ShowWindowCommands.SW_MINIMIZE,
+            Controls.WindowState.Maximized => ShowWindowCommands.SW_MAXIMIZE,
+            _ => ShowWindowCommands.SW_RESTORE,
+        };
+        User32.ShowWindow(Handle, cmd);
+
+        // Transparent popup windows keep WS_THICKFRAME for native resize tracking, but
+        // WM_NCCALCSIZE removes the visible non-client frame. Restore saved bounds
+        // explicitly because WM_GETMINMAXINFO overrides the maximized bounds.
+        if (state == Controls.WindowState.Normal && _allowsTransparency)
+        {
+            var rb = Window.RestoreBounds;
+            if (rb.Width > 0 && rb.Height > 0)
+            {
+                SetPosition(rb.X, rb.Y);
+                SetClientSize(rb.Width, rb.Height);
+            }
+        }
+    }
+
+    public void SetBorderless(bool value)
+    {
+        if (Handle == 0) return;
+        // Borderless is read from Window.Borderless inside GetWindowStyle; recompute the native style.
+        ApplyWindowStyle();
+    }
+
+    // Reapplies the recomputed window style (preserving the visible bit) and forces a frame recalc.
+    // GWL_STYLE packs MewUI-owned frame/caption/resize bits together with bits MewUI does not own:
+    // WS_VISIBLE, the WS_MINIMIZE/WS_MAXIMIZE state bits, and any WS_CHILD an external host may set.
+    // Rewriting the whole word would clear those, so a restyle touches only the owned bits.
+    private const uint OWNED_STYLE_MASK =
+        WindowStyles.WS_POPUP | WindowStyles.WS_CAPTION | WindowStyles.WS_SYSMENU
+        | WindowStyles.WS_THICKFRAME | WindowStyles.WS_MINIMIZEBOX | WindowStyles.WS_MAXIMIZEBOX;
+
+    private void ReapplyOwnedStyle()
+    {
+        const int GWL_STYLE = -16;
+        const uint SWP_NOSIZE = 0x0001;
+        const uint SWP_NOMOVE = 0x0002;
+        const uint SWP_NOZORDER = 0x0004;
+        const uint SWP_FRAMECHANGED = 0x0020;
+
+        uint current = (uint)User32.GetWindowLongPtr(Handle, GWL_STYLE).ToInt64();
+        uint merged = (current & ~OWNED_STYLE_MASK) | (GetWindowStyle() & OWNED_STYLE_MASK);
+        User32.SetWindowLongPtr(Handle, GWL_STYLE, (nint)merged);
+        User32.SetWindowPos(Handle, 0, 0, 0, 0, 0, SWP_NOSIZE | SWP_NOMOVE | SWP_NOZORDER | SWP_FRAMECHANGED | SWP_NOACTIVATE_ON_REFRESH);
+    }
+
+    private void ApplyWindowStyle() => ReapplyOwnedStyle();
+
+    private void EnterFullScreen()
+    {
+        if (_isFullScreen) return;
+
+        User32.GetWindowRect(Handle, out _savedFullScreenRect);
+        _isFullScreen = true;
+        ApplyWindowStyle(); // GetWindowStyle now returns WS_POPUP
+
+        var monitor = User32.MonitorFromWindow(Handle, MonitorDefaultToNearest);
+        var mi = MONITORINFO.Create();
+        if (User32.GetMonitorInfo(monitor, ref mi))
+        {
+            // Cover the full monitor (rcMonitor), not the work area, so the taskbar is hidden.
+            var r = mi.rcMonitor;
+            const uint SWP_NOZORDER = 0x0004;
+            const uint SWP_FRAMECHANGED = 0x0020;
+            User32.SetWindowPos(Handle, 0, r.left, r.top, r.Width, r.Height, SWP_NOZORDER | SWP_FRAMECHANGED);
+        }
+    }
+
+    private void ExitFullScreen()
+    {
+        if (!_isFullScreen) return;
+
+        _isFullScreen = false;
+        ApplyWindowStyle(); // restore borderless or overlapped style per Window.Borderless
+
+        var r = _savedFullScreenRect;
+        const uint SWP_NOZORDER = 0x0004;
+        const uint SWP_FRAMECHANGED = 0x0020;
+        User32.SetWindowPos(Handle, 0, r.left, r.top, r.Width, r.Height, SWP_NOZORDER | SWP_FRAMECHANGED);
+    }
+
+    public void SetCanMinimize(bool value)
+    {
+        if (Handle == 0) return;
+
+        const int GWL_STYLE = -16;
+        const uint WS_MINIMIZEBOX = 0x00020000;
+        const uint SWP_NOSIZE = 0x0001;
+        const uint SWP_NOMOVE = 0x0002;
+        const uint SWP_NOZORDER = 0x0004;
+        const uint SWP_FRAMECHANGED = 0x0020;
+
+        uint style = (uint)User32.GetWindowLongPtr(Handle, GWL_STYLE).ToInt64();
+        style = value ? (style | WS_MINIMIZEBOX) : (style & ~WS_MINIMIZEBOX);
+        User32.SetWindowLongPtr(Handle, GWL_STYLE, (nint)style);
+        User32.SetWindowPos(Handle, 0, 0, 0, 0, 0, SWP_NOSIZE | SWP_NOMOVE | SWP_NOZORDER | SWP_FRAMECHANGED | SWP_NOACTIVATE_ON_REFRESH);
+    }
+
+    public void SetCanMaximize(bool value)
+    {
+        if (Handle == 0) return;
+
+        const int GWL_STYLE = -16;
+        const uint WS_MAXIMIZEBOX = 0x00010000;
+        const uint SWP_NOSIZE = 0x0001;
+        const uint SWP_NOMOVE = 0x0002;
+        const uint SWP_NOZORDER = 0x0004;
+        const uint SWP_FRAMECHANGED = 0x0020;
+
+        uint style = (uint)User32.GetWindowLongPtr(Handle, GWL_STYLE).ToInt64();
+        style = value ? (style | WS_MAXIMIZEBOX) : (style & ~WS_MAXIMIZEBOX);
+        User32.SetWindowLongPtr(Handle, GWL_STYLE, (nint)style);
+        User32.SetWindowPos(Handle, 0, 0, 0, 0, 0, SWP_NOSIZE | SWP_NOMOVE | SWP_NOZORDER | SWP_FRAMECHANGED | SWP_NOACTIVATE_ON_REFRESH);
+    }
+
+    public void SetTopmost(bool value)
+    {
+        if (Handle == 0) return;
+
+        const uint SWP_NOMOVE = 0x0002;
+        const uint SWP_NOSIZE = 0x0001;
+        const uint SWP_NOACTIVATE = 0x0010;
+
+        User32.SetWindowPos(Handle, value ? -1 : -2, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+    }
+
+    public void SetShowInTaskbar(bool value)
+    {
+        if (Handle == 0) return;
+
+        const int GWL_EXSTYLE = -20;
+        const uint WS_EX_APPWINDOW = 0x00040000;
+        const uint WS_EX_TOOLWINDOW = 0x00000080;
+        const uint SWP_NOSIZE = 0x0001;
+        const uint SWP_NOMOVE = 0x0002;
+        const uint SWP_NOZORDER = 0x0004;
+        const uint SWP_FRAMECHANGED = 0x0020;
+
+        uint exStyle = (uint)User32.GetWindowLongPtr(Handle, GWL_EXSTYLE).ToInt64();
+        if (value)
+        {
+            exStyle |= WS_EX_APPWINDOW;
+        }
+        else
+        {
+            exStyle &= ~WS_EX_APPWINDOW;
+        }
+
+        if (Window.Kind == Controls.WindowKind.Tool)
+        {
+            exStyle |= WS_EX_TOOLWINDOW;
+            exStyle &= ~WS_EX_APPWINDOW;
+        }
+        else
+        {
+            exStyle &= ~WS_EX_TOOLWINDOW;
+        }
+
+        User32.SetWindowLongPtr(Handle, GWL_EXSTYLE, (nint)exStyle);
+        ApplyOwnerHandle();
+        User32.SetWindowPos(Handle, 0, 0, 0, 0, 0, SWP_NOSIZE | SWP_NOMOVE | SWP_NOZORDER | SWP_FRAMECHANGED | SWP_NOACTIVATE_ON_REFRESH);
+    }
+
+    public void Close()
+    {
+        if (Handle != 0)
+        {
+            // Route programmatic close through WM_CLOSE so Window.RaiseClosed() runs,
+            // ensuring modal ownership state and ShowDialogAsync completion are handled.
+            _ = User32.PostMessage(Handle, WindowMessages.WM_CLOSE, 0, 0);
+        }
+    }
+
+    public void Invalidate(bool erase)
+    {
+        if (Handle == 0)
+        {
+            return;
+        }
+
+        // Request-driven rendering: coalesce multiple invalidations and let the platform host render pass present.
+        NeedsRender = true;
+        _host.RequestRender();
+    }
+
+    public void SetOpacity(double opacity)
+    {
+        _opacity = Math.Clamp(opacity, 0.0, 1.0);
+        if (Handle == 0)
+        {
+            return;
+        }
+
+        EnsureLayeredStyleIfNeeded();
+        ApplyOpacity();
+        Invalidate(erase: false);
+    }
+
+    public void SetAllowsTransparency(bool allowsTransparency)
+    {
+        _allowsTransparency = allowsTransparency;
+        if (Handle == 0)
+        {
+            return;
+        }
+
+        EnsureLayeredStyleIfNeeded();
+        if (_allowsTransparency)
+        {
+            ValidateTransparencySupport();
+        }
+        else
+        {
+            ApplyOpacity();
+        }
+        Invalidate(erase: false);
+    }
+
+    private double _extendTitleBarHeight;
+
+    public void SetExtendClientAreaToTitleBar(double titleBarHeight)
+    {
+        _extendTitleBarHeight = titleBarHeight;
+        if (Handle == 0) return;
+
+        double dpiScale = GetDpiForWindow(Handle) / 96.0;
+        int topPx = titleBarHeight > 0 ? (int)(titleBarHeight * dpiScale) : 0;
+
+        if (topPx > 0)
+        {
+            // Win11+: extend by title bar height to preserve rounded corners.
+            // Win7/Win10: extend by 1px to preserve DWM shadow without heavy Aero Glass effect.
+            int extendPx = IsWindows11OrLater ? topPx : 1;
+            var margins = new Dwmapi.MARGINS { cyTopHeight = extendPx };
+            Native.Dwmapi.DwmExtendFrameIntoClientArea(Handle, ref margins);
+        }
+        else
+        {
+            var margins = new Dwmapi.MARGINS();
+            Native.Dwmapi.DwmExtendFrameIntoClientArea(Handle, ref margins);
+        }
+
+        // Force WM_NCCALCSIZE to recalculate.
+        const uint SWP_FRAMECHANGED = 0x0020;
+        const uint SWP_NOMOVE = 0x0002;
+        const uint SWP_NOSIZE = 0x0001;
+        const uint SWP_NOZORDER = 0x0004;
+        const uint SWP_NOACTIVATE = 0x0010;
+        User32.SetWindowPos(Handle, 0, 0, 0, 0, 0,
+            SWP_FRAMECHANGED | SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
+
+        Invalidate(erase: true);
+    }
+
+    public void SetWindowBorderColor(Color? color)
+    {
+        if (Handle == 0 || !IsWindows11OrLater) return;
+
+        // COLORREF = 0x00BBGGRR. Use DWMWA_COLOR_NONE (0xFFFFFFFE) to restore default.
+        int colorRef = color.HasValue
+            ? color.Value.R | (color.Value.G << 8) | (color.Value.B << 16)
+            : unchecked((int)0xFFFFFFFE); // DWMWA_COLOR_NONE
+        Native.Dwmapi.DwmSetWindowAttribute(Handle,
+            Native.Dwmapi.DwmWindowAttribute.DWMWA_BORDER_COLOR,
+            ref colorRef, sizeof(int));
+    }
+
+    public WindowChromeCapabilities ChromeCapabilities
+    {
+        get
+        {
+            bool dwmEnabled = Native.Dwmapi.DwmIsCompositionEnabled(out int enabled) == 0 && enabled != 0;
+            var caps = dwmEnabled
+                ? WindowChromeCapabilities.ExtendClientArea
+                : WindowChromeCapabilities.None;
+            if (IsWindows11OrLater)
+                caps |= WindowChromeCapabilities.NativeBorderColor
+                      | WindowChromeCapabilities.NativeWindowBorder;
+            return caps;
+        }
+    }
+
+    private static bool IsWindows11OrLater
+        => Environment.OSVersion.Version.Build >= 22000;
+
+    private nint HandleExtendedTitleBarHitTest(nint lParam)
+    {
+        int screenX = (short)(lParam.ToInt64() & 0xFFFF);
+        int screenY = (short)((lParam.ToInt64() >> 16) & 0xFFFF);
+
+        var pt = new POINT(screenX, screenY);
+        User32.ScreenToClient(Handle, ref pt);
+
+        // Window client rect in pixels.
+        User32.GetClientRect(Handle, out var clientRect);
+        int w = clientRect.right;
+        int h = clientRect.bottom;
+
+        double dpiScale = GetDpiForWindow(Handle) / 96.0;
+        int borderPx = Math.Max(1, (int)(6 * dpiScale)); // resize border thickness
+        int titleBarPx = (int)(_extendTitleBarHeight * dpiScale);
+
+        const int HTCLIENT = 1;
+        const int HTCAPTION = 2;
+        const int HTLEFT = 10;
+        const int HTRIGHT = 11;
+        const int HTTOP = 12;
+        const int HTTOPLEFT = 13;
+        const int HTTOPRIGHT = 14;
+        const int HTBOTTOM = 15;
+        const int HTBOTTOMLEFT = 16;
+        const int HTBOTTOMRIGHT = 17;
+
+        // Resize borders (skip when maximized - no resize in maximized state).
+        if (Window.WindowState != Controls.WindowState.Maximized && Window.WindowSize.IsResizable)
+        {
+            bool left = pt.x < borderPx;
+            bool right = pt.x >= w - borderPx;
+            bool top = pt.y < borderPx;
+            bool bottom = pt.y >= h - borderPx;
+
+            if (top && left) return HTTOPLEFT;
+            if (top && right) return HTTOPRIGHT;
+            if (bottom && left) return HTBOTTOMLEFT;
+            if (bottom && right) return HTBOTTOMRIGHT;
+            if (left) return HTLEFT;
+            if (right) return HTRIGHT;
+            if (top) return HTTOP;
+            if (bottom) return HTBOTTOM;
+        }
+
+        // Title bar area.
+        if (pt.y < titleBarPx)
+        {
+            double dipX = pt.x / dpiScale;
+            double dipY = pt.y / dpiScale;
+            var visualRoot = Window.EffectiveVisualRoot as Controls.UIElement;
+            var hit = visualRoot?.HitTest(new Point(
+                dipX + Window.Padding.Left,
+                dipY + Window.Padding.Top));
+
+            // Interactive control - let it handle the click.
+            if (hit != null && hit != visualRoot && (hit.Focusable || hit is not Controls.Panel))
+                return HTCLIENT;
+
+            return HTCAPTION;
+        }
+
+        return HTCLIENT;
+    }
+
+    public void SetTitle(string title)
+    {
+        if (Handle != 0)
+        {
+            User32.SetWindowText(Handle, title);
+        }
+    }
+
+    public void SetIcon(IconSource? icon)
+    {
+        if (Handle == 0)
+        {
+            return;
+        }
+
+        DestroyIcons();
+
+        if (icon == null)
+        {
+            ApplyIcons();
+            return;
+        }
+
+        var dpiScale = Window.DpiScale <= 0 ? 1.0 : Window.DpiScale;
+        int smallPx = Math.Max(16, (int)Math.Round(16 * dpiScale));
+        int bigPx = Math.Max(32, (int)Math.Round(32 * dpiScale));
+
+        _hIconSmall = TryCreateIcon(icon, smallPx);
+        _hIconBig = TryCreateIcon(icon, bigPx);
+        if (_hIconBig == 0 && _hIconSmall != 0)
+        {
+            _hIconBig = _hIconSmall;
+        }
+        else if (_hIconSmall == 0 && _hIconBig != 0)
+        {
+            _hIconSmall = _hIconBig;
+        }
+
+        ApplyIcons();
+    }
+
+    public void SetClientSize(double widthDip, double heightDip)
+    {
+        if (Handle == 0)
+        {
+            return;
+        }
+
+        uint dpi = Window.Dpi == 0 ? GetDpiForWindow(Handle) : Window.Dpi;
+        double dpiScale = dpi / 96.0;
+
+        int clientW = (int)Math.Round(widthDip * dpiScale);
+        int clientH = (int)Math.Round(heightDip * dpiScale);
+
+        int windowW, windowH;
+        if (_allowsTransparency || _extendTitleBarHeight > 0)
+        {
+            // WM_NCCALCSIZE removes non-client area → client = window.
+            windowW = clientW;
+            windowH = clientH;
+        }
+        else
+        {
+            var rect = new RECT(0, 0, clientW, clientH);
+            Win32DpiApiResolver.AdjustWindowRectExForDpi(ref rect, GetWindowStyle(), false, GetWindowExStyle(), dpi);
+            windowW = rect.Width;
+            windowH = rect.Height;
+        }
+
+        const uint SWP_NOMOVE = 0x0002;
+        const uint SWP_NOZORDER = 0x0004;
+        const uint SWP_NOACTIVATE = 0x0010;
+        uint flags = SWP_NOMOVE | SWP_NOZORDER;
+        // A non-activating surface must not be pulled to the foreground by a programmatic resize
+        // (the fit-to-content resize runs right after Show and would otherwise steal the owner's activation).
+        if (Window.IsNonActivatingSurface)
+        {
+            flags |= SWP_NOACTIVATE;
+        }
+        User32.SetWindowPos(Handle, 0, 0, 0, windowW, windowH, flags);
+    }
+
+    public Point GetPosition()
+    {
+        if (Handle == 0 || !User32.GetWindowRect(Handle, out var r))
+        {
+            return default;
+        }
+
+        uint dpi = Window.Dpi == 0 ? GetDpiForWindow(Handle) : Window.Dpi;
+        double dpiScale = dpi / 96.0;
+        if (dpiScale <= 0)
+        {
+            dpiScale = 1.0;
+        }
+
+        return new Point(r.left / dpiScale, r.top / dpiScale);
+    }
+
+    public void SetPositionPx(int leftPx, int topPx)
+    {
+        if (Handle == 0)
+        {
+            return;
+        }
+
+        MoveWindowTo(leftPx, topPx);
+    }
+
+    public void SetPosition(double leftDip, double topDip)
+    {
+        if (Handle == 0)
+        {
+            return;
+        }
+
+        uint dpi = Window.Dpi == 0 ? GetDpiForWindow(Handle) : Window.Dpi;
+        double dpiScale = dpi / 96.0;
+        if (dpiScale <= 0)
+        {
+            dpiScale = 1.0;
+        }
+
+        int x = (int)Math.Round(leftDip * dpiScale);
+        int y = (int)Math.Round(topDip * dpiScale);
+
+        MoveWindowTo(x, y);
+    }
+
+    private void MoveWindowTo(int xPx, int yPx)
+    {
+        const uint SWP_NOSIZE = 0x0001;
+        const uint SWP_NOZORDER = 0x0004;
+        const uint SWP_NOACTIVATE = 0x0010;
+
+        User32.SetWindowPos(Handle, 0, xPx, yPx, 0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
+    }
+
+    public void CaptureMouse()
+    {
+        if (Handle == 0)
+        {
+            return;
+        }
+
+        User32.SetCapture(Handle);
+    }
+
+    public void ReleaseMouseCapture()
+    {
+        // ReleaseCapture works on the thread: a capture the system already moved elsewhere (a move loop) stays there.
+        if (User32.GetCapture() == Handle)
+        {
+            User32.ReleaseCapture();
+        }
+    }
+
+    public nint ProcessMessage(uint msg, nint wParam, nint lParam)
+    {
+        if (Window.HasNativeMessageHandler)
+        {
+            var hookArgs = new Win32NativeMessageEventArgs(msg, wParam, lParam);
+            if (Window.RaiseNativeMessage(hookArgs))
+            {
+                return hookArgs.Result;
+            }
+        }
+
+        switch (msg)
+        {
+            case WindowMessages.WM_SETCURSOR:
+                // For a client-area hit, apply our cursor (or hide it) and return TRUE to prevent
+                // DefWindowProc from resetting it to the arrow on every move.
+                if ((lParam & 0xFFFF) == 1 /* HTCLIENT */)
+                {
+                    if (_cursorHidden)
+                    {
+                        User32.SetCursor(0);
+                        return 1;
+                    }
+                    if (_currentCursor != 0)
+                    {
+                        User32.SetCursor(_currentCursor);
+                        return 1;
+                    }
+                }
+                return User32.DefWindowProc(Handle, msg, wParam, lParam);
+
+            case WindowMessages.WM_NCHITTEST:
+                if (Window.IsInputTransparentSurface)
+                {
+                    // Taking the pointer would end the owner's hover and close the popup under the cursor.
+                    const int HTTRANSPARENT = -1;
+                    return HTTRANSPARENT;
+                }
+                if (_allowsTransparency)
+                {
+                    return HandleNcHitTest(lParam);
+                }
+                if (_extendTitleBarHeight > 0)
+                {
+                    return HandleExtendedTitleBarHitTest(lParam);
+                }
+                return User32.DefWindowProc(Handle, msg, wParam, lParam);
+
+            case WindowMessages.WM_NCCALCSIZE:
+                return HandleNcCalcSize(wParam, lParam);
+
+            case WindowMessages.WM_NCCREATE:
+                return User32.DefWindowProc(Handle, msg, wParam, lParam);
+
+            case WindowMessages.WM_CREATE:
+                return 0;
+
+            case WindowMessages.WM_DESTROY:
+                HandleDestroy();
+                return 0;
+
+            case WindowMessages.WM_CLOSE:
+                if (Window.RequestClose())
+                {
+                    // Return activation to the owner when an owned window that currently has the foreground is
+                    // destroyed: Win32's default activation can pick the wrong top-level (especially for tool /
+                    // owned windows when several are open), sending focus somewhere unexpected.
+                    var owner = Window.Owner;
+                    bool wasForeground = owner != null && User32.GetForegroundWindow() == Handle;
+
+                    Window.RaiseClosed();
+
+                    // Resolved after RaiseClosed so this window is already out of the owner's modal list.
+                    // Raising the owner while it still has a live modal child would bury that child.
+                    nint activateHandle = owner != null ? (owner.GetTopModalChild() ?? owner).Handle : 0;
+
+                    User32.DestroyWindow(Handle);
+
+                    if (wasForeground && activateHandle != 0)
+                    {
+                        _ = User32.SetForegroundWindow(activateHandle);
+                    }
+                }
+                return 0;
+
+            case WindowMessages.WM_CANCELMODE:
+                Window.OnOsCaptureCancelled();
+                return User32.DefWindowProc(Handle, msg, wParam, lParam);
+
+            case WindowMessages.WM_CAPTURECHANGED:
+                // lParam is the window taking the capture; the framework ignores the changes it made itself.
+                Window.OnOsCaptureLost(lParam);
+                return User32.DefWindowProc(Handle, msg, wParam, lParam);
+
+            case WindowMessages.WM_PAINT:
+                return HandlePaint();
+
+            // OS modal loops (DefWindowProc-driven resize/move and menu loops) suspend
+            // our main loop's Render pass. Drive a ~60fps WM_TIMER so animations and
+            // any pending invalidations keep rendering until the modal loop exits.
+            // Also force one immediate render so the first frame after entering the
+            // modal loop doesn't wait up to 16ms for the first WM_TIMER tick.
+            case WindowMessages.WM_ENTERSIZEMOVE:
+            case WindowMessages.WM_ENTERMENULOOP:
+                User32.SetTimer(Handle, 1, 8, 0);
+                Window.Invalidate();
+                RenderIfNeeded();
+                return 0;
+
+            case WindowMessages.WM_MOVING:
+                return HandleMoving(lParam);
+
+            case WindowMessages.WM_EXITSIZEMOVE:
+                _moveLoopRectIsStale = false;
+                User32.KillTimer(Handle, 1);
+                // The move loop tracks its own rectangle and re-applies it after every DPI
+                // transition, overriding any resize the transition triggered. A fit window
+                // therefore leaves the loop at the size the old scale implied, and its layout has
+                // no reason to submit again, so the transaction is reopened here.
+                Window.InvalidateSizingTransaction();
+                return 0;
+
+            case WindowMessages.WM_EXITMENULOOP:
+                User32.KillTimer(Handle, 1);
+                return 0;
+
+            case WindowMessages.WM_ERASEBKGND:
+                return HandleEraseBackground(wParam);
+
+            case WindowMessages.WM_GETMINMAXINFO:
+                return HandleGetMinMaxInfo(lParam);
+
+            case WindowMessages.WM_SIZE:
+                return HandleSize(wParam, lParam);
+
+            case WindowMessages.WM_DPICHANGED:
+                return HandleDpiChanged(wParam, lParam);
+
+            case WindowMessages.WM_DPICHANGED_AFTERPARENT:
+                return HandleDpiChangedAfterParent();
+
+            case WindowMessages.WM_ACTIVATE:
+                return HandleActivate(wParam);
+
+            case WindowMessages.WM_MOUSEACTIVATE:
+                // Non-activating surfaces: clicking their content must not steal foreground from the
+                // owner window (that would break light-dismiss and leave the owner looking inactive).
+                if (Window.IsNonActivatingSurface)
+                {
+                    const int MA_NOACTIVATE = 3;
+                    return MA_NOACTIVATE;
+                }
+                return User32.DefWindowProc(Handle, msg, wParam, lParam);
+
+            case WindowMessages.WM_POINTERDOWN:
+            case WindowMessages.WM_POINTERUPDATE:
+            case WindowMessages.WM_POINTERUP:
+                // Touch and pen are taken here and not passed on, so the system generates no mouse
+                // messages for them. Everything else, the mouse included, keeps arriving as WM_MOUSE*.
+                return HandlePointer(msg, wParam) ? 0 : User32.DefWindowProc(Handle, msg, wParam, lParam);
+
+            case WindowMessages.WM_POINTERCAPTURECHANGED:
+                if (TouchInputGate.IsSupported)
+                {
+                    WindowInputRouter.PointerCancel(Window, PointerIdOf(wParam));
+                }
+                return User32.DefWindowProc(Handle, msg, wParam, lParam);
+
+            case WindowMessages.WM_POINTERLEAVE:
+                if (TouchInputGate.IsSupported
+                    && User32.GetPointerType((uint)PointerIdOf(wParam), out uint leavingType)
+                    && leavingType == POINTER_INFO.PT_PEN)
+                {
+                    // A pen hovers like a mouse, so leaving range ends its hover.
+                    WindowInputRouter.UpdateMouseOver(Window, null);
+                }
+                return User32.DefWindowProc(Handle, msg, wParam, lParam);
+
+            case WindowMessages.WM_TABLET_QUERYSYSTEMGESTURESTATUS:
+                // The system's own hold-for-right-click delays every press and fires a second right click
+                // after the one the gesture layer raises.
+                return TouchInputGate.IsSupported
+                    ? TABLET_DISABLE_PRESSANDHOLD | TABLET_DISABLE_PENTAPFEEDBACK | TABLET_DISABLE_PENBARRELFEEDBACK | TABLET_DISABLE_FLICKS
+                    : User32.DefWindowProc(Handle, msg, wParam, lParam);
+
+            case WindowMessages.WM_LBUTTONDOWN:
+                return HandleMouseButton(lParam, MouseButton.Left, isDown: true, isDoubleClickMessage: false);
+
+            case WindowMessages.WM_LBUTTONDBLCLK:
+                return HandleMouseButton(lParam, MouseButton.Left, isDown: true, isDoubleClickMessage: true);
+
+            case WindowMessages.WM_LBUTTONUP:
+                return HandleMouseButton(lParam, MouseButton.Left, isDown: false, isDoubleClickMessage: false);
+
+            case WindowMessages.WM_RBUTTONDOWN:
+                return HandleMouseButton(lParam, MouseButton.Right, isDown: true, isDoubleClickMessage: false);
+
+            case WindowMessages.WM_RBUTTONDBLCLK:
+                return HandleMouseButton(lParam, MouseButton.Right, isDown: true, isDoubleClickMessage: true);
+
+            case WindowMessages.WM_RBUTTONUP:
+                return HandleMouseButton(lParam, MouseButton.Right, isDown: false, isDoubleClickMessage: false);
+
+            case WindowMessages.WM_MBUTTONDOWN:
+                return HandleMouseButton(lParam, MouseButton.Middle, isDown: true, isDoubleClickMessage: false);
+
+            case WindowMessages.WM_MBUTTONDBLCLK:
+                return HandleMouseButton(lParam, MouseButton.Middle, isDown: true, isDoubleClickMessage: true);
+
+            case WindowMessages.WM_MBUTTONUP:
+                return HandleMouseButton(lParam, MouseButton.Middle, isDown: false, isDoubleClickMessage: false);
+
+            case WindowMessages.WM_MOUSEMOVE:
+                return HandleMouseMove(lParam);
+
+            case WindowMessages.WM_MOUSELEAVE:
+                return HandleMouseLeave();
+
+            case WindowMessages.WM_MOUSEWHEEL:
+                return HandleMouseWheel(wParam, lParam, isHorizontal: false);
+
+            case WindowMessages.WM_MOUSEHWHEEL:
+                return HandleMouseWheel(wParam, lParam, isHorizontal: true);
+
+            case WindowMessages.WM_KEYDOWN:
+            case WindowMessages.WM_SYSKEYDOWN:
+                return HandleKeyDown(msg, wParam, lParam);
+
+            case WindowMessages.WM_KEYUP:
+            case WindowMessages.WM_SYSKEYUP:
+                return HandleKeyUp(msg, wParam, lParam);
+
+            case WindowMessages.WM_CHAR:
+                return HandleChar(wParam);
+
+            case WindowMessages.WM_SYSCHAR:
+                // Suppress WM_SYSCHAR to prevent OS beep. MewUI does not use native menus,
+                // so there is no OS accelerator that needs this message.
+                return 0;
+
+            case WindowMessages.WM_IME_STARTCOMPOSITION:
+                return HandleImeStartComposition();
+
+            case WindowMessages.WM_IME_COMPOSITION:
+                return HandleImeComposition(lParam);
+
+            case WindowMessages.WM_IME_ENDCOMPOSITION:
+                return HandleImeEndComposition();
+
+            case WindowMessages.WM_IME_NOTIFY:
+                return User32.DefWindowProc(Handle, msg, wParam, lParam);
+
+            case WindowMessages.WM_SETFOCUS:
+                // The system caret exists only so caret-following IMEs and accessibility
+                // tools can track the input position; the visible caret is drawn by MewUI.
+                // HandleImeStartComposition creates it late for mid-window focus moves.
+                if (Window.FocusManager.FocusedElement is ITextInputClient)
+                {
+                    CreateInvisibleSystemCaret();
+                }
+                return 0;
+
+            case WindowMessages.WM_KILLFOCUS:
+                User32.DestroyCaret();
+                return 0;
+
+            case Win32Dispatcher.WM_INVOKE:
+                // Clear before processing (same order as the host's dispatcher window) so work
+                // posted during processing can re-request a WM_INVOKE.
+                if (Window.ApplicationDispatcher is Win32Dispatcher invokeDispatcher)
+                {
+                    invokeDispatcher.ClearInvokeRequest();
+                    invokeDispatcher.ProcessWorkItems();
+                }
+                return 0;
+
+            case WindowMessages.WM_TIMER:
+                if (wParam == 1)
+                {
+                    // A native move/size loop blocks the host pump, and every window, not only this one, waits on it.
+                    _host.RenderContinuousWindows(Application.Current.RenderLoopSettings);
+                    return 0;
+                }
+
+                if ((Window.ApplicationDispatcher as Win32Dispatcher)?.ProcessTimer((nuint)wParam) == true)
+                {
+                    return 0;
+                }
+
+                return 0;
+
+            case WindowMessages.WM_DROPFILES:
+                // Legacy file-drop path - used as a fallback on MTA threads where IDropTarget cannot be
+                // registered. STA threads use IDropTarget instead (Shell32.DragAcceptFiles is not called).
+                return HandleDropFiles(wParam);
+
+            default:
+                return User32.DefWindowProc(Handle, msg, wParam, lParam);
+        }
+    }
+
+    private void CreateWindow()
+    {
+        uint initialDpi = ResolveInitialDpi();
+        Window.SetDpi(initialDpi);
+        double dpiScale = Window.DpiScale;
+
+        var rect = new RECT(0, 0, (int)(Window.Width * dpiScale), (int)(Window.Height * dpiScale));
+        uint style = GetWindowStyle();
+        uint exStyle = GetWindowExStyle();
+        if (!Window.AllowsTransparency)
+        {
+            Win32DpiApiResolver.AdjustWindowRectExForDpi(ref rect, style, false, exStyle, initialDpi);
+        }
+
+        var (x, y) = ResolveInitialPosition(rect.Width, rect.Height, initialDpi);
+
+        Handle = User32.CreateWindowEx(
+            exStyle,
+            Win32PlatformHost.WindowClassName,
+            Window.Title,
+            style,
+            x,
+            y,
+            rect.Width,
+            rect.Height,
+            0,
+            0,
+            Kernel32.GetModuleHandle(null),
+            0);
+
+        if (Handle == 0)
+        {
+            throw new InvalidOperationException($"Failed to create window. Error: {Marshal.GetLastWin32Error()}");
+        }
+
+        _titleBarThemeSync.Initialize(Handle);
+        DisableTouchFeedback();
+        _host.RegisterWindow(Handle, this);
+        Window.AttachBackend(this);
+        // AttachBackend calls SetAllowDrop(true) automatically if Window.AllowDrop was already set,
+        // so we don't need to register the drop target here.
+
+        ApplyOwnerHandle();
+        ApplyResizeMode();
+        EnsureLayeredStyleIfNeeded();
+        ValidateTransparencySupport();
+        ApplyOpacity();
+
+        uint actualDpi = GetDpiForWindow(Handle);
+        if (actualDpi != initialDpi)
+        {
+            Window.SetDpi(actualDpi);
+            SetClientSize(Window.Width, Window.Height);
+            var updatedRect = new RECT(0, 0, (int)Math.Round(Window.Width * Window.DpiScale), (int)Math.Round(Window.Height * Window.DpiScale));
+            if (!Window.AllowsTransparency)
+            {
+                Win32DpiApiResolver.AdjustWindowRectExForDpi(ref updatedRect, style, false, exStyle, actualDpi);
+            }
+            var (updatedX, updatedY) = ResolveInitialPosition(updatedRect.Width, updatedRect.Height, actualDpi);
+            User32.SetWindowPos(Handle, 0, updatedX, updatedY, 0, 0, 0x0001 | 0x0004 | 0x0010);
+            // Force layout recalculation with the correct DPI before first paint
+            Window.PerformLayout();
+        }
+
+        User32.GetClientRect(Handle, out var clientRect);
+        Window.SetClientSizeDip(clientRect.Width / Window.DpiScale, clientRect.Height / Window.DpiScale);
+    }
+
+    private uint ResolveInitialDpi()
+    {
+        if (Window.StartupLocation == WindowStartupLocation.CenterOwner &&
+            Window.Owner is { } ownerWindow &&
+            ownerWindow.Handle != 0)
+        {
+            return GetDpiForWindow(ownerWindow.Handle);
+        }
+
+        var monitor = GetStartupMonitor();
+        return monitor != 0
+            ? Win32DpiApiResolver.GetDpiForMonitor(monitor)
+            : Win32DpiApiResolver.GetSystemDpi();
+    }
+
+    private nint HandleDropFiles(nint hDrop)
+    {
+        try
+        {
+            unsafe
+            {
+                uint count = Shell32.DragQueryFile(hDrop, 0xFFFFFFFF, null, 0);
+                if (count == 0) return 0;
+
+                var paths = new List<string>((int)count);
+                for (uint i = 0; i < count; i++)
+                {
+                    uint length = Shell32.DragQueryFile(hDrop, i, null, 0);
+                    if (length == 0) continue;
+
+                    char[] rented = ArrayPool<char>.Shared.Rent((int)length + 1);
+                    try
+                    {
+                        fixed (char* buffer = rented)
+                        {
+                            _ = Shell32.DragQueryFile(hDrop, i, buffer, length + 1);
+                            if (buffer[0] != '\0')
+                            {
+                                paths.Add(new string(buffer, 0, (int)length));
+                            }
+                        }
+                    }
+                    finally
+                    {
+                        ArrayPool<char>.Shared.Return(rented, clearArray: true);
+                    }
+                }
+
+                if (paths.Count == 0) return 0;
+
+                POINT clientPx = default;
+                _ = Shell32.DragQueryPoint(hDrop, &clientPx);
+                var screenPx = clientPx;
+                User32.ClientToScreen(Handle, ref screenPx);
+
+                double dpi = Window.DpiScale;
+                var uris = new List<string>(paths.Count);
+                foreach (var path in paths)
+                {
+                    if (Uri.TryCreate(path, UriKind.Absolute, out var uri))
+                    {
+                        uris.Add(uri.AbsoluteUri);
+                    }
+                }
+
+                var data = new DataObject(new Dictionary<string, object>
+                {
+                    [StandardDataFormats.StorageItems] = paths,
+                    [StandardDataFormats.Uris] = uris,
+                });
+
+                var args = new DragEventArgs(
+                    data,
+                    new Point(clientPx.x / dpi, clientPx.y / dpi),
+                    new Point(screenPx.x, screenPx.y),
+                    DragDropEffects.Copy);
+
+                // Route through the framework so element-level Drop handlers fire (and window-level fallback).
+                // No DragEnter/Over/Leave with WM_DROPFILES - only the final Drop is delivered.
+                WindowDragDropRouter.OnExternalDrop(Window, args);
+                return 0;
+            }
+        }
+        finally
+        {
+            Shell32.DragFinish(hDrop);
+        }
+    }
+
+    private (int X, int Y) ResolveInitialPosition(int windowWidthPx, int windowHeightPx, uint dpi)
+    {
+        if (Window.StartupLocation == WindowStartupLocation.CenterOwner &&
+            Window.Owner is { } ownerWindow &&
+            ownerWindow.Handle != 0 &&
+            TryGetOwnerPlacementRect(ownerWindow, out var ownerRect))
+        {
+            int x = ownerRect.left + ((ownerRect.Width - windowWidthPx) / 2);
+            int y = ownerRect.top + ((ownerRect.Height - windowHeightPx) / 2);
+            return ClampToWorkArea(x, y, windowWidthPx, windowHeightPx, User32.MonitorFromWindow(ownerWindow.Handle, MonitorDefaultToNearest));
+        }
+
+        if (Window.EffectiveStartupLocation == WindowStartupLocation.CenterScreen)
+        {
+            var monitor = GetStartupMonitor();
+            if (TryGetMonitorWorkArea(monitor, out var workArea))
+            {
+                int x = workArea.left + ((workArea.Width - windowWidthPx) / 2);
+                int y = workArea.top + ((workArea.Height - windowHeightPx) / 2);
+                return (x, y);
+            }
+        }
+
+        // Already screen coordinates; scaling would reintroduce the mismatch this avoids.
+        if (Window.StartupPositionPx is { } posPx)
+        {
+            return ClampToWorkArea(posPx.X, posPx.Y, windowWidthPx, windowHeightPx, GetStartupMonitor());
+        }
+
+        if (Window.ResolvedStartupPosition is { } pos)
+        {
+            double dpiScale = Math.Max(1.0, dpi / 96.0);
+            int x = (int)Math.Round(pos.X * dpiScale);
+            int y = (int)Math.Round(pos.Y * dpiScale);
+            return ClampToWorkArea(x, y, windowWidthPx, windowHeightPx, GetStartupMonitor());
+        }
+
+        return (100, 100);
+    }
+
+    private void ApplyResolvedStartupPosition()
+    {
+        if (Handle == 0)
+        {
+            return;
+        }
+
+        if (Window.StartupLocation == WindowStartupLocation.Manual &&
+            Window.ResolvedStartupPosition is null && Window.StartupPositionPx is null)
+        {
+            return;
+        }
+
+        uint dpi = Window.Dpi == 0 ? GetDpiForWindow(Handle) : Window.Dpi;
+        uint style = GetWindowStyle();
+        uint exStyle = GetWindowExStyle();
+        var rect = new RECT(
+            0,
+            0,
+            (int)Math.Round(Window.Width * Window.DpiScale),
+            (int)Math.Round(Window.Height * Window.DpiScale));
+
+        if (!Window.AllowsTransparency)
+        {
+            Win32DpiApiResolver.AdjustWindowRectExForDpi(ref rect, style, false, exStyle, dpi);
+        }
+        var (x, y) = ResolveInitialPosition(rect.Width, rect.Height, dpi);
+
+        const uint SWP_NOSIZE = 0x0001;
+        const uint SWP_NOZORDER = 0x0004;
+        const uint SWP_NOACTIVATE = 0x0010;
+        User32.SetWindowPos(Handle, 0, x, y, 0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
+    }
+
+    private bool TryGetOwnerPlacementRect(Window ownerWindow, out RECT ownerRect)
+    {
+        if (Window.AllowsTransparency)
+        {
+            var ownerClientTopLeftPx = ownerWindow.ClientToScreen(Point.Zero);
+            double ownerScale = ownerWindow.DpiScale <= 0 ? 1.0 : ownerWindow.DpiScale;
+            int ownerClientWidthPx = Math.Max(0, (int)Math.Round(ownerWindow.ClientSize.Width * ownerScale));
+            int ownerClientHeightPx = Math.Max(0, (int)Math.Round(ownerWindow.ClientSize.Height * ownerScale));
+
+            ownerRect = RECT.FromXYWH(
+                (int)Math.Round(ownerClientTopLeftPx.X),
+                (int)Math.Round(ownerClientTopLeftPx.Y),
+                ownerClientWidthPx,
+                ownerClientHeightPx);
+
+            return ownerClientWidthPx > 0 && ownerClientHeightPx > 0;
+        }
+
+        return User32.GetWindowRect(ownerWindow.Handle, out ownerRect);
+    }
+
+    private nint GetStartupMonitor()
+    {
+        if (Window.StartupLocation == WindowStartupLocation.CenterOwner &&
+            Window.Owner is { } ownerWindow &&
+            ownerWindow.Handle != 0)
+        {
+            return User32.MonitorFromWindow(ownerWindow.Handle, MonitorDefaultToNearest);
+        }
+
+        if (Window.StartupPositionPx is { } posPx)
+        {
+            return User32.MonitorFromPoint(new POINT(posPx.X, posPx.Y), MonitorDefaultToNearest);
+        }
+
+        if (Window.ResolvedStartupPosition is { } pos)
+        {
+            // The system scale only finds the right monitor when the target shares it; a higher-DPI
+            // secondary is missed, and the window then lands scaled by the wrong monitor's DPI.
+            uint systemDpi = Win32DpiApiResolver.GetSystemDpi();
+            double scale = Math.Max(1.0, systemDpi / 96.0);
+            var point = new POINT((int)Math.Round(pos.X * scale), (int)Math.Round(pos.Y * scale));
+            return User32.MonitorFromPoint(point, MonitorDefaultToNearest);
+        }
+
+        if (User32.GetCursorPos(out var cursor))
+        {
+            return User32.MonitorFromPoint(cursor, MonitorDefaultToNearest);
+        }
+
+        return User32.MonitorFromPoint(new POINT(0, 0), MonitorDefaultToPrimary);
+    }
+
+    private static bool TryGetMonitorWorkArea(nint monitor, out RECT workArea)
+    {
+        if (monitor != 0)
+        {
+            var info = MONITORINFO.Create();
+            if (User32.GetMonitorInfo(monitor, ref info))
+            {
+                workArea = info.rcWork;
+                return true;
+            }
+        }
+
+        workArea = default;
+        return false;
+    }
+
+    private static (int X, int Y) ClampToWorkArea(int x, int y, int width, int height, nint monitor)
+    {
+        if (!TryGetMonitorWorkArea(monitor, out var workArea))
+        {
+            return (x, y);
+        }
+
+        int minX = workArea.left;
+        int minY = workArea.top;
+        int maxX = Math.Max(minX, workArea.right - width);
+        int maxY = Math.Max(minY, workArea.bottom - height);
+
+        return (Math.Clamp(x, minX, maxX), Math.Clamp(y, minY, maxY));
+    }
+
+    private nint HandleEraseBackground(nint hdc)
+    {
+        if (_allowsTransparency)
+        {
+            _initialEraseDone = true;
+            return 1;
+        }
+
+        if (_initialEraseDone)
+        {
+            return 1;
+        }
+
+        if (hdc == 0 || Handle == 0)
+        {
+            return 1;
+        }
+
+        if (!User32.GetClientRect(Handle, out var rc))
+        {
+            return 1;
+        }
+
+        var theme = Window.ThemeInternal;
+        var bg = Window.Background.A > 0 ? Window.Background : theme.Palette.WindowBackground;
+
+        nint brush = Gdi32.CreateSolidBrush(bg.ToCOLORREF());
+        try
+        {
+            Gdi32.FillRect(hdc, ref rc, brush);
+        }
+        finally
+        {
+            if (brush != 0)
+            {
+                Gdi32.DeleteObject(brush);
+            }
+        }
+
+        _initialEraseDone = true;
+        return 1;
+    }
+
+    // ID2D1/DXGI-rendered windows show a black/stretched flash on the newly-exposed area during
+    // live resize because DWM's default resize BitBlt stretches the stale swap-chain content.
+    // Returning WVR_VALIDRECTS from WM_NCCALCSIZE tells DWM to copy the old client's top-left
+    // overlap 1:1 into the new client (no stretch) and invalidate the rest for a normal repaint,
+    // which matches the GDI/GL backends' smooth behavior. (Firefox bug 672885 technique.)
+    private unsafe nint HandleNcCalcSize(nint wParam, nint lParam)
+    {
+        const uint WVR_VALIDRECTS = 0x0400;
+
+        if (wParam == 0)
+        {
+            return User32.DefWindowProc(Handle, WindowMessages.WM_NCCALCSIZE, wParam, lParam);
+        }
+
+        var rgrc = (RECT*)lParam;
+
+        if (_allowsTransparency || _extendTitleBarHeight > 0)
+        {
+            // Custom chrome: client == window (no non-client deflate). Keep the original behavior
+            // exactly (return 0). WVR_VALIDRECTS is only meaningful for windows that composite
+            // through the redirection bitmap; transparent (NOREDIRECTIONBITMAP) windows don't, and
+            // returning it here breaks their sizing.
+            if (!_allowsTransparency && Window.WindowState == Controls.WindowState.Maximized)
+            {
+                int frame = User32.GetSystemMetrics(92 /* SM_CXPADDEDBORDER */)
+                          + User32.GetSystemMetrics(33 /* SM_CYSIZEFRAME */);
+                rgrc[0].left += frame;
+                rgrc[0].top += frame;
+                rgrc[0].right -= frame;
+                rgrc[0].bottom -= frame;
+            }
+            return 0;
+        }
+
+        // Opaque native chrome: let DefWindowProc compute the standard client rect into rgrc[0].
+        RECT oldClient = rgrc[2];
+        _ = User32.DefWindowProc(Handle, WindowMessages.WM_NCCALCSIZE, wParam, lParam);
+        RECT newClient = rgrc[0];
+
+        int validWidth = Math.Min(oldClient.Width, newClient.Width);
+        int validHeight = Math.Min(oldClient.Height, newClient.Height);
+        if (validWidth > 0 && validHeight > 0)
+        {
+            // rgrc[2] = source (old client, top-left aligned), rgrc[1] = destination (new client, top-left aligned).
+            rgrc[2] = new RECT(oldClient.left, oldClient.top, oldClient.left + validWidth, oldClient.top + validHeight);
+            rgrc[1] = new RECT(newClient.left, newClient.top, newClient.left + validWidth, newClient.top + validHeight);
+            return (nint)WVR_VALIDRECTS;
+        }
+
+        return 0;
+    }
+
+    private void ApplyIcons()
+    {
+        // WM_SETICON: wParam=ICON_SMALL(0)/ICON_BIG(1), lParam=HICON
+        const int ICON_SMALL = 0;
+        const int ICON_BIG = 1;
+
+        User32.SendMessage(Handle, WindowMessages.WM_SETICON, (nint)ICON_SMALL, _hIconSmall);
+        User32.SendMessage(Handle, WindowMessages.WM_SETICON, (nint)ICON_BIG, _hIconBig);
+    }
+
+    private static nint TryCreateIcon(IconSource icon, int desiredSizePx)
+    {
+        if (!icon.TryGetPixels(desiredSizePx, out var bmp))
+        {
+            return 0;
+        }
+
+        return CreateHIconFromPixelBuffer(bmp);
+    }
+
+    private static nint CreateHIconFromPixelBuffer(Bgra32PixelBuffer bmp)
+    {
+        int w = Math.Max(1, bmp.WidthPx);
+        int h = Math.Max(1, bmp.HeightPx);
+
+        var bmi = BITMAPINFO.Create32bpp(w, h);
+        nint bits;
+        nint hbmColor = Gdi32.CreateDIBSection(0, ref bmi, usage: 0, out bits, 0, 0);
+        if (hbmColor == 0 || bits == 0)
+        {
+            if (hbmColor != 0)
+            {
+                Gdi32.DeleteObject(hbmColor);
+            }
+
+            return 0;
+        }
+
+        Marshal.Copy(bmp.Data, 0, bits, bmp.Data.Length);
+
+        // For 32-bpp icons, Windows primarily uses the alpha channel; provide a 1-bpp mask for compatibility.
+        nint hbmMask = Gdi32.CreateBitmap(w, h, nPlanes: 1, nBitCount: 1, lpBits: 0);
+        if (hbmMask == 0)
+        {
+            Gdi32.DeleteObject(hbmColor);
+            return 0;
+        }
+
+        var info = new ICONINFO
+        {
+            fIcon = true,
+            xHotspot = 0,
+            yHotspot = 0,
+            hbmMask = hbmMask,
+            hbmColor = hbmColor,
+        };
+
+        nint hIcon = User32.CreateIconIndirect(ref info);
+        Gdi32.DeleteObject(hbmColor);
+        Gdi32.DeleteObject(hbmMask);
+        return hIcon;
+    }
+
+    private void DestroyIcons()
+    {
+        var oldSmall = _hIconSmall;
+        var oldBig = _hIconBig;
+        _hIconSmall = 0;
+        _hIconBig = 0;
+
+        if (oldSmall != 0)
+        {
+            User32.DestroyIcon(oldSmall);
+        }
+
+        if (oldBig != 0 && oldBig != oldSmall)
+        {
+            User32.DestroyIcon(oldBig);
+        }
+    }
+
+    private uint GetWindowStyle()
+    {
+        // Popup surfaces carry no caption, border, or resize frame: the popup chrome draws its own
+        // shadow and rounding. Kept ahead of the transparency branch so a transparent popup does not
+        // pick up the resize-tracking WS_THICKFRAME meant for top-level custom-chrome windows.
+        if (Window.Kind == Controls.WindowKind.Popup)
+        {
+            return WindowStyles.WS_POPUP;
+        }
+
+        // Per-pixel transparency cannot use the default visible non-client chrome because
+        // layered presentation and input routing both use client coordinates. Keep
+        // WS_THICKFRAME for native resize tracking, then remove the actual non-client
+        // frame in WM_NCCALCSIZE so client-origin == window-origin.
+        if (Window.AllowsTransparency)
+        {
+            return WindowStyles.WS_POPUP | WindowStyles.WS_SYSMENU | WindowStyles.WS_THICKFRAME;
+        }
+
+        // Borderless or fullscreen: strip the entire native non-client frame.
+        if (Window.Borderless || _isFullScreen)
+        {
+            return WindowStyles.WS_POPUP;
+        }
+
+        {
+            uint style = WindowStyles.WS_OVERLAPPEDWINDOW;
+            if (Window.IsDialogWindow)
+            {
+                style &= ~(WindowStyles.WS_MAXIMIZEBOX | WindowStyles.WS_MINIMIZEBOX);
+            }
+            if (Window.IsAlertWindow)
+            {
+                style &= ~WindowStyles.WS_SYSMENU;
+            }
+            if (Window.Kind == Controls.WindowKind.Tool)
+            {
+                // Tool windows expose only a close button (no minimize/maximize), matching the utility-window
+                // contract on the other platforms.
+                style &= ~(WindowStyles.WS_MINIMIZEBOX | WindowStyles.WS_MAXIMIZEBOX);
+            }
+            if (!Window.WindowSize.IsResizable)
+            {
+                style &= ~(WindowStyles.WS_THICKFRAME | WindowStyles.WS_MAXIMIZEBOX);
+            }
+
+            return style;
+        }
+    }
+
+    private uint GetWindowExStyle()
+    {
+        uint exStyle = 0;
+        if (Window.AllowsTransparency)
+        {
+            // GPU-surface transparency (D2D + DXGI swap-chain) requires the window to be
+            // created without a redirection bitmap so DWM composes the swap-chain output
+            // with per-pixel alpha. WS_EX_NOREDIRECTIONBITMAP must be set at CreateWindow
+            // time and cannot be toggled later.
+            if (ResolveTransparencyMode() == Win32TransparencyMode.Surface)
+            {
+                exStyle |= WindowStylesEx.WS_EX_NOREDIRECTIONBITMAP;
+            }
+            else
+            {
+                exStyle |= WindowStylesEx.WS_EX_LAYERED;
+            }
+        }
+        else if (Window.Opacity < 0.999)
+        {
+            // Window-wide opacity (no per-pixel alpha) uses the classic WS_EX_LAYERED +
+            // SetLayeredWindowAttributes(LWA_ALPHA) path regardless of backend.
+            exStyle |= WindowStylesEx.WS_EX_LAYERED;
+        }
+
+        if (Window.ShowInTaskbar)
+        {
+            exStyle |= WindowStylesEx.WS_EX_APPWINDOW;
+        }
+
+        switch (Window.Kind)
+        {
+            // Tool/utility window: excluded from taskbar + Alt-Tab via WS_EX_TOOLWINDOW, regardless of
+            // AllowsTransparency (the tool role is orthogonal to per-pixel alpha; the thin-caption effect
+            // is moot on a borderless surface). Set at creation so Alt-Tab registration is decided up front
+            // rather than patched late. ShowInTaskbar=false is additionally owner-HWND handled.
+            case Controls.WindowKind.Tool:
+                exStyle |= WindowStylesEx.WS_EX_TOOLWINDOW;
+                exStyle &= ~WindowStylesEx.WS_EX_APPWINDOW;
+                break;
+
+            // Popup surface: excluded from the taskbar (WS_EX_TOOLWINDOW) and never activated
+            // (WS_EX_NOACTIVATE) so it does not steal focus from the owner. Unlike the overlay it omits
+            // WS_EX_TRANSPARENT, so it still receives mouse input. Per-pixel alpha comes from the
+            // transparency branch above when AllowsTransparency is set.
+            case Controls.WindowKind.Popup:
+                exStyle |= WindowStylesEx.WS_EX_TOOLWINDOW | WindowStylesEx.WS_EX_NOACTIVATE;
+                exStyle &= ~WindowStylesEx.WS_EX_APPWINDOW;
+                break;
+
+            // Input-transparent overlay (drag preview): clicks pass through (WS_EX_TRANSPARENT) and the window
+            // never activates (WS_EX_NOACTIVATE), so it cannot steal capture/focus from the source window.
+            // WS_EX_LAYERED is required for the click-through hit-test pass-through to work.
+            case Controls.WindowKind.Overlay:
+                exStyle |= WindowStylesEx.WS_EX_TRANSPARENT | WindowStylesEx.WS_EX_LAYERED | WindowStylesEx.WS_EX_NOACTIVATE;
+                break;
+        }
+
+        return exStyle;
+    }
+
+    /// <summary>
+    /// Resolves the backend's preferred Win32 transparency strategy. Backends that don't
+    /// implement <see cref="IWin32TransparencyCapabilities"/> default to
+    /// <see cref="Win32TransparencyMode.Bitmap"/> - the existing layered-DIB path.
+    /// </summary>
+    private Win32TransparencyMode ResolveTransparencyMode()
+        => (Window.GraphicsFactory as IWin32TransparencyCapabilities)?.TransparencyMode
+           ?? Win32TransparencyMode.Bitmap;
+
+    private void ApplyResizeMode() => ReapplyOwnedStyle();
+
+    private void HandleDestroy()
+    {
+        // Best-effort Closed for out-of-band destroy (e.g. external DestroyWindow call).
+        // Normal close path already called RaiseClosed() before DestroyWindow,
+        // so the _lifetimeState guard inside RaiseClosed() prevents double invocation.
+        Window.RaiseClosed();
+
+        RevokeDropTarget();
+        _titleBarThemeSync.Dispose();
+        DestroyIcons();
+
+        // ReleaseCapture works on the thread, not on this window: releasing it unconditionally took
+        // the capture away from whatever else holds it, and a popup closing on a press cancelled the
+        // press the owner had just started (a button under a tooltip needed a second click).
+        if (User32.GetCapture() == Handle)
+        {
+            User32.ReleaseCapture();
+        }
+
+        Window.ClearMouseOverState();
+        Window.ClearMouseCaptureState();
+        Window.ReleaseWindowGraphicsResources(Handle);
+
+        _host.UnregisterWindow(Handle);
+        Window.DisposeVisualTree();
+
+        if (_invisibleCaretBitmap != 0)
+        {
+            Gdi32.DeleteObject(_invisibleCaretBitmap);
+            _invisibleCaretBitmap = 0;
+        }
+
+        Handle = 0;
+    }
+
+    private Win32DropTargetAdapter? _dropTargetAdapter;
+    private bool _legacyDropFilesRegistered;
+    private bool _oleInitialized;
+
+    // STA → IDropTarget + IDropTargetHelper.   MTA → WM_DROPFILES fallback.
+    // Apartment requirements and effect negotiation details: see remarks on UIElement.AllowDropProperty.
+    /// <inheritdoc/>
+    public void SetAllowDrop(bool allow)
+    {
+        if (allow) RegisterDropTarget();
+        else RevokeDropTarget();
+    }
+
+    private void RegisterDropTarget()
+    {
+        if (Handle == 0 || _dropTargetCom != 0 || _legacyDropFilesRegistered) return;
+
+        if (Thread.CurrentThread.GetApartmentState() == ApartmentState.STA &&
+            Ole32.OleInitialize(0) >= 0)
+        {
+            // Every successful OleInitialize must be balanced by OleUninitialize (revoke/destroy path).
+            _oleInitialized = true;
+            _dropTargetAdapter = new Win32DropTargetAdapter(this);
+            var pTarget = Win32DropTarget.Create(_dropTargetAdapter);
+            int hr = Ole32.RegisterDragDrop(Handle, pTarget);
+            if (hr >= 0)
+            {
+                _dropTargetCom = pTarget;
+                return;
+            }
+            Win32DropTarget.Release(pTarget);
+            _dropTargetAdapter = null;
+            Ole32.OleUninitialize();
+            _oleInitialized = false;
+        }
+
+        // Fallback: WM_DROPFILES will be delivered to WndProc; HandleDropFiles routes through the router.
+        Shell32.DragAcceptFiles(Handle, true);
+        _legacyDropFilesRegistered = true;
+    }
+
+    private void RevokeDropTarget()
+    {
+        if (Handle == 0) return;
+        if (_dropTargetCom != 0)
+        {
+            _ = Ole32.RevokeDragDrop(Handle);
+            _dropTargetAdapter?.ReleaseHelper();
+            _dropTargetAdapter = null;
+            Win32DropTarget.Release(_dropTargetCom);
+            _dropTargetCom = 0;
+        }
+        if (_oleInitialized)
+        {
+            Ole32.OleUninitialize();
+            _oleInitialized = false;
+        }
+        if (_legacyDropFilesRegistered)
+        {
+            Shell32.DragAcceptFiles(Handle, false);
+            _legacyDropFilesRegistered = false;
+        }
+    }
+
+    private nint HandlePaint()
+    {
+        var ps = new PAINTSTRUCT();
+        nint hdc = User32.BeginPaint(Handle, out ps);
+
+        // The system asks for a paint when what the window showed is gone, whatever the scene changed.
+        Window.NotePresentedFrameLost();
+
+        try
+        {
+            NeedsRender = false;
+            if (_allowsTransparency && ResolveTransparencyMode() == Win32TransparencyMode.Bitmap)
+            {
+                // Layered (DIB) windows are updated via UpdateLayeredWindow - paint DC isn't used.
+                RenderNowCore();
+            }
+            else
+            {
+                // Default and Surface paths both render via Window.RenderFrame; Surface mode
+                // marks the HDC surface as transparent so the backend selects an alpha-aware
+                // present (D2D: PREMULTIPLIED swap-chain).
+                Window.RenderFrame(GetHdcSurface(hdc));
+            }
+        }
+        finally
+        {
+            User32.EndPaint(Handle, ref ps);
+        }
+
+        return 0;
+    }
+
+    internal void RenderIfNeeded()
+    {
+        if (!NeedsRender || Handle == 0)
+        {
+            return;
+        }
+
+        NeedsRender = false;
+        RenderNowCore();
+    }
+
+    internal void RenderNow()
+    {
+        if (Handle == 0)
+        {
+            return;
+        }
+
+        NeedsRender = false;
+        RenderNowCore();
+    }
+
+    private void RenderNowCore()
+    {
+        // Bitmap-mode transparency goes through UpdateLayeredWindow - no HDC required.
+        if (_allowsTransparency && ResolveTransparencyMode() == Win32TransparencyMode.Bitmap)
+        {
+            RenderNowLayered();
+            _ = User32.ValidateRect(Handle, 0);
+            return;
+        }
+
+        // Render without relying on WM_PAINT. This matches the request-driven model (WPF-style coalescing).
+        // If the window is in an invalid paint state (e.g., uncovered), ValidateRect prevents redundant WM_PAINT storms.
+
+        nint hdc = User32.GetDC(Handle);
+        if (hdc == 0)
+        {
+            return;
+        }
+
+        try
+        {
+            Window.RenderFrame(GetHdcSurface(hdc));
+            _ = User32.ValidateRect(Handle, 0);
+        }
+        finally
+        {
+            _ = User32.ReleaseDC(Handle, hdc);
+        }
+    }
+
+    private void RenderNowLayered()
+    {
+        if (Handle == 0)
+        {
+            return;
+        }
+
+        var clientSize = Window.ClientSize;
+        int pixelWidth = (int)Math.Ceiling(clientSize.Width * Window.DpiScale);
+        int pixelHeight = (int)Math.Ceiling(clientSize.Height * Window.DpiScale);
+        pixelWidth = Math.Max(1, pixelWidth);
+        pixelHeight = Math.Max(1, pixelHeight);
+
+        if (Window.GraphicsFactory is not IWindowSurfacePresenter presenter)
+        {
+            return;
+        }
+
+        var monitor = User32.MonitorFromWindow(Handle, MonitorDefaultToNearest);
+        var surface = _cachedLayeredSurface;
+        if (surface == null || !surface.Matches(Handle, monitor, pixelWidth, pixelHeight, Window.DpiScale))
+        {
+            surface = new Win32LayeredPresentSurface(Handle, monitor, pixelWidth, pixelHeight, Window.DpiScale);
+            _cachedLayeredSurface = surface;
+        }
+        _ = presenter.Present(Window, surface, _opacity);
+    }
+
+    private Win32LayeredPresentSurface? _cachedLayeredSurface;
+
+    private Win32HdcSurface? _cachedHdcSurface;
+
+    private Win32HdcSurface GetHdcSurface(nint hdc)
+    {
+        var clientSize = Window.ClientSize;
+        int pixelWidth = Math.Max(1, (int)Math.Ceiling(clientSize.Width * Window.DpiScale));
+        int pixelHeight = Math.Max(1, (int)Math.Ceiling(clientSize.Height * Window.DpiScale));
+        double dpiScale = Window.DpiScale > 0 ? Window.DpiScale : 1.0;
+        // Surface-mode transparent windows (WS_EX_NOREDIRECTIONBITMAP + GPU swap-chain)
+        // need the backend to pick a premultiplied-alpha present path. We mark the surface
+        // here so D2D's CreateContextCore selects the swap-chain transparent target.
+        bool transparent = _allowsTransparency
+            && ResolveTransparencyMode() == Win32TransparencyMode.Surface;
+        var monitor = User32.MonitorFromWindow(Handle, MonitorDefaultToNearest);
+
+        if (_cachedHdcSurface?.Matches(hdc, monitor, pixelWidth, pixelHeight, dpiScale, transparent) != true)
+        {
+            _cachedHdcSurface = new Win32HdcSurface(Handle, hdc, monitor, pixelWidth, pixelHeight, dpiScale, TransparentComposition: transparent);
+        }
+        return _cachedHdcSurface;
+    }
+
+    private sealed record Win32HdcSurface(nint Hwnd, nint Hdc, nint Monitor, int PixelWidth, int PixelHeight, double DpiScale, bool TransparentComposition)
+        : IWin32HdcWindowSurface
+    {
+        public nint Handle => Hwnd;
+
+        // HMONITOR identifies the display; replicate it in NativeHandle for backends that
+        // expect the platform-native pointer there. IdLow mirrors the same value so structural
+        // equality is meaningful even when callers only inspect the numeric id pair.
+        public PlatformDisplayIdentity DisplayIdentity =>
+            Monitor == 0 ? default : new PlatformDisplayIdentity((ulong)Monitor, 0, Monitor);
+
+        public bool Matches(nint hdc, nint monitor, int pixelWidth, int pixelHeight, double dpiScale, bool transparentComposition) =>
+            Hdc == hdc && Monitor == monitor && PixelWidth == pixelWidth && PixelHeight == pixelHeight && DpiScale == dpiScale
+            && TransparentComposition == transparentComposition;
+    }
+
+    private void EnsureLayeredStyleIfNeeded()
+    {
+        if (Handle == 0)
+        {
+            return;
+        }
+
+        const int GWL_EXSTYLE = -20;
+        const uint SWP_NOSIZE = 0x0001;
+        const uint SWP_NOMOVE = 0x0002;
+        const uint SWP_NOZORDER = 0x0004;
+        const uint SWP_FRAMECHANGED = 0x0020;
+
+        uint exStyle = (uint)User32.GetWindowLongPtr(Handle, GWL_EXSTYLE).ToInt64();
+        bool hasNoRedirection = (exStyle & WindowStylesEx.WS_EX_NOREDIRECTIONBITMAP) != 0;
+
+        // Surface-mode (NOREDIRECTIONBITMAP) windows are fixed at creation; do not toggle
+        // WS_EX_LAYERED on/off - that bit is only meaningful when the window has a
+        // redirection surface, and switching transparency strategy on the fly requires a
+        // window recreate which is outside this hook's contract.
+        if (hasNoRedirection)
+        {
+            return;
+        }
+
+        bool needsLayered = _allowsTransparency || _opacity < 0.999;
+        bool hasLayered = (exStyle & WindowStylesEx.WS_EX_LAYERED) != 0;
+
+        if (needsLayered == hasLayered)
+        {
+            return;
+        }
+
+        if (needsLayered)
+        {
+            exStyle |= WindowStylesEx.WS_EX_LAYERED;
+        }
+        else
+        {
+            exStyle &= ~WindowStylesEx.WS_EX_LAYERED;
+        }
+
+        User32.SetWindowLongPtr(Handle, GWL_EXSTYLE, (nint)exStyle);
+        User32.SetWindowPos(Handle, 0, 0, 0, 0, 0, SWP_NOSIZE | SWP_NOMOVE | SWP_NOZORDER | SWP_FRAMECHANGED | SWP_NOACTIVATE_ON_REFRESH);
+    }
+
+    private void ApplyOpacity()
+    {
+        if (Handle == 0 || _allowsTransparency)
+        {
+            return;
+        }
+
+        // Global opacity for non-layered rendering.
+        const uint LWA_ALPHA = 0x00000002;
+        byte alpha = (byte)Math.Round(_opacity * 255.0);
+        _ = User32.SetLayeredWindowAttributes(Handle, 0, alpha, LWA_ALPHA);
+    }
+
+    private void ValidateTransparencySupport()
+    {
+        if (!_allowsTransparency)
+        {
+            return;
+        }
+
+        // Bitmap-mode (UpdateLayeredWindow) requires IWindowSurfacePresenter; Surface-mode
+        // (NOREDIRECTIONBITMAP + GPU swap-chain) renders through the standard HDC path so
+        // the presenter capability isn't needed.
+        if (ResolveTransparencyMode() == Win32TransparencyMode.Bitmap
+            && Window.GraphicsFactory is not IWindowSurfacePresenter)
+        {
+            throw new PlatformNotSupportedException("Per-pixel transparency on Win32 requires a graphics backend that supports window surfaces.");
+        }
+    }
+
+    // Lightweight HWND-only surface used to drive the IWindowSurfacePresenter (Bitmap-mode
+    // UpdateLayeredWindow) path. Distinct from Win32HdcSurface because the present path
+    // creates its own offscreen DC; no HDC is supplied at this layer.
+    private sealed class Win32LayeredPresentSurface : IWin32WindowSurface
+    {
+        public nint Handle => Hwnd;
+
+        public nint Hwnd { get; }
+
+        public nint Monitor { get; }
+
+        public int PixelWidth { get; }
+
+        public int PixelHeight { get; }
+
+        public double DpiScale { get; }
+
+        public PlatformDisplayIdentity DisplayIdentity =>
+            Monitor == 0 ? default : new PlatformDisplayIdentity((ulong)Monitor, 0, Monitor);
+
+        public Win32LayeredPresentSurface(nint hwnd, nint monitor, int pixelWidth, int pixelHeight, double dpiScale)
+        {
+            Hwnd = hwnd;
+            Monitor = monitor;
+            PixelWidth = pixelWidth;
+            PixelHeight = pixelHeight;
+            DpiScale = dpiScale;
+        }
+
+        public bool Matches(nint hwnd, nint monitor, int pixelWidth, int pixelHeight, double dpiScale) =>
+            Hwnd == hwnd && Monitor == monitor && PixelWidth == pixelWidth && PixelHeight == pixelHeight && DpiScale == dpiScale;
+    }
+
+    // All-zero monochrome caret bitmap: the system renders a bitmap caret by XOR-ing it,
+    // so zero bits draw nothing even when an IME calls ShowCaret on the focused window.
+    private nint _invisibleCaretBitmap;
+
+    /// <summary>Creates the window's system caret with an invisible bitmap so caret-following
+    /// IMEs and accessibility tools get a position anchor without anything blinking on screen.</summary>
+    private unsafe void CreateInvisibleSystemCaret()
+    {
+        if (_invisibleCaretBitmap == 0)
+        {
+            // 1bpp 1x20: scanlines are WORD aligned, so 20 rows take 2 bytes each, all zero.
+            byte* bits = stackalloc byte[40];
+            new Span<byte>(bits, 40).Clear();
+            _invisibleCaretBitmap = Gdi32.CreateBitmap(1, 20, 1, 1, (nint)bits);
+        }
+
+        if (_invisibleCaretBitmap != 0)
+        {
+            User32.CreateCaret(Handle, _invisibleCaretBitmap, 0, 0);
+        }
+        else
+        {
+            User32.CreateCaret(Handle, 0, 1, 20);
+        }
+    }
+
+    private unsafe nint HandleGetMinMaxInfo(nint lParam)
+    {
+        var info = (MINMAXINFO*)lParam;
+
+        uint dpi = Window.Dpi == 0 ? GetDpiForWindow(Handle) : Window.Dpi;
+        double dpiScale = dpi / 96.0;
+        if (dpiScale <= 0) dpiScale = 1.0;
+
+        // For transparent (WS_POPUP | WS_THICKFRAME) windows, the OS extends the maximized
+        // window beyond the work area by the frame thickness. Override ptMaxPosition/ptMaxSize
+        // so the maximized window exactly fills the work area with no frame overshoot.
+        if (_allowsTransparency)
+        {
+            var hMonitor = User32.MonitorFromWindow(Handle, MonitorDefaultToNearest);
+            var mi = MONITORINFO.Create();
+            if (User32.GetMonitorInfo(hMonitor, ref mi))
+            {
+                info->ptMaxPosition.x = mi.rcWork.left - mi.rcMonitor.left;
+                info->ptMaxPosition.y = mi.rcWork.top - mi.rcMonitor.top;
+                info->ptMaxSize.x = mi.rcWork.Width;
+                info->ptMaxSize.y = mi.rcWork.Height;
+            }
+        }
+
+        // The OS default min track size exists for caption buttons; windows without visible
+        // non-client chrome (transparent or borderless) have none, so only the WindowSize minimums apply.
+        if (_allowsTransparency || Window.Borderless)
+        {
+            info->ptMinTrackSize.x = 1;
+            info->ptMinTrackSize.y = 1;
+        }
+
+        var ws = Window.WindowSize;
+        double minW = ws.MinWidth;
+        double minH = ws.MinHeight;
+        double maxW = ws.MaxWidth;
+        double maxH = ws.MaxHeight;
+
+        if (minW > 0 || minH > 0)
+        {
+            var minRect = new RECT(0, 0,
+                minW > 0 ? (int)Math.Ceiling(minW * dpiScale) : 0,
+                minH > 0 ? (int)Math.Ceiling(minH * dpiScale) : 0);
+            if (!_allowsTransparency)
+            {
+                Win32DpiApiResolver.AdjustWindowRectExForDpi(ref minRect, GetWindowStyle(), false, GetWindowExStyle(), dpi);
+            }
+
+            if (minW > 0) info->ptMinTrackSize.x = minRect.Width;
+            if (minH > 0) info->ptMinTrackSize.y = minRect.Height;
+        }
+
+        if (!double.IsPositiveInfinity(maxW) || !double.IsPositiveInfinity(maxH))
+        {
+            var maxRect = new RECT(0, 0,
+                !double.IsPositiveInfinity(maxW) ? (int)Math.Ceiling(maxW * dpiScale) : 0,
+                !double.IsPositiveInfinity(maxH) ? (int)Math.Ceiling(maxH * dpiScale) : 0);
+            if (!_allowsTransparency)
+            {
+                Win32DpiApiResolver.AdjustWindowRectExForDpi(ref maxRect, GetWindowStyle(), false, GetWindowExStyle(), dpi);
+            }
+
+            if (!double.IsPositiveInfinity(maxW)) info->ptMaxTrackSize.x = maxRect.Width;
+            if (!double.IsPositiveInfinity(maxH)) info->ptMaxTrackSize.y = maxRect.Height;
+        }
+
+        return 0;
+    }
+
+    private nint HandleSize(nint wParam, nint lParam)
+    {
+        int widthPx = (short)(lParam.ToInt64() & 0xFFFF);
+        int heightPx = (short)((lParam.ToInt64() >> 16) & 0xFFFF);
+
+        Window.SetClientSizeDip(widthPx / Window.DpiScale, heightPx / Window.DpiScale);
+        Window.PerformLayout();
+        Window.Invalidate();
+
+        // Notify WindowState change from OS (e.g. user drags from maximized, snap, taskbar minimize)
+        const int SIZE_MINIMIZED = 1;
+        const int SIZE_MAXIMIZED = 2;
+        const int SIZE_RESTORED = 0;
+        int sizeType = (int)wParam;
+        var newState = sizeType switch
+        {
+            SIZE_MINIMIZED => Controls.WindowState.Minimized,
+            SIZE_MAXIMIZED => Controls.WindowState.Maximized,
+            SIZE_RESTORED => Controls.WindowState.Normal,
+            _ => Window.WindowState,
+        };
+        // While fullscreen, the monitor-cover SetWindowPos emits SIZE_RESTORED; do not let it revert the state.
+        if (!_isFullScreen && newState != Window.WindowState)
+            Window.SetWindowStateFromBackend(newState);
+
+        Window.RaiseClientSizeChanged(widthPx / Window.DpiScale, heightPx / Window.DpiScale);
+        return 0;
+    }
+
+    /// <summary>
+    /// Corrects the rectangle the OS move loop is tracking after a DPI transition, so a fit window
+    /// follows the cursor at the size layout asked for instead of snapping to it on release. Only
+    /// a transition sets this path live; an ordinary move goes straight to DefWindowProc.
+    /// </summary>
+    private nint HandleMoving(nint lParam)
+    {
+        if (!_moveLoopRectIsStale || Window.RequestedClientSize is not Size requested)
+        {
+            return User32.DefWindowProc(Handle, WindowMessages.WM_MOVING, 0, lParam);
+        }
+
+        uint dpi = Window.Dpi == 0 ? GetDpiForWindow(Handle) : Window.Dpi;
+        double dpiScale = dpi / 96.0;
+        var target = new RECT(0, 0,
+            (int)Math.Round(requested.Width * dpiScale),
+            (int)Math.Round(requested.Height * dpiScale));
+        if (!_allowsTransparency && _extendTitleBarHeight <= 0)
+        {
+            Win32DpiApiResolver.AdjustWindowRectExForDpi(
+                ref target, GetWindowStyle(), false, GetWindowExStyle(), dpi);
+        }
+
+        var rect = Marshal.PtrToStructure<RECT>(lParam);
+        if (rect.Width == target.Width && rect.Height == target.Height)
+        {
+            _moveLoopRectIsStale = false;
+            return User32.DefWindowProc(Handle, WindowMessages.WM_MOVING, 0, lParam);
+        }
+
+        rect.right = rect.left + target.Width;
+        rect.bottom = rect.top + target.Height;
+        Marshal.StructureToPtr(rect, lParam, false);
+        return 1;
+    }
+
+    private nint HandleDpiChanged(nint wParam, nint lParam)
+    {
+        uint newDpi = (uint)(wParam.ToInt64() & 0xFFFF);
+        Window.SetDpi(newDpi);
+
+        // A transition during a drag leaves the move loop holding the old scale's rectangle, which
+        // it re-applies over the resize below on the next mouse move.
+        _moveLoopRectIsStale = true;
+
+        var suggestedRect = Marshal.PtrToStructure<RECT>(lParam);
+        User32.SetWindowPos(Handle, 0,
+            suggestedRect.left, suggestedRect.top,
+            suggestedRect.Width, suggestedRect.Height,
+            0x0004 | 0x0010); // SWP_NOZORDER | SWP_NOACTIVATE
+
+        // WM_SIZE is usually sent after SetWindowPos, but we need a consistent client size for the
+        // layout pass we run below (otherwise a stale _clientSizeDip can cause a 1-frame "broken" layout).
+        User32.GetClientRect(Handle, out var clientRect);
+        Window.SetClientSizeDip(clientRect.Width / Window.DpiScale, clientRect.Height / Window.DpiScale);
+
+        // Re-apply DWM extended frame with updated DPI scale.
+        if (_extendTitleBarHeight > 0)
+            SetExtendClientAreaToTitleBar(_extendTitleBarHeight);
+
+        Window.PerformLayout();
+        Window.Invalidate();
+
+        // During modal move/size loop, the normal render pass doesn't run.
+        // Force an immediate render so the layered window updates at the new DPI.
+        if (_allowsTransparency)
+            RenderIfNeeded();
+
+        return 0;
+    }
+
+    private nint HandleDpiChangedAfterParent()
+    {
+        // Sent to a child window after its parent's DPI changed (e.g. a window hosted inside another
+        // process's window that moved to a different-DPI monitor). Unlike WM_DPICHANGED it carries no
+        // DPI or suggested rect, and the parent owns position/size, so re-query and keep the placement.
+        uint newDpi = GetDpiForWindow(Handle);
+        uint oldDpi = Window.Dpi;
+        if (newDpi == 0 || newDpi == oldDpi)
+        {
+            return 0;
+        }
+
+        Window.SetDpi(newDpi);
+
+        User32.GetClientRect(Handle, out var clientRect);
+        Window.SetClientSizeDip(clientRect.Width / Window.DpiScale, clientRect.Height / Window.DpiScale);
+
+        if (_extendTitleBarHeight > 0)
+            SetExtendClientAreaToTitleBar(_extendTitleBarHeight);
+
+        Window.PerformLayout();
+        Window.Invalidate();
+
+        if (_allowsTransparency)
+            RenderIfNeeded();
+
+        return 0;
+    }
+
+    private nint HandleActivate(nint wParam)
+    {
+        bool active = (wParam.ToInt64() & 0xFFFF) != 0;
+        Window.SetIsActive(active);
+        if (active)
+        {
+            Window.RaiseActivated();
+        }
+        else
+        {
+            Window.RaiseDeactivated();
+        }
+
+        return 0;
+    }
+
+    private nint HandleMouseMove(nint lParam)
+    {
+        if (IsMouseMessageFromPointer())
+        {
+            return 0;
+        }
+
+        EnsureMouseLeaveTracking();
+
+        // Dismiss watch: while a popup surface holds capture, moves land here regardless of pointer
+        // location. A move over a related surface (the owner window or a sibling popup of the same owner)
+        // is handed to that window so its own hover tracking runs there - e.g. a menu bar switching its
+        // open top-level menu as the pointer crosses siblings while a dropdown is open. This keeps the
+        // owner and the active popup chain behaving as one input surface, mirroring the press path.
+        if (Window.Kind == Controls.WindowKind.Popup)
+        {
+            int xPx = (short)(lParam.ToInt64() & 0xFFFF);
+            int yPx = (short)((lParam.ToInt64() >> 16) & 0xFFFF);
+            if (User32.GetClientRect(Handle, out var popupClient))
+            {
+                bool outside = xPx < 0 || yPx < 0 || xPx >= popupClient.Width || yPx >= popupClient.Height;
+                if (!outside)
+                {
+                    // Owner moves forwarded while this popup holds capture deliberately skip
+                    // TrackMouseEvent: the native pointer is not really over the owner, so leave
+                    // tracking would fire immediately and ping-pong. Retire that forwarded hover
+                    // explicitly when the pointer comes back into the popup.
+                    if (Window.Owner is Window ownerWindow)
+                    {
+                        WindowInputRouter.UpdateMouseOver(ownerWindow, null);
+                    }
+                }
+                else
+                {
+                    // Capture keeps delivering moves to this surface after the pointer has left it.
+                    // Clear its hover chain before forwarding; the later WM_MOUSELEAVE is asynchronous
+                    // and may not arrive until after the pointer has already entered another surface.
+                    WindowInputRouter.UpdateMouseOver(Window, null);
+
+                    const uint GA_ROOT = 2;
+                    var screenPt = new POINT(xPx, yPx);
+                    User32.ClientToScreen(Handle, ref screenPt);
+                    nint hit = User32.WindowFromPoint(screenPt);
+                    nint root = hit == 0 ? 0 : User32.GetAncestor(hit, GA_ROOT);
+                    if (root != 0 && root != Handle && Window.IsPopupInputForwardTarget(root))
+                    {
+                        var targetPt = screenPt;
+                        User32.ScreenToClient(root, ref targetPt);
+                        // Keep forwarding synchronous. Posted WM_MOUSEMOVE messages are not coalesced
+                        // with the platform's input messages, so rapid movement can build an unbounded
+                        // owner-window backlog that delays the following click while the popup has capture.
+                        _ = User32.SendMessage(root, WindowMessages.WM_MOUSEMOVE, 0, (targetPt.y << 16) | (targetPt.x & 0xFFFF));
+                        return 0;
+                    }
+
+                    // The pointer is over neither this surface nor a related one. Capture keeps every move
+                    // here, and the owner suppresses its own leave tracking while we hold it, so nothing
+                    // else will retire the owner's hover: do it here.
+                    if (Window.Owner is Window ownerWindow)
+                    {
+                        WindowInputRouter.UpdateMouseOver(ownerWindow, null);
+                    }
+                }
+            }
+        }
+
+        var pos = GetMousePosition(lParam);
+        var screenPos = ClientToScreen(pos);
+
+        bool leftDown = (User32.GetKeyState(VirtualKeys.VK_LBUTTON) & 0x8000) != 0;
+        bool rightDown = (User32.GetKeyState(VirtualKeys.VK_RBUTTON) & 0x8000) != 0;
+        bool middleDown = (User32.GetKeyState(VirtualKeys.VK_MBUTTON) & 0x8000) != 0;
+        WindowInputRouter.MouseMove(Window, pos, screenPos, leftDown, rightDown, middleDown, GetModifierKeys());
+
+        return 0;
+    }
+
+    // WM_MOUSELEAVE is only delivered after an explicit TrackMouseEvent(TME_LEAVE) registration,
+    // and the registration is consumed on each leave - so we re-register on every MouseMove until leave fires.
+    private void EnsureMouseLeaveTracking()
+    {
+        if (_isTrackingMouseLeave || Handle == 0)
+            return;
+
+        // While another surface holds capture, the moves arriving here are forwarded by that surface
+        // (a popup handing its owner the moves over it), not moves the system routed to us. The system
+        // still counts the pointer as away from this window, so a leave request fires back at once and
+        // ping-pongs against the next forwarded move. The capture holder drives hover in that mode.
+        nint capture = User32.GetCapture();
+        if (capture != 0 && capture != Handle)
+            return;
+
+        var tme = new TRACKMOUSEEVENT
+        {
+            cbSize = (uint)Marshal.SizeOf<TRACKMOUSEEVENT>(),
+            dwFlags = TRACKMOUSEEVENT.TME_LEAVE,
+            hwndTrack = Handle,
+            dwHoverTime = 0,
+        };
+        if (User32.TrackMouseEvent(ref tme))
+            _isTrackingMouseLeave = true;
+    }
+
+    private nint HandleMouseButton(nint lParam, MouseButton button, bool isDown, bool isDoubleClickMessage)
+    {
+        if (IsMouseMessageFromPointer())
+        {
+            return 0;
+        }
+
+        int xPx = (short)(lParam.ToInt64() & 0xFFFF);
+        int yPx = (short)((lParam.ToInt64() >> 16) & 0xFFFF);
+
+        // Dismiss watch: while a popup surface holds capture, presses land here regardless of pointer
+        // location. A press over a related surface (owner window or sibling popup of the same owner)
+        // is handed to that window and acts there normally - its close policy decides what closes -
+        // matching the in-surface path and the X11 owner-events grab. Any other outside press
+        // light-dismisses and is consumed (standard menu UX: the closing click does not also act on
+        // whatever is underneath).
+        if (isDown && Window.Kind == Controls.WindowKind.Popup && User32.GetClientRect(Handle, out var popupClient)
+            && (xPx < 0 || yPx < 0 || xPx >= popupClient.Width || yPx >= popupClient.Height))
+        {
+            const uint GA_ROOT = 2;
+            var screenPt = new POINT(xPx, yPx);
+            User32.ClientToScreen(Handle, ref screenPt);
+            nint hit = User32.WindowFromPoint(screenPt);
+            nint root = hit == 0 ? 0 : User32.GetAncestor(hit, GA_ROOT);
+            if (root != 0 && Window.IsPopupInputForwardTarget(root))
+            {
+                var targetPt = screenPt;
+                User32.ScreenToClient(root, ref targetPt);
+                uint forwardMsg = button switch
+                {
+                    MouseButton.Right => isDoubleClickMessage ? WindowMessages.WM_RBUTTONDBLCLK : WindowMessages.WM_RBUTTONDOWN,
+                    MouseButton.Middle => isDoubleClickMessage ? WindowMessages.WM_MBUTTONDBLCLK : WindowMessages.WM_MBUTTONDOWN,
+                    _ => isDoubleClickMessage ? WindowMessages.WM_LBUTTONDBLCLK : WindowMessages.WM_LBUTTONDOWN,
+                };
+                // wParam (MK_* state) is unused by our own WndProc, which re-reads key state itself.
+                _ = User32.PostMessage(root, forwardMsg, 0, (targetPt.y << 16) | (targetPt.x & 0xFFFF));
+            }
+            else
+            {
+                Window.OnPopupSurfaceOutsidePress();
+            }
+
+            return 0;
+        }
+        var pos = new Point(xPx / Window.DpiScale, yPx / Window.DpiScale);
+        var screenPos = ClientToScreen(pos);
+        bool leftDown = (User32.GetKeyState(VirtualKeys.VK_LBUTTON) & 0x8000) != 0;
+        bool rightDown = (User32.GetKeyState(VirtualKeys.VK_RBUTTON) & 0x8000) != 0;
+        bool middleDown = (User32.GetKeyState(VirtualKeys.VK_MBUTTON) & 0x8000) != 0;
+
+        int clickCount = 1;
+        int buttonIndex = (int)button;
+        if ((uint)buttonIndex < (uint)_lastPressClickCounts.Length)
+        {
+            if (isDown)
+            {
+                const int SM_CXDOUBLECLK = 36;
+                const int SM_CYDOUBLECLK = 37;
+                uint timeMs = unchecked((uint)User32.GetMessageTime());
+                uint maxDelayMs = User32.GetDoubleClickTime();
+                int maxDistX = User32.GetSystemMetrics(SM_CXDOUBLECLK);
+                int maxDistY = User32.GetSystemMetrics(SM_CYDOUBLECLK);
+
+                clickCount = _clickCountTracker.Update(button, xPx, yPx, timeMs, maxDelayMs, maxDistX, maxDistY);
+                if (isDoubleClickMessage && clickCount < 2)
+                {
+                    clickCount = 2;
+                }
+
+                _lastPressClickCounts[buttonIndex] = clickCount;
+            }
+            else
+            {
+                clickCount = _lastPressClickCounts[buttonIndex];
+                if (clickCount <= 0)
+                {
+                    clickCount = 1;
+                }
+            }
+        }
+        WindowInputRouter.MouseButton(
+            Window,
+            pos,
+            screenPos,
+            button,
+            isDown,
+            leftDown,
+            rightDown,
+            middleDown,
+            clickCount,
+            GetModifierKeys());
+
+        return 0;
+    }
+
+    private nint HandleMouseWheel(nint wParam, nint lParam, bool isHorizontal)
+    {
+        int raw = (short)((wParam.ToInt64() >> 16) & 0xFFFF);
+
+        // Win32 WHEEL_DELTA = 120 per notch. High-resolution mice / Precision Touchpad
+        // can deliver values less than 120 as fractional notches.
+        double notches = raw / 120.0;
+
+        // MouseWheelEventArgs.Delta convention: +Y = scroll-up intent, +X = scroll-left intent.
+        // Win32 vertical (WM_MOUSEWHEEL) raw +120 = wheel forward = scroll up → matches +Y.
+        // Win32 horizontal (WM_MOUSEHWHEEL) raw +120 = tilt right = scroll right → opposite
+        // of our +X convention, so flip the sign on the X axis.
+        Vector delta = isHorizontal
+            ? new Vector(-notches, 0)
+            : new Vector(0, notches);
+
+        var screenX = (short)(lParam.ToInt64() & 0xFFFF);
+        var screenY = (short)((lParam.ToInt64() >> 16) & 0xFFFF);
+        var pt = new POINT(screenX, screenY);
+        User32.ScreenToClient(Handle, ref pt);
+        var pos = new Point(pt.x / Window.DpiScale, pt.y / Window.DpiScale);
+        WindowInputRouter.MouseWheel(Window, pos, new Point(screenX, screenY), delta, modifiers: GetModifierKeys());
+
+        return 0;
+    }
+
+    private nint HandleMouseLeave()
+    {
+        _isTrackingMouseLeave = false;
+
+        WindowInputRouter.UpdateMouseOver(Window, null);
+        return 0;
+    }
+
+    private nint HandleNcHitTest(nint lParam)
+    {
+        const int HTNOWHERE = 0;
+        const int HTCLIENT = 1;
+        const int HTLEFT = 10;
+        const int HTRIGHT = 11;
+        const int HTTOP = 12;
+        const int HTTOPLEFT = 13;
+        const int HTTOPRIGHT = 14;
+        const int HTBOTTOM = 15;
+        const int HTBOTTOMLEFT = 16;
+        const int HTBOTTOMRIGHT = 17;
+
+        if (Handle == 0)
+        {
+            return HTNOWHERE;
+        }
+
+        int screenX = (short)(lParam.ToInt64() & 0xFFFF);
+        int screenY = (short)((lParam.ToInt64() >> 16) & 0xFFFF);
+        var pt = new POINT(screenX, screenY);
+        User32.ScreenToClient(Handle, ref pt);
+
+        if (!User32.GetClientRect(Handle, out var clientRect))
+        {
+            return HTCLIENT;
+        }
+
+        int w = clientRect.Width;
+        int h = clientRect.Height;
+
+        if (pt.x < 0 || pt.y < 0 || pt.x >= w || pt.y >= h)
+            return HTNOWHERE;
+
+        // Resize border detection for transparent windows (shadow area).
+        double dpiScale = GetDpiForWindow(Handle) / 96.0;
+        int grip = Math.Max(1, (int)(12 * dpiScale)); // shadow extent area
+
+        if (Window.WindowState != Controls.WindowState.Maximized && Window.WindowSize.IsResizable)
+        {
+            bool left = pt.x < grip;
+            bool right = pt.x >= w - grip;
+            bool top = pt.y < grip;
+            bool bottom = pt.y >= h - grip;
+
+            if (top && left) return HTTOPLEFT;
+            if (top && right) return HTTOPRIGHT;
+            if (bottom && left) return HTBOTTOMLEFT;
+            if (bottom && right) return HTBOTTOMRIGHT;
+            if (left) return HTLEFT;
+            if (right) return HTRIGHT;
+            if (top) return HTTOP;
+            if (bottom) return HTBOTTOM;
+        }
+
+        return HTCLIENT;
+    }
+
+    private const nint TABLET_DISABLE_PRESSANDHOLD = 0x00000001;
+    private const nint TABLET_DISABLE_PENTAPFEEDBACK = 0x00000008;
+    private const nint TABLET_DISABLE_PENBARRELFEEDBACK = 0x00000010;
+    private const nint TABLET_DISABLE_FLICKS = 0x00010000;
+
+    private const int FEEDBACK_TOUCH_PRESSANDHOLD = 9;
+    private const int FEEDBACK_TOUCH_RIGHTTAP = 10;
+
+    // Mouse messages the system made up from a touch or pen contact carry this in their extra info.
+    private const uint MOUSE_FROM_POINTER_MASK = 0xFFFFFF00;
+    private const uint MOUSE_FROM_POINTER_SIGNATURE = 0xFF515700;
+
+    // Enough to cover the samples a busy frame can merge into one update.
+    private const int MAX_POINTER_HISTORY = 32;
+
+    private static int PointerIdOf(nint wParam) => (int)(wParam.ToInt64() & 0xFFFF);
+
+    /// <summary>
+    /// True for a mouse message the system made up from a touch or pen contact. Those contacts already
+    /// arrived through WM_POINTER*, so routing the copy would press everything twice.
+    /// </summary>
+    private static bool IsMouseMessageFromPointer()
+        => TouchInputGate.IsSupported
+            && (unchecked((uint)User32.GetMessageExtraInfo()) & MOUSE_FROM_POINTER_MASK) == MOUSE_FROM_POINTER_SIGNATURE;
+
+    private unsafe void DisableTouchFeedback()
+    {
+        if (!TouchInputGate.IsSupported)
+        {
+            return;
+        }
+
+        // The circle the system draws while a finger is held would sit under the menu the hold opens.
+        int off = 0;
+        _ = User32.SetWindowFeedbackSetting(Handle, FEEDBACK_TOUCH_PRESSANDHOLD, 0, sizeof(int), &off);
+        _ = User32.SetWindowFeedbackSetting(Handle, FEEDBACK_TOUCH_RIGHTTAP, 0, sizeof(int), &off);
+    }
+
+    /// <summary>Routes a touch or pen WM_POINTER message; false leaves it to the system.</summary>
+    private unsafe bool HandlePointer(uint msg, nint wParam)
+    {
+        if (!TouchInputGate.IsSupported)
+        {
+            return false;
+        }
+
+        uint pointerId = (uint)PointerIdOf(wParam);
+        if (!User32.GetPointerInfo(pointerId, out var info))
+        {
+            return false;
+        }
+
+        PointerType pointerType;
+        if (info.pointerType == POINTER_INFO.PT_TOUCH)
+        {
+            pointerType = PointerType.Touch;
+        }
+        else if (info.pointerType == POINTER_INFO.PT_PEN)
+        {
+            pointerType = PointerType.Pen;
+        }
+        else
+        {
+            return false;
+        }
+
+        int id = (int)pointerId;
+        var modifiers = GetModifierKeys();
+        if ((info.pointerFlags & POINTER_INFO.POINTER_FLAG_CANCELED) != 0)
+        {
+            WindowInputRouter.PointerCancel(Window, id);
+            return true;
+        }
+
+        switch (msg)
+        {
+            case WindowMessages.WM_POINTERDOWN:
+                WindowInputRouter.PointerDown(Window, id, pointerType, PointerPosition(info), PointerScreenPosition(info),
+                    PointerTimestamp(info), modifiers);
+                break;
+
+            case WindowMessages.WM_POINTERUP:
+                WindowInputRouter.PointerUp(Window, id, pointerType, PointerPosition(info), PointerScreenPosition(info),
+                    PointerTimestamp(info), modifiers);
+                break;
+
+            default:
+                // One update can carry several samples the system merged. Speed is read from the spacing
+                // of samples in time, so each one is delivered, oldest first, with its own time.
+                if (info.historyCount > 1)
+                {
+                    uint count = Math.Min(info.historyCount, MAX_POINTER_HISTORY);
+                    var history = stackalloc POINTER_INFO[(int)count];
+                    if (User32.GetPointerInfoHistory(pointerId, ref count, history))
+                    {
+                        for (int index = (int)count - 1; index >= 1; index--)
+                        {
+                            var sample = history[index];
+                            WindowInputRouter.PointerMove(Window, id, pointerType, PointerPosition(sample),
+                                PointerScreenPosition(sample), PointerTimestamp(sample), modifiers);
+                        }
+                    }
+                }
+
+                WindowInputRouter.PointerMove(Window, id, pointerType, PointerPosition(info), PointerScreenPosition(info),
+                    PointerTimestamp(info), modifiers);
+                break;
+        }
+
+        return true;
+    }
+
+    private Point PointerPosition(in POINTER_INFO info)
+    {
+        var point = info.ptPixelLocation;
+        User32.ScreenToClient(Handle, ref point);
+        return new Point(point.x / Window.DpiScale, point.y / Window.DpiScale);
+    }
+
+    private Point PointerScreenPosition(in POINTER_INFO info) => ClientToScreen(PointerPosition(info));
+
+    /// <summary>When the contact sample was generated, in Stopwatch ticks.</summary>
+    private static long PointerTimestamp(in POINTER_INFO info)
+    {
+        // The performance count is the QPC value at generation, the clock Stopwatch reads on Windows. A
+        // device that does not report it gets the time the message is handled.
+        return info.performanceCount != 0 ? unchecked((long)info.performanceCount) : System.Diagnostics.Stopwatch.GetTimestamp();
+    }
+
+    private ModifierKeys GetModifierKeys()
+    {
+        var modifiers = ModifierKeys.None;
+
+        if ((User32.GetKeyState(VirtualKeys.VK_CONTROL) & 0x8000) != 0)
+        {
+            modifiers |= ModifierKeys.Control;
+        }
+
+        if ((User32.GetKeyState(VirtualKeys.VK_SHIFT) & 0x8000) != 0)
+        {
+            modifiers |= ModifierKeys.Shift;
+        }
+
+        if ((User32.GetKeyState(VirtualKeys.VK_MENU) & 0x8000) != 0)
+        {
+            modifiers |= ModifierKeys.Alt;
+        }
+
+        return modifiers;
+    }
+
+    private nint HandleKeyDown(uint msg, nint wParam, nint lParam)
+    {
+        _textInputSuppression.BeginKeyDown();
+
+        int platformKey = (int)wParam.ToInt64();
+        bool isRepeat = ((lParam.ToInt64() >> 30) & 1) != 0;
+        var modifiers = GetModifierKeys();
+
+        // Let the OS handle Alt+F4 so it translates to WM_SYSCOMMAND/SC_CLOSE and our WM_CLOSE path runs.
+        if (msg == WindowMessages.WM_SYSKEYDOWN &&
+            modifiers.HasFlag(ModifierKeys.Alt) &&
+            platformKey == VirtualKeys.VK_F4)
+        {
+            return User32.DefWindowProc(Handle, msg, wParam, lParam);
+        }
+
+        var args = new KeyEventArgs(MapKey(platformKey), platformKey, modifiers, isRepeat);
+        Window.RaisePreviewKeyDown(args);
+        if (args.Handled)
+        {
+            // TranslateMessage already queued this key's WM_CHAR, so the drop happens there.
+            _textInputSuppression.SuppressKeystrokeText();
+            return 0;
+        }
+
+        WindowInputRouter.KeyDown(Window, args);
+        Window.ProcessAccessKeyDown(args);
+
+        // WPF-like Tab behavior:
+        // - Always let the focused element see KeyDown first.
+        // - Only perform focus navigation if the key is still unhandled.
+        if (!args.Handled && args.Key == Key.Tab)
+        {
+            if (modifiers.HasFlag(ModifierKeys.Shift))
+            {
+                Window.FocusManager.MoveFocusPrevious();
+            }
+            else
+            {
+                Window.FocusManager.MoveFocusNext();
+            }
+
+            // Prevent a subsequent WM_CHAR '\t' from inserting a tab into the newly focused element.
+            _textInputSuppression.SuppressKeystrokeText();
+            return 0;
+        }
+
+        if (args.Handled)
+        {
+            _textInputSuppression.SuppressKeystrokeText();
+        }
+
+        // Suppress DefWindowProc for WM_SYSKEYDOWN when the key is a bare modifier (Alt/F10).
+        // Otherwise Windows activates the native menu system which interferes with our access key handling.
+        if (!args.Handled && msg == WindowMessages.WM_SYSKEYDOWN &&
+            (platformKey == VirtualKeys.VK_MENU || platformKey == VirtualKeys.VK_F10))
+        {
+            return 0;
+        }
+
+        return args.Handled ? 0 : User32.DefWindowProc(Handle, msg, wParam, lParam);
+    }
+
+    private nint HandleKeyUp(uint msg, nint wParam, nint lParam)
+    {
+        int platformKey = (int)wParam.ToInt64();
+        var modifiers = GetModifierKeys();
+
+        var args = new KeyEventArgs(MapKey(platformKey), platformKey, modifiers);
+        Window.RaisePreviewKeyUp(args);
+        if (!args.Handled)
+        {
+            WindowInputRouter.KeyUp(Window, args);
+        }
+
+        Window.ProcessAccessKeyUp(args);
+        Window.RequerySuggested();
+
+        // Suppress DefWindowProc for WM_SYSKEYUP with bare Alt to prevent native menu activation.
+        if (!args.Handled && msg == WindowMessages.WM_SYSKEYUP &&
+            (platformKey == VirtualKeys.VK_MENU || platformKey == VirtualKeys.VK_F10))
+        {
+            return 0;
+        }
+
+        return args.Handled ? 0 : User32.DefWindowProc(Handle, msg, wParam, lParam);
+    }
+
+    private nint HandleChar(nint wParam)
+    {
+        char c = (char)wParam.ToInt64();
+
+        if (_textInputSuppression.IsSuppressed)
+        {
+            return 0;
+        }
+
+        if (c == '\b')
+        {
+            return 0;
+        }
+
+        if (char.IsControl(c) && c != '\r' && c != '\t')
+        {
+            return 0;
+        }
+
+        WindowInputRouter.TextInput(Window, new TextInputEventArgs(c.ToString()));
+        return 0;
+    }
+
+    private nint HandleImeStartComposition()
+    {
+        var args = new TextCompositionEventArgs();
+        Window.RaisePreviewTextCompositionStart(args);
+        if (!args.Handled)
+        {
+            if (Window.FocusManager.FocusedElement is ITextCompositionClient client)
+            {
+                // WM_SETFOCUS creates the caret only when a text input already had focus;
+                // focus may have moved to one afterwards, so ensure it exists before the
+                // IME starts tracking it. CreateCaret replaces any existing caret.
+                CreateInvisibleSystemCaret();
+                client.HandleTextCompositionStart(args);
+                PositionImeWindow(client);
+            }
+        }
+
+        return 0;
+    }
+
+    private void PositionImeWindow(ITextCompositionClient client)
+    {
+        nint himc = Imm32.ImmGetContext(Handle);
+        if (himc == 0) return;
+
+        const int COMPOSITION_OFFSET_Y_DIP = 2;
+
+        try
+        {
+            double dpiScale = GetDpiForWindow(Handle) / 96.0;
+
+            // Composition window follows current caret (end of preedit text).
+            int caretPos = (client is ITextCompositionEditor editor) ? editor.CaretPosition : client.CompositionStartIndex;
+            var caretRect = client.GetCharRectInWindow(caretPos);
+
+            // If layout hasn't been performed yet, use a fallback height to avoid skipping IME positioning entirely.
+            if (caretRect.Width <= 0 && caretRect.Height <= 0)
+                caretRect = new Rect(caretRect.X, caretRect.Y, 1, 16);
+            int caretPx = (int)(caretRect.X * dpiScale);
+            int caretPy = (int)(caretRect.Y * dpiScale);
+            int lineH = (int)(caretRect.Height * dpiScale);
+
+            var compForm = new Imm32.COMPOSITIONFORM
+            {
+                dwStyle = Imm32.CFS_POINT | Imm32.CFS_FORCE_POSITION,
+                ptCurrentPos = new Imm32.POINT { x = caretPx, y = caretPy },
+            };
+            Imm32.ImmSetCompositionWindow(himc, ref compForm);
+
+            // Candidate window stays at the column the composition started in, at the top of its
+            // line: the IME drops the list below that point itself, by the composition font it was
+            // handed, so adding the line height here would drop it twice. The offset is clearance
+            // between the list and the line it belongs to, which the drop alone leaves too tight.
+            var startRect = client.GetCharRectInWindow(client.CompositionStartIndex);
+            int startPx = (int)(startRect.X * dpiScale);
+            int startPy = (int)((startRect.Y + COMPOSITION_OFFSET_Y_DIP) * dpiScale);
+
+            // Set composition font so third-party IMEs (e.g. Sogou) can determine
+            // candidate window size and position correctly. The height is the line the preedit
+            // actually occupies, not the size the control asked for: a script that falls back to
+            // another face makes the line taller, and an IME that drops the list by the size it was
+            // told then lands it over the text.
+            if (client is Controls.Control ctl)
+            {
+                var logFont = new LOGFONT
+                {
+                    lfHeight = -(int)(Math.Max(ctl.FontSize, startRect.Height) * dpiScale),
+                    lfWeight = ctl.FontWeight == FontWeight.Bold ? 700 : 400,
+                    lfCharSet = 1, // DEFAULT_CHARSET
+                };
+                logFont.SetFaceName(ctl.FontFamily ?? "");
+                Imm32.ImmSetCompositionFont(himc, ref logFont);
+            }
+
+            var candForm = new Imm32.CANDIDATEFORM
+            {
+                dwIndex = 0,
+                dwStyle = Imm32.CFS_CANDIDATEPOS,
+                ptCurrentPos = new Imm32.POINT { x = startPx, y = startPy },
+            };
+            Imm32.ImmSetCandidateWindow(himc, ref candForm);
+            ImeLogger.Write($"position caret={caretPos} rect=({caretRect.X:F1},{caretRect.Y:F1},{caretRect.Width:F1},{caretRect.Height:F1}) compAt=({caretPx},{caretPy}) candAt=({startPx},{startPy}) dpi={dpiScale:F2}");
+        }
+        finally
+        {
+            Imm32.ImmReleaseContext(Handle, himc);
+        }
+    }
+
+    private nint HandleImeComposition(nint lParam)
+    {
+        int flags = (int)lParam.ToInt64();
+
+        if ((flags & Imm32.CompositionStringFlags.GCS_COMPSTR) != 0)
+        {
+            string comp = GetImeCompositionString(Imm32.CompositionStringFlags.GCS_COMPSTR);
+            var attrs = GetImeCompositionAttributes();
+            var args = new TextCompositionEventArgs(comp, attrs);
+            Window.RaisePreviewTextCompositionUpdate(args);
+            if (!args.Handled)
+            {
+                if (Window.FocusManager.FocusedElement is ITextCompositionClient client)
+                {
+                    client.HandleTextCompositionUpdate(args);
+                    PositionImeWindow(client);
+                }
+            }
+        }
+
+        // Forward committed IME text explicitly.
+        // Relying on WM_CHAR for IME commits is fragile because DefWindowProc is responsible for generating
+        // those messages, and this backend intentionally intercepts WM_IME_COMPOSITION.
+        if ((flags & Imm32.CompositionStringFlags.GCS_RESULTSTR) != 0)
+        {
+            string result = GetImeCompositionString(Imm32.CompositionStringFlags.GCS_RESULTSTR);
+            if (!string.IsNullOrEmpty(result))
+            {
+                WindowInputRouter.TextInput(Window, new TextInputEventArgs(result));
+            }
+        }
+
+        return 0;
+    }
+
+    private nint HandleImeEndComposition()
+    {
+        var args = new TextCompositionEventArgs();
+        Window.RaisePreviewTextCompositionEnd(args);
+        if (!args.Handled)
+        {
+            if (Window.FocusManager.FocusedElement is ITextCompositionClient client)
+            {
+                client.HandleTextCompositionEnd(args);
+            }
+        }
+
+        return 0;
+    }
+
+    private string GetImeCompositionString(int dwIndex)
+    {
+        nint himc = Imm32.ImmGetContext(Handle);
+        if (himc == 0)
+        {
+            return string.Empty;
+        }
+
+        try
+        {
+            int byteCount = Imm32.ImmGetCompositionStringW(himc, dwIndex, 0, 0);
+            if (byteCount <= 0)
+            {
+                return string.Empty;
+            }
+
+            // IMM returns UTF-16LE bytes.
+            byteCount = Math.Min(byteCount, 1024 * 1024);
+            byte[] rented = ArrayPool<byte>.Shared.Rent(byteCount);
+            try
+            {
+                unsafe
+                {
+                    fixed (byte* p = rented)
+                    {
+                        _ = Imm32.ImmGetCompositionStringW(himc, dwIndex, (nint)p, byteCount);
+                    }
+                }
+
+                return Encoding.Unicode.GetString(rented, 0, byteCount);
+            }
+            finally
+            {
+                ArrayPool<byte>.Shared.Return(rented);
+            }
+        }
+        finally
+        {
+            Imm32.ImmReleaseContext(Handle, himc);
+        }
+    }
+
+    private CompositionAttr[]? GetImeCompositionAttributes()
+    {
+        nint himc = Imm32.ImmGetContext(Handle);
+        if (himc == 0) return null;
+
+        try
+        {
+            int count = Imm32.ImmGetCompositionStringW(himc, Imm32.CompositionStringFlags.GCS_COMPATTR, 0, 0);
+            if (count <= 0) return null;
+
+            count = Math.Min(count, 1024);
+            var buf = new byte[count];
+            unsafe
+            {
+                fixed (byte* p = buf)
+                {
+                    Imm32.ImmGetCompositionStringW(himc, Imm32.CompositionStringFlags.GCS_COMPATTR, (nint)p, count);
+                }
+            }
+
+            var attrs = new CompositionAttr[count];
+            for (int i = 0; i < count; i++)
+            {
+                attrs[i] = (CompositionAttr)Math.Min(buf[i], (byte)4);
+            }
+            return attrs;
+        }
+        finally
+        {
+            Imm32.ImmReleaseContext(Handle, himc);
+        }
+    }
+
+    internal static Key MapKey(int vk)
+    {
+        // Function keys
+        if (vk is >= VirtualKeys.VK_F1 and <= VirtualKeys.VK_F24)
+        {
+            return (Key)((int)Key.F1 + (vk - VirtualKeys.VK_F1));
+        }
+
+        // Digits (top row)
+        if (vk is >= 0x30 and <= 0x39)
+        {
+            return (Key)((int)Key.D0 + (vk - 0x30));
+        }
+
+        // Letters
+        if (vk is >= 0x41 and <= 0x5A)
+        {
+            return (Key)((int)Key.A + (vk - 0x41));
+        }
+
+        // Numpad digits
+        if (vk is >= 0x60 and <= 0x69)
+        {
+            return (Key)((int)Key.NumPad0 + (vk - 0x60));
+        }
+
+        return vk switch
+        {
+            VirtualKeys.VK_BACK => Key.Backspace,
+            VirtualKeys.VK_TAB => Key.Tab,
+            VirtualKeys.VK_RETURN => Key.Enter,
+            VirtualKeys.VK_ESCAPE => Key.Escape,
+            VirtualKeys.VK_SPACE => Key.Space,
+
+            VirtualKeys.VK_LEFT => Key.Left,
+            VirtualKeys.VK_UP => Key.Up,
+            VirtualKeys.VK_RIGHT => Key.Right,
+            VirtualKeys.VK_DOWN => Key.Down,
+
+            VirtualKeys.VK_INSERT => Key.Insert,
+            VirtualKeys.VK_DELETE => Key.Delete,
+            VirtualKeys.VK_HOME => Key.Home,
+            VirtualKeys.VK_END => Key.End,
+            VirtualKeys.VK_PRIOR => Key.PageUp,
+            VirtualKeys.VK_NEXT => Key.PageDown,
+
+            VirtualKeys.VK_ADD => Key.Add,
+            VirtualKeys.VK_SUBTRACT => Key.Subtract,
+            VirtualKeys.VK_MULTIPLY => Key.Multiply,
+            VirtualKeys.VK_DIVIDE => Key.Divide,
+            VirtualKeys.VK_DECIMAL => Key.Decimal,
+
+            VirtualKeys.VK_OEM_3 => Key.Backquote,
+            VirtualKeys.VK_OEM_MINUS => Key.Minus,
+            VirtualKeys.VK_OEM_PLUS => Key.Equal,
+            VirtualKeys.VK_OEM_4 => Key.BracketLeft,
+            VirtualKeys.VK_OEM_6 => Key.BracketRight,
+            VirtualKeys.VK_OEM_5 => Key.Backslash,
+            VirtualKeys.VK_OEM_1 => Key.Semicolon,
+            VirtualKeys.VK_OEM_7 => Key.Quote,
+            VirtualKeys.VK_OEM_COMMA => Key.Comma,
+            VirtualKeys.VK_OEM_PERIOD => Key.Period,
+            VirtualKeys.VK_OEM_2 => Key.Slash,
+            VirtualKeys.VK_OEM_102 => Key.IntlBackslash,
+            VirtualKeys.VK_APPS => Key.ContextMenu,
+
+            _ => Key.None
+        };
+    }
+
+    private Point GetMousePosition(nint lParam)
+    {
+        int x = (short)(lParam.ToInt64() & 0xFFFF);
+        int y = (short)((lParam.ToInt64() >> 16) & 0xFFFF);
+        // lParam is in device pixels; convert to DIPs.
+        return new Point(x / Window.DpiScale, y / Window.DpiScale);
+    }
+
+    private Point ClientToScreenInternal(Point clientPoint)
+    {
+        var pt = new POINT((int)(clientPoint.X * Window.DpiScale), (int)(clientPoint.Y * Window.DpiScale));
+        User32.ClientToScreen(Handle, ref pt);
+        return new Point(pt.x, pt.y);
+    }
+
+    public Point ClientToScreen(Point clientPointDip)
+        => ClientToScreenInternal(clientPointDip);
+
+    public Point ScreenToClient(Point screenPointPx)
+    {
+        var pt = new POINT((int)screenPointPx.X, (int)screenPointPx.Y);
+        User32.ScreenToClient(Handle, ref pt);
+        return new Point(pt.x / Window.DpiScale, pt.y / Window.DpiScale);
+    }
+
+    public void Dispose()
+    {
+        _titleBarThemeSync.Dispose();
+        DestroyIcons();
+        if (Handle != 0)
+        {
+            Close();
+        }
+    }
+
+    public void SetEnabled(bool enabled)
+    {
+        if (Handle == 0)
+        {
+            return;
+        }
+
+        _ = User32.EnableWindow(Handle, enabled);
+
+        if (!enabled)
+        {
+            // Keep managed UI state consistent while modal; the window ends its element capture before disabling.
+            Window.ClearMouseOverState();
+        }
+    }
+
+    public void Activate()
+    {
+        if (Handle == 0)
+        {
+            return;
+        }
+
+        _ = User32.SetForegroundWindow(Handle);
+        _ = User32.SetFocus(Handle);
+    }
+
+    public void SetOwner(nint ownerHandle)
+    {
+        _nativeOwnerHandle = ownerHandle;
+        if (Handle == 0)
+        {
+            return;
+        }
+
+        ApplyOwnerHandle();
+
+        // If the owner is topmost, an owned (non-topmost) window sits in the normal z-order band, which is
+        // entirely below the topmost band, so it would be hidden behind the owner. Match the owner's topmost
+        // state so the owned/dialog window stays above it. Ownership alone does not promote an already-shown
+        // window across bands. (macOS achieves the same by setting the owned level to ownerLevel + 1.)
+        if (ownerHandle != 0)
+        {
+            const int GWL_EXSTYLE = -20;
+            const uint WS_EX_TOPMOST = 0x00000008;
+            const int HWND_TOPMOST = -1;
+            const uint SWP_NOSIZE = 0x0001;
+            const uint SWP_NOMOVE = 0x0002;
+            const uint SWP_NOACTIVATE = 0x0010;
+
+            uint ownerExStyle = (uint)User32.GetWindowLongPtr(ownerHandle, GWL_EXSTYLE).ToInt64();
+            if ((ownerExStyle & WS_EX_TOPMOST) != 0)
+            {
+                User32.SetWindowPos(Handle, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+            }
+        }
+    }
+
+    private void ApplyOwnerHandle()
+    {
+        if (Handle == 0)
+        {
+            return;
+        }
+
+        // The hidden owner only suppresses the taskbar button of a window that has no owner of its own;
+        // an owned window keeps its button through WS_EX_APPWINDOW.
+        nint effectiveOwner = _nativeOwnerHandle != 0
+            ? _nativeOwnerHandle
+            : (Window.ShowInTaskbar ? 0 : EnsureHiddenTaskbarOwner());
+
+        nint currentOwner = User32.GetWindowLongPtr(Handle, GwlHwndParent);
+        if (currentOwner == effectiveOwner)
+        {
+            return;
+        }
+
+        User32.SetWindowLongPtr(Handle, GwlHwndParent, effectiveOwner);
+
+        // The taskbar re-reads the owner and WS_EX_APPWINDOW only when the window is shown again.
+        if (User32.IsWindowVisible(Handle))
+        {
+            bool wasForeground = User32.GetForegroundWindow() == Handle;
+            User32.ShowWindow(Handle, ShowWindowCommands.SW_HIDE);
+            User32.ShowWindow(Handle, wasForeground ? ShowWindowCommands.SW_SHOW : ShowWindowCommands.SW_SHOWNOACTIVATE);
+        }
+    }
+
+    private static nint EnsureHiddenTaskbarOwner()
+    {
+        lock (HiddenTaskbarOwnerLock)
+        {
+            if (s_hiddenTaskbarOwner != 0 && User32.IsWindow(s_hiddenTaskbarOwner))
+            {
+                return s_hiddenTaskbarOwner;
+            }
+
+            s_hiddenTaskbarOwner = User32.CreateWindowEx(
+                0,
+                Win32PlatformHost.WindowClassName,
+                "AprillzMewUI_TaskbarOwner",
+                WindowStyles.WS_OVERLAPPED | WindowStyles.WS_DISABLED,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                Kernel32.GetModuleHandle(null),
+                0);
+
+            return s_hiddenTaskbarOwner;
+        }
+    }
+
+    public void CenterOnOwner()
+    {
+        if (Handle == 0 || Window.Owner is not { } ownerWindow || ownerWindow.Handle == 0)
+            return;
+
+        if (!TryGetOwnerPlacementRect(ownerWindow, out var ownerRect))
+            return;
+
+        User32.GetWindowRect(Handle, out var windowRect);
+        int w = windowRect.Width;
+        int h = windowRect.Height;
+        int x = ownerRect.left + ((ownerRect.Width - w) / 2);
+        int y = ownerRect.top + ((ownerRect.Height - h) / 2);
+        var (cx, cy) = ClampToWorkArea(x, y, w, h, User32.MonitorFromWindow(ownerWindow.Handle, MonitorDefaultToNearest));
+
+        const uint SWP_NOSIZE = 0x0001;
+        const uint SWP_NOZORDER = 0x0004;
+        const uint SWP_NOACTIVATE = 0x0010;
+        User32.SetWindowPos(Handle, 0, cx, cy, 0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
+    }
+
+    public void EnsureTheme(bool isDark)
+    {
+        _titleBarThemeSync.ApplyTheme(isDark);
+    }
+
+    public void SetCursor(CursorType cursorType)
+    {
+        if (cursorType == CursorType.None)
+        {
+            _cursorHidden = true;
+            _currentCursor = 0;
+            User32.SetCursor(0);
+            return;
+        }
+
+        _cursorHidden = false;
+
+        nint id = cursorType switch
+        {
+            CursorType.Arrow => SystemCursors.IDC_ARROW,
+            CursorType.IBeam => SystemCursors.IDC_IBEAM,
+            CursorType.Wait => SystemCursors.IDC_WAIT,
+            CursorType.Cross => SystemCursors.IDC_CROSS,
+            CursorType.UpArrow => SystemCursors.IDC_UPARROW,
+            CursorType.SizeNWSE => SystemCursors.IDC_SIZENWSE,
+            CursorType.SizeNESW => SystemCursors.IDC_SIZENESW,
+            CursorType.SizeWE => SystemCursors.IDC_SIZEWE,
+            CursorType.SizeNS => SystemCursors.IDC_SIZENS,
+            CursorType.SizeAll => SystemCursors.IDC_SIZEALL,
+            CursorType.No => SystemCursors.IDC_NO,
+            CursorType.Hand => SystemCursors.IDC_HAND,
+            CursorType.Help => SystemCursors.IDC_HELP,
+            _ => SystemCursors.IDC_ARROW,
+        };
+
+        _currentCursor = User32.LoadCursor(0, id);
+        User32.SetCursor(_currentCursor);
+    }
+
+    public void SetImeMode(ImeMode mode)
+    {
+        switch (mode)
+        {
+            case ImeMode.Disabled:
+                var prev = Imm32.ImmAssociateContext(Handle, 0);
+                if (prev != 0) _savedImeContext = prev;
+                break;
+            case ImeMode.AlphaNumeric:
+            {
+                // Restore context first if disabled
+                if (_savedImeContext != 0)
+                {
+                    Imm32.ImmAssociateContext(Handle, _savedImeContext);
+                    _savedImeContext = 0;
+                }
+                nint himc = Imm32.ImmGetContext(Handle);
+                if (himc != 0)
+                {
+                    Imm32.ImmGetConversionStatus(himc, out _savedConversion, out _savedSentence);
+                    Imm32.ImmSetConversionStatus(himc, Imm32.IME_CMODE_ALPHANUMERIC, _savedSentence);
+                    Imm32.ImmReleaseContext(Handle, himc);
+                }
+            }
+            break;
+            default: // Auto
+                if (_savedImeContext != 0)
+                {
+                    Imm32.ImmAssociateContext(Handle, _savedImeContext);
+                    _savedImeContext = 0;
+                }
+                else
+                {
+                    nint himc = Imm32.ImmGetContext(Handle);
+                    if (himc != 0)
+                    {
+                        Imm32.ImmSetOpenStatus(himc, true);
+                        if (_savedConversion != 0)
+                        {
+                            Imm32.ImmSetConversionStatus(himc, _savedConversion, _savedSentence);
+                            _savedConversion = 0;
+                        }
+                        Imm32.ImmReleaseContext(Handle, himc);
+                    }
+                }
+                break;
+        }
+    }
+
+    public void CancelImeComposition()
+    {
+        var hImc = Imm32.ImmGetContext(Handle);
+        if (hImc != 0)
+        {
+            Imm32.ImmNotifyIME(hImc, Imm32.NI_COMPOSITIONSTR, Imm32.CPS_CANCEL, 0);
+            Imm32.ImmReleaseContext(Handle, hImc);
+        }
+    }
+
+    private uint GetDpiForWindow(nint handle) => Win32DpiApiResolver.GetDpiForWindow(handle);
+}

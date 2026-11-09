@@ -1,0 +1,34 @@
+# Shader entry points cooked by scripts/cook_shaders.py: one [[shader]] table per entry point (file / entry / stage).
+# Each entry is compiled HLSL -> DXIL (DX12) and HLSL -> SPIR-V (Vulkan) into cooked/<file>.<entry>.{dxil,spv}.
+# The cooked blobs are committed, so a fresh clone runs without a shader compiler; re-cook after editing a shader.
+schema = 1
+
+[[shader]]   # the MewVG / NanoVG vector-UI pass
+file = "ui.hlsl"
+entry = "VSMain"
+stage = "vert"
+
+[[shader]]
+file = "ui.hlsl"
+entry = "PSMain"
+stage = "frag"
+
+[[shader]]   # the lit cube
+file = "cube.hlsl"
+entry = "VSMain"
+stage = "vert"
+
+[[shader]]
+file = "cube.hlsl"
+entry = "PSMain"
+stage = "frag"
+
+[[shader]]   # the viewport floor grid
+file = "grid.hlsl"
+entry = "VSMain"
+stage = "vert"
+
+[[shader]]
+file = "grid.hlsl"
+entry = "PSMain"
+stage = "frag"

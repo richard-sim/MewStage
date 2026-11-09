@@ -1,0 +1,19 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!--
+    Tier 0. The device-agnostic input snapshot: level state for keys, mouse and gamepads plus per-frame deltas and
+    typed text, with the key, button and axis enums. No SDL, no MewUI: the host fills it from SDL events and the UI
+    backend's input bridge reads it.
+  -->
+
+  <PropertyGroup>
+    <RootNamespace>MewStage.Input</RootNamespace>
+    <AssemblyName>MewStage.Input</AssemblyName>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <InternalsVisibleTo Include="MewStage.Host.Tests" />
+    <InternalsVisibleTo Include="MewStage.Ui.Tests" />
+  </ItemGroup>
+
+</Project>

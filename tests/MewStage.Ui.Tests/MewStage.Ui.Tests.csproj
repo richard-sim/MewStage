@@ -1,0 +1,42 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!-- The MewUI backend: headless host (fake device), allocation gates, lavapipe host contract and sink gates, fonts, external textures, navigator, input bridge. Runs with tiered compilation off so the allocation gates see steady-state code. -->
+
+  <PropertyGroup>
+    <RootNamespace>MewStage.Ui.Tests</RootNamespace>
+    <AssemblyName>MewStage.Ui.Tests</AssemblyName>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Microsoft.NET.Test.Sdk" Version="18.11.0" />
+    <PackageReference Include="xunit" Version="2.9.3" />
+    <PackageReference Include="xunit.runner.visualstudio" Version="4.0.1" />
+    <PackageReference Include="Xunit.SkippableFact" Version="1.5.23" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!-- The production ui.hlsl, cooked (assets/shaders/cooked), and the Lora faces for the font tests. -->
+    <EmbeddedResource Include="..\..\assets\shaders\cooked\ui.hlsl.VSMain.spv" LogicalName="ui.hlsl.VSMain.spv" />
+    <EmbeddedResource Include="..\..\assets\shaders\cooked\ui.hlsl.PSMain.spv" LogicalName="ui.hlsl.PSMain.spv" />
+    <EmbeddedResource Include="..\..\assets\fonts\Lora-*.ttf" LogicalName="%(Filename)%(Extension)" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\..\src\MewStage.Graphics\MewStage.Graphics.csproj" />
+    <ProjectReference Include="..\..\src\MewStage.Rendering\MewStage.Rendering.csproj" />
+    <ProjectReference Include="..\..\src\MewStage.Input\MewStage.Input.csproj" />
+    <ProjectReference Include="..\..\src\MewStage.Ui.Navigation\MewStage.Ui.Navigation.csproj" />
+    <ProjectReference Include="..\..\src\MewStage.Ui.Backend\MewStage.Ui.Backend.csproj" />
+    <ProjectReference Include="..\..\src\MewStage.Viewport\MewStage.Viewport.csproj" />
+    <ProjectReference Include="..\..\third_party\MewUI\src\MewUI\MewUI.csproj" />
+    <ProjectReference Include="..\..\third_party\MewVG\src\MewVG.Core\MewVG.Core.csproj" />
+  </ItemGroup>
+
+  <PropertyGroup>
+    <TieredCompilation>false</TieredCompilation>
+    <MewStageUiHost>Embedded</MewStageUiHost>
+  </PropertyGroup>
+  <Import Project="$(MSBuildThisFileDirectory)..\..\third_party\MewUI.Consumer.targets" />
+
+</Project>

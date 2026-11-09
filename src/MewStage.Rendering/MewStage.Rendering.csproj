@@ -1,0 +1,39 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!--
+    Tier 1. The GPU backends (Vulkan through Silk.NET, Direct3D 12 through Vortice, a headless device for tests and a
+    Metal stub), the offscreen swapchain, the GPU scheduler with its frames in flight, the render graph and its
+    compiler, and the camera / reversed-Z projection. Depends on MewStage.Graphics only.
+
+    The DX12 backend is Windows-only at run time; its managed assemblies restore and compile on every platform.
+    Vulkan runs on Windows and Linux and, under Mesa lavapipe, on a machine with no GPU at all (the test suites).
+  -->
+
+  <PropertyGroup>
+    <RootNamespace>MewStage.Rendering</RootNamespace>
+    <AssemblyName>MewStage.Rendering</AssemblyName>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <!-- The Vulkan backend's VK_EXT_debug_utils label and object-name path is compiled in; MEWSTAGE_VK_MARKERS=1 or
+         MEWSTAGE_VK_VALIDATION=1 enables it at run time. -->
+    <DefineConstants>$(DefineConstants);MEWSTAGE_VK_MARKERS</DefineConstants>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <InternalsVisibleTo Include="MewStage.Rendering.Tests" />
+    <InternalsVisibleTo Include="MewStage.Ui.Tests" />
+    <InternalsVisibleTo Include="MewStage.Demo.Tests" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\MewStage.Graphics\MewStage.Graphics.csproj" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Silk.NET.Vulkan" Version="2.21.0" />
+    <PackageReference Include="Silk.NET.Vulkan.Extensions.KHR" Version="2.21.0" />
+    <PackageReference Include="Silk.NET.Vulkan.Extensions.EXT" Version="2.21.0" />
+    <PackageReference Include="Vortice.Direct3D12" Version="3.8.2" />
+    <PackageReference Include="Vortice.DXGI" Version="3.8.3" />
+  </ItemGroup>
+
+</Project>

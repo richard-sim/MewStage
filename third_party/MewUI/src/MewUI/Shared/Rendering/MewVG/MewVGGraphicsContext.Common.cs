@@ -1,0 +1,1243 @@
+using System.Numerics;
+using System.Runtime.CompilerServices;
+
+using Aprillz.MewVG;
+
+namespace Aprillz.MewUI.Rendering.MewVG;
+
+#if MEWUI_MEWVG_MACOS
+internal sealed partial class MewVGMacOSGraphicsContext : GraphicsContextBase, ITransparentDirtyRectContext, IOpaqueDirtyRectContext
+#elif MEWUI_MEWVG_X11
+internal sealed partial class MewVGX11GraphicsContext : GraphicsContextBase, ITransparentDirtyRectContext, IOpaqueDirtyRectContext, ISurfaceCopyContext
+#elif MEWUI_MEWVG_MEWSTAGE
+// MewStage vendor patch core-bridge/0001 (see third_party/NOTICE): a GPU-agnostic branch. No GL; Clear takes the fill path.
+internal sealed partial class MewStageMewVGGraphicsContext : GraphicsContextBase, ITransparentDirtyRectContext, IOpaqueDirtyRectContext, IGroupOpacityContext
+#else
+internal sealed partial class MewVGWin32GraphicsContext : GraphicsContextBase, ITransparentDirtyRectContext, IOpaqueDirtyRectContext, ISurfaceCopyContext
+#endif
+{
+#if MEWUI_MEWVG_MACOS
+    private MewVGMetal _vg;
+#elif MEWUI_MEWVG_MEWSTAGE
+    private MewVGContext _vg = null!;
+#else
+    private MewVGGL _vg;
+#endif
+
+    private readonly Stack<(Rect? clipBoundsWorld, float globalAlpha, Matrix3x2 transform, bool textPixelSnap)> _saveStack =
+        CollectionPool<Stack<(Rect? clipBoundsWorld, float globalAlpha, Matrix3x2 transform, bool textPixelSnap)>>.Rent();
+
+    // Tracks external raster leases acquired during the current frame. Each source is
+    // acquired at most once per frame and the lease is disposed at frame end after the
+    // platform-specific flush/swap.
+    private readonly List<(IExternalRasterSource source, IExternalRasterLease lease)> _acquiredExternalsThisFrame = new();
+    private float _globalAlpha = 1f;
+    private bool _textPixelSnap = true;
+    private Matrix3x2 _transform = Matrix3x2.Identity;
+    private Rect? _clipBoundsWorld;
+    private double _viewportWidthDip;
+    private double _viewportHeightDip;
+    private int _viewportWidthPx;
+    private int _viewportHeightPx;
+    // Frozen PathGeometry → object-space tessellation cache (static: shared across
+    // windows, survives per-frame context recreation; ConditionalWeakTable ephemeron
+    // semantics auto-collect entries when PathGeometry key is GC'd)
+    private static readonly ConditionalWeakTable<PathGeometry, FrozenFillCacheEntry> _fillCache = new();
+
+    // Budget for the tessellation cache. Keys live as long as their PathGeometry, so a document
+    // holding thousands of frozen paths (an icon list) would otherwise pin an unbounded amount of
+    // tessellation data (measured: 3,445 icons kept ~150 MB live through a forced gen2).
+    private const long FILL_CACHE_BUDGET_BYTES = 48L * 1024 * 1024;
+
+
+    // Guards the byte accounting and eviction sweep; entries themselves stay CWT-managed.
+    private static readonly object _fillCacheGate = new();
+    private static long _fillCacheBytes;
+    private static long _fillCacheStamp;
+
+    private sealed class FrozenFillCacheEntry
+    {
+        public FrozenFillCache? NonZero;
+        public FrozenFillCache? EvenOdd;
+        public long AccountedBytes;
+        public long LastUse;
+
+        public long CurrentBytes => (NonZero?.EstimatedBytes ?? 0) + (EvenOdd?.EstimatedBytes ?? 0);
+
+        ~FrozenFillCacheEntry()
+        {
+            var bytes = Interlocked.Exchange(ref AccountedBytes, 0);
+            if (bytes == 0)
+            {
+                return;
+            }
+
+            lock (_fillCacheGate)
+            {
+                _fillCacheBytes -= bytes;
+                RenderResourceMetrics.GeometryCacheBytesChanged(-bytes);
+            }
+        }
+    }
+
+    /// <summary>
+    /// Re-accounts <paramref name="entry"/> after a (re)build and evicts least-recently-used cache
+    /// entries until the total is back under budget. An evicted path re-tessellates on its next
+    /// draw, so eviction trades reuse for a bounded live-heap footprint.
+    /// </summary>
+    private static void AccountFillCacheAndEvict(FrozenFillCacheEntry entry)
+    {
+        lock (_fillCacheGate)
+        {
+            _fillCacheBytes += entry.CurrentBytes - entry.AccountedBytes;
+            RenderResourceMetrics.GeometryCacheBytesChanged(entry.CurrentBytes - entry.AccountedBytes);
+            entry.AccountedBytes = entry.CurrentBytes;
+            entry.LastUse = ++_fillCacheStamp;
+
+            if (_fillCacheBytes <= FILL_CACHE_BUDGET_BYTES)
+            {
+                return;
+            }
+
+            // Collect and sort the live entries by last use; oldest evicted first. The sweep is
+            // O(n log n) but runs only when the budget trips, which a steady scene never does.
+            var candidates = new List<KeyValuePair<PathGeometry, FrozenFillCacheEntry>>();
+            foreach (var pair in _fillCache)
+            {
+                if (!ReferenceEquals(pair.Value, entry))
+                {
+                    candidates.Add(pair);
+                }
+            }
+            candidates.Sort(static (a, b) => a.Value.LastUse.CompareTo(b.Value.LastUse));
+
+            foreach (var victim in candidates)
+            {
+                if (_fillCacheBytes <= FILL_CACHE_BUDGET_BYTES)
+                {
+                    break;
+                }
+                _fillCacheBytes -= victim.Value.AccountedBytes;
+                RenderResourceMetrics.GeometryCacheBytesChanged(-victim.Value.AccountedBytes);
+                victim.Value.AccountedBytes = 0;
+                _fillCache.Remove(victim.Key);
+            }
+        }
+    }
+
+    private static void TouchFillCache(FrozenFillCacheEntry entry)
+        => entry.LastUse = Interlocked.Increment(ref _fillCacheStamp);
+
+    internal static void TrimSharedGeometryCache()
+    {
+        lock (_fillCacheGate)
+        {
+            foreach (var pair in _fillCache)
+            {
+                var entry = pair.Value;
+                if (entry.AccountedBytes != 0)
+                {
+                    _fillCacheBytes -= entry.AccountedBytes;
+                    RenderResourceMetrics.GeometryCacheBytesChanged(-entry.AccountedBytes);
+                    entry.AccountedBytes = 0;
+                }
+
+                entry.NonZero = null;
+                entry.EvenOdd = null;
+            }
+
+            _fillCache.Clear();
+            _fillCacheBytes = 0;
+        }
+    }
+
+    private double _dpiScale;
+    public override double DpiScale => _dpiScale;
+
+    public override ImageScaleQuality ImageScaleQuality { get; set; } = ImageScaleQuality.Default;
+
+    protected override void OnBeginFrame(IRenderTarget target)
+    {
+        _dpiScale = target.DpiScale <= 0 ? 1.0 : target.DpiScale;
+        _viewportWidthPx = Math.Max(1, FramePixelWidth);
+        _viewportHeightPx = Math.Max(1, FramePixelHeight);
+        _viewportWidthDip = _viewportWidthPx / DpiScale;
+        _viewportHeightDip = _viewportHeightPx / DpiScale;
+
+        _globalAlpha = 1f;
+        _textPixelSnap = true;
+        _transform = Matrix3x2.Identity;
+        _clipBoundsWorld = null;
+        _saveStack.Clear();
+        _acquiredExternalsThisFrame.Clear();
+
+        BeginFramePlatform();
+    }
+
+    protected override void OnEndFrame()
+    {
+        EndFramePlatform();
+        _saveStack.Clear();
+        if (_acquiredExternalsThisFrame.Count > 0)
+        {
+            foreach (var (_, lease) in _acquiredExternalsThisFrame)
+            {
+                lease.Dispose();
+            }
+            _acquiredExternalsThisFrame.Clear();
+        }
+    }
+
+    /// <summary>
+    /// Acquires <paramref name="source"/> if not already acquired in this frame. The
+    /// platform's DrawImage path calls this before issuing the NVG draw that samples the
+    /// external texture. Idempotent within a frame: a single lease covers any number of
+    /// DrawImage calls referencing the same texture.
+    /// </summary>
+    private IExternalRasterLease EnsureExternalAcquired(IExternalRasterSource source)
+    {
+        for (int i = 0; i < _acquiredExternalsThisFrame.Count; i++)
+        {
+            if (ReferenceEquals(_acquiredExternalsThisFrame[i].source, source))
+            {
+                return _acquiredExternalsThisFrame[i].lease;
+            }
+        }
+        var lease = source.Acquire();
+        _acquiredExternalsThisFrame.Add((source, lease));
+        return lease;
+    }
+
+    protected override void OnDispose()
+    {
+        CollectionPool.Return(_saveStack);
+        DestroyPlatform();
+    }
+
+    /// <summary>
+    /// Platform-specific per-frame initialization (MakeCurrent, GL.Viewport, vg.BeginFrame, etc.).
+    /// </summary>
+    partial void BeginFramePlatform();
+
+    /// <summary>
+    /// Platform-specific per-frame cleanup (vg.EndFrame, swap buffers, release context, etc.).
+    /// </summary>
+    partial void EndFramePlatform();
+
+    /// <summary>
+    /// Platform-specific permanent resource cleanup (delete GL context, etc.).
+    /// </summary>
+    partial void DestroyPlatform();
+
+    #region State Management
+
+    protected override void SaveCore()
+    {
+        _vg.Save();
+        _saveStack.Push((_clipBoundsWorld, _globalAlpha, _transform, _textPixelSnap));
+    }
+
+    protected override void RestoreCore()
+    {
+        _vg.Restore();
+        if (_saveStack.Count > 0)
+        {
+            var state = _saveStack.Pop();
+            _clipBoundsWorld = state.clipBoundsWorld;
+            _globalAlpha = state.globalAlpha;
+            _textPixelSnap = state.textPixelSnap;
+            _transform = state.transform;
+            _vg.GlobalAlpha(_globalAlpha);
+        }
+    }
+
+    protected override void SetClipCore(Rect rect)
+    {
+        var worldClip = TransformRectToWorldAABB(rect);
+        _clipBoundsWorld = IntersectClipBounds(_clipBoundsWorld, worldClip);
+
+        var clip = _clipBoundsWorld.Value;
+        _vg.SetTransformMatrix(Matrix3x2.Identity);
+        _vg.Scissor((float)clip.X, (float)clip.Y, (float)clip.Width, (float)clip.Height);
+        _vg.SetTransformMatrix(_transform);
+    }
+
+    protected override void SetClipRoundedRectCore(Rect rect, double radiusX, double radiusY)
+    {
+        if (radiusX <= 0 && radiusY <= 0)
+        {
+            SetClip(rect);
+            return;
+        }
+
+        var worldClip = TransformRectToWorldAABB(rect);
+        _clipBoundsWorld = IntersectClipBounds(_clipBoundsWorld, worldClip);
+
+        var clip = _clipBoundsWorld.Value;
+        _vg.SetTransformMatrix(Matrix3x2.Identity);
+        _vg.Scissor((float)clip.X, (float)clip.Y, (float)clip.Width, (float)clip.Height);
+        _vg.SetTransformMatrix(_transform);
+
+        float radius = (float)Math.Max(0, Math.Min(radiusX, radiusY));
+        _vg.BeginPath();
+        _vg.RoundedRect(
+            (float)rect.X,
+            (float)rect.Y,
+            (float)rect.Width,
+            (float)rect.Height,
+            radius);
+        _vg.Clip();
+    }
+
+    protected override void SetClipPathCore(PathGeometry path)
+    {
+        var bounds = path.GetBounds();
+        var worldClip = TransformRectToWorldAABB(bounds);
+        _clipBoundsWorld = IntersectClipBounds(_clipBoundsWorld, worldClip);
+
+        var clip = _clipBoundsWorld.Value;
+        _vg.SetTransformMatrix(Matrix3x2.Identity);
+        _vg.Scissor((float)clip.X, (float)clip.Y, (float)clip.Width, (float)clip.Height);
+        _vg.SetTransformMatrix(_transform);
+
+        ReplayNvgPathCommands(path, path.FillRule);
+        _vg.Clip();
+    }
+
+
+    protected override void TranslateCore(double dx, double dy)
+    {
+        _transform = Matrix3x2.CreateTranslation((float)dx, (float)dy) * _transform;
+        _vg.SetTransformMatrix(_transform);
+    }
+
+    protected override void RotateCore(double angleRadians)
+    {
+        _transform = Matrix3x2.CreateRotation((float)angleRadians) * _transform;
+        _vg.SetTransformMatrix(_transform);
+    }
+
+    protected override void ScaleCore(double sx, double sy)
+    {
+        _transform = Matrix3x2.CreateScale((float)sx, (float)sy) * _transform;
+        _vg.SetTransformMatrix(_transform);
+    }
+
+    protected override void SetTransformCore(Matrix3x2 matrix)
+    {
+        _transform = matrix;
+        _vg.SetTransformMatrix(_transform);
+    }
+
+    protected override Matrix3x2 GetTransformCore() => _transform;
+
+    protected override void ResetTransformCore()
+    {
+        _transform = Matrix3x2.Identity;
+        _vg.SetTransformMatrix(_transform);
+    }
+
+    public override float GlobalAlpha
+    {
+        get => _globalAlpha;
+        set { _globalAlpha = value; _vg.GlobalAlpha(value); }
+    }
+
+    public override bool TextPixelSnap
+    {
+        get => _textPixelSnap;
+        set => _textPixelSnap = value;
+    }
+
+    protected override void ResetClipCore()
+    {
+        _clipBoundsWorld = null;
+        _vg.ResetScissor();
+    }
+
+    #endregion
+
+    #region Drawing Primitives
+
+    public override void Clear(Color color)
+    {
+#if !MEWUI_MEWVG_MACOS && !MEWUI_MEWVG_MEWSTAGE
+        ClearTargetPixels(new Rect(0, 0, _viewportWidthDip, _viewportHeightDip), ToNvgColor(color));
+#else
+        _vg.Save();
+        _vg.ResetTransform();
+        _vg.ResetScissor();
+        _vg.ShapeAntiAlias(false);
+        _vg.BeginPath();
+
+        //_vg.Rect(-1, -1, (float)_viewportWidthDip + 2, (float)_viewportHeightDip + 2);
+        _vg.Rect(0, 0, (float)_viewportWidthDip, (float)_viewportHeightDip);
+
+        _vg.FillColor(ToNvgColor(color));
+        _vg.Fill();
+        _vg.Restore();
+#endif
+    }
+
+    void ITransparentDirtyRectContext.ClearRectangleToTransparent(Rect rect)
+        => ClearRectangleCore(rect, new MewVGColor(0, 0, 0, 0));
+
+    void IOpaqueDirtyRectContext.ClearRectangle(Rect rect, Color color)
+        => ClearRectangleCore(rect, ToNvgColor(color));
+
+    private void ClearRectangleCore(Rect rect, MewVGColor color)
+    {
+#if !MEWUI_MEWVG_MACOS && !MEWUI_MEWVG_MEWSTAGE
+        ClearTargetPixels(rect, color);
+#else
+        _vg.Save();
+        _vg.ResetTransform();
+        _vg.ResetScissor();
+        _vg.ShapeAntiAlias(false);
+        // Copy replaces the destination channels instead of blending over them, which is what makes
+        // this an erase; source-over would leave the old alpha behind.
+        _vg.GlobalCompositeOperation(MewVGCompositeOperation.Copy);
+        _vg.BeginPath();
+        _vg.Rect((float)rect.X, (float)rect.Y, (float)rect.Width, (float)rect.Height);
+        _vg.FillColor(color);
+        _vg.Fill();
+        _vg.Restore();
+#endif
+    }
+
+#if !MEWUI_MEWVG_MACOS && !MEWUI_MEWVG_MEWSTAGE
+    /// <summary>Overwrites the pixels of <paramref name="rect"/> (target coordinates) with <paramref name="color"/>.</summary>
+    private void ClearTargetPixels(Rect rect, MewVGColor color)
+    {
+        // A GL clear instead of a queued fill: the fill runs the full paint shader on every pixel, which on a
+        // tile-based GPU costs several times a plain clear.
+        if (!TryGetTargetPixels(rect, out int left, out int top, out int right, out int bottom))
+        {
+            return;
+        }
+
+        if (CoversTarget(left, top, right, bottom))
+        {
+            DiscardPendingFrameClear();
+        }
+
+        FlushQueuedDraws();
+        Native.GL.Enable(Native.GL.GL_SCISSOR_TEST);
+        Native.GL.Scissor(left, _viewportHeightPx - bottom, right - left, bottom - top);
+        Native.GL.ColorMask(true, true, true, true);
+        // The target holds premultiplied colour, as the fill it replaces would have written.
+        Native.GL.ClearColor(color.R * color.A, color.G * color.A, color.B * color.A, color.A);
+        Native.GL.Clear(Native.GL.GL_COLOR_BUFFER_BIT);
+        Native.GL.Disable(Native.GL.GL_SCISSOR_TEST);
+    }
+
+    bool ISurfaceCopyContext.TryCopySurface(IRenderSurface source, Rect area)
+    {
+        if (RenderSurfaceResource.ResolveBackendSurface(source) is not OpenGL.OpenGLPixelRenderSurface surface ||
+            !surface.IsFboInitialized ||
+            !Native.OpenGLExt.IsBlitFramebufferSupported)
+        {
+            return false;
+        }
+
+        // A multisampled target rejects the blit: a browser canvas whose context the page made first
+        // keeps the page's antialias setting.
+        BindFrameTarget();
+        if (Native.GL.GetInteger(Native.GL.GL_SAMPLES) > 0)
+        {
+            return false;
+        }
+
+        if (!TryGetTargetPixels(area, out int left, out int top, out int right, out int bottom))
+        {
+            return true;
+        }
+
+        int sourceHeight = surface.ContentHeightPx;
+        if (right > surface.ContentWidthPx || bottom > sourceHeight)
+        {
+            return false;
+        }
+
+        if (CoversTarget(left, top, right, bottom))
+        {
+            DiscardPendingFrameClear();
+        }
+
+        FlushQueuedDraws();
+        uint target = (uint)Native.GL.GetInteger(Native.OpenGLExt.GL_FRAMEBUFFER_BINDING);
+
+        // Framebuffer objects belong to the context that made them, so a surface made under another
+        // context is read through a framebuffer made here around its (shared) texture.
+        uint readFramebuffer = surface.Fbo;
+        uint temporaryFramebuffer = 0;
+        if (surface.CreationContext == 0 || surface.CreationContext != GetCurrentGLContext())
+        {
+            unsafe
+            {
+                Native.OpenGLExt.GenFramebuffers(1, &temporaryFramebuffer);
+            }
+
+            Native.OpenGLExt.BindFramebuffer(Native.OpenGLExt.GL_READ_FRAMEBUFFER, temporaryFramebuffer);
+            Native.OpenGLExt.FramebufferTexture2D(Native.OpenGLExt.GL_READ_FRAMEBUFFER, Native.OpenGLExt.GL_COLOR_ATTACHMENT0,
+                Native.GL.GL_TEXTURE_2D, surface.Texture, 0);
+            readFramebuffer = temporaryFramebuffer;
+        }
+
+        Native.OpenGLExt.BindFramebuffer(Native.OpenGLExt.GL_READ_FRAMEBUFFER, readFramebuffer);
+        Native.OpenGLExt.BindFramebuffer(Native.OpenGLExt.GL_DRAW_FRAMEBUFFER, target);
+        Native.GL.Disable(Native.GL.GL_SCISSOR_TEST);
+        // Both are drawn bottom-up, so rows are measured from the bottom of each one's content.
+        Native.OpenGLExt.BlitFramebuffer(
+            left, sourceHeight - bottom, right, sourceHeight - top,
+            left, _viewportHeightPx - bottom, right, _viewportHeightPx - top,
+            Native.GL.GL_COLOR_BUFFER_BIT, Native.OpenGLExt.GL_NEAREST);
+        Native.OpenGLExt.BindFramebuffer(Native.OpenGLExt.GL_FRAMEBUFFER, target);
+
+        if (temporaryFramebuffer != 0)
+        {
+            unsafe
+            {
+                Native.OpenGLExt.DeleteFramebuffers(1, &temporaryFramebuffer);
+            }
+        }
+
+        return true;
+    }
+
+    /// <summary>Sends the draws queued so far to the frame target, so direct target writes land after them.</summary>
+    private void FlushQueuedDraws()
+    {
+        BindFrameTarget();
+        Native.GL.Viewport(0, 0, _viewportWidthPx, _viewportHeightPx);
+        ApplyPendingFrameClear();
+        _vg.EndFrame();
+    }
+
+    /// <summary>
+    /// Converts a rectangle in target coordinates to the pixels a non-antialiased fill of it covers
+    /// (those whose centres lie inside), clipped to the viewport. False when none are.
+    /// </summary>
+    private bool TryGetTargetPixels(Rect rect, out int left, out int top, out int right, out int bottom)
+    {
+        double scale = DpiScale;
+        left = Math.Max(0, (int)Math.Ceiling(rect.X * scale - 0.5));
+        top = Math.Max(0, (int)Math.Ceiling(rect.Y * scale - 0.5));
+        right = Math.Min(_viewportWidthPx, (int)Math.Ceiling(rect.Right * scale - 0.5));
+        bottom = Math.Min(_viewportHeightPx, (int)Math.Ceiling(rect.Bottom * scale - 0.5));
+        return right > left && bottom > top;
+    }
+
+
+    private bool CoversTarget(int left, int top, int right, int bottom)
+        => left == 0 && top == 0 && right == _viewportWidthPx && bottom == _viewportHeightPx;
+
+    /// <summary>Performs the clear a platform defers from the start of a frame to its first write, if one is pending.</summary>
+    partial void ApplyPendingFrameClear();
+
+    /// <summary>Drops a deferred frame clear because the first write replaces the whole target anyway.</summary>
+    partial void DiscardPendingFrameClear();
+
+#endif
+
+    protected override void DrawLineCore(Point start, Point end, Color color, double thickness = 1)
+    {
+        _vg.BeginPath();
+        _vg.MoveTo((float)start.X, (float)start.Y);
+        _vg.LineTo((float)end.X, (float)end.Y);
+        _vg.StrokeColor(ToNvgColor(color));
+        NvgStrokeWidth((float)thickness);
+        _vg.Stroke();
+    }
+
+    protected override void DrawRectangleCore(Rect rect, Color color, double thickness, bool strokeInset)
+    {
+        if (strokeInset)
+            rect = rect.Deflate(new Thickness(QuantizeHalfStroke(thickness, DpiScale)));
+        // MewStage vendor patch rendering/0001: as FillRectangleCore - only a grid-aligned rectangle strokes crisply without
+        // antialiasing; under a shear or rotation its edges are slanted and came out stair-stepped.
+        var xform = _vg.GetTransformMatrix();
+        bool gridAligned = (xform.M12 == 0 && xform.M21 == 0) || (xform.M11 == 0 && xform.M22 == 0);
+        if (gridAligned)
+        {
+            _vg.ShapeAntiAlias(false);
+        }
+
+        _vg.BeginPath();
+        _vg.Rect((float)rect.X, (float)rect.Y, (float)rect.Width, (float)rect.Height);
+        _vg.StrokeColor(ToNvgColor(color));
+        NvgStrokeWidth((float)thickness);
+        _vg.Stroke();
+        if (gridAligned)
+        {
+            _vg.ShapeAntiAlias(true);
+        }
+    }
+
+    protected override void FillRectangleCore(Rect rect, Color color)
+    {
+        // Edges on the pixel grid fill crisply without antialiasing; a turned rectangle's edges are
+        // slanted and would come out jagged.
+        var xform = _vg.GetTransformMatrix();
+        bool gridAligned = (xform.M12 == 0 && xform.M21 == 0) || (xform.M11 == 0 && xform.M22 == 0);
+        if (gridAligned)
+        {
+            _vg.ShapeAntiAlias(false);
+        }
+
+        _vg.BeginPath();
+        _vg.Rect((float)rect.X, (float)rect.Y, (float)rect.Width, (float)rect.Height);
+        _vg.FillColor(ToNvgColor(color));
+        _vg.Fill();
+        if (gridAligned)
+        {
+            _vg.ShapeAntiAlias(true);
+        }
+    }
+
+    protected override void DrawRoundedRectangleCore(Rect rect, double radiusX, double radiusY, Color color, double thickness = 1)
+    {
+        float radius = (float)Math.Max(0, Math.Min(radiusX, radiusY));
+        _vg.BeginPath();
+        _vg.RoundedRect((float)rect.X, (float)rect.Y, (float)rect.Width, (float)rect.Height, radius);
+        _vg.StrokeColor(ToNvgColor(color));
+        NvgStrokeWidth((float)thickness);
+        _vg.Stroke();
+    }
+
+    protected override void FillRoundedRectangleCore(Rect rect, double radiusX, double radiusY, Color color)
+    {
+        float radius = (float)Math.Max(0, Math.Min(radiusX, radiusY));
+        _vg.BeginPath();
+        _vg.RoundedRect((float)rect.X, (float)rect.Y, (float)rect.Width, (float)rect.Height, radius);
+        _vg.FillColor(ToNvgColor(color));
+        _vg.Fill();
+    }
+
+    protected override void DrawEllipseCore(Rect bounds, Color color, double thickness = 1)
+    {
+        float cx = (float)(bounds.X + bounds.Width * 0.5);
+        float cy = (float)(bounds.Y + bounds.Height * 0.5);
+        float rx = (float)(bounds.Width * 0.5);
+        float ry = (float)(bounds.Height * 0.5);
+
+        _vg.BeginPath();
+        _vg.Ellipse(cx, cy, rx, ry);
+        _vg.StrokeColor(ToNvgColor(color));
+        NvgStrokeWidth((float)thickness);
+        _vg.Stroke();
+    }
+
+    protected override void FillEllipseCore(Rect bounds, Color color)
+    {
+        float cx = (float)(bounds.X + bounds.Width * 0.5);
+        float cy = (float)(bounds.Y + bounds.Height * 0.5);
+        float rx = (float)(bounds.Width * 0.5);
+        float ry = (float)(bounds.Height * 0.5);
+
+        _vg.BeginPath();
+        _vg.Ellipse(cx, cy, rx, ry);
+        _vg.FillColor(ToNvgColor(color));
+        _vg.Fill();
+    }
+
+    public override void DrawPath(PathGeometry path, Color color, double thickness = 1)
+    {
+        RecordDrawPath();
+        if (path == null || color.A == 0 || thickness <= 0)
+        {
+            return;
+        }
+
+        ReplayNvgPathCommands(path);
+        _vg.StrokeColor(ToNvgColor(color));
+        // Path strokes keep their exact width: vector artwork (SVG) relies on
+        // fractional and sub-pixel stroke weights, which the core renders via
+        // coverage-emulating alpha. Pixel snapping stays on the UI primitives
+        // (lines, rectangles, ellipses) only.
+        _vg.StrokeWidth((float)thickness);
+        _vg.Stroke();
+    }
+
+    public override void FillPath(PathGeometry path, Color color)
+        => FillPath(path, color, path?.FillRule ?? FillRule.NonZero);
+
+    public override void FillPath(PathGeometry path, Color color, FillRule fillRule)
+    {
+        RecordFillPath();
+        if (path == null || color.A == 0)
+        {
+            return;
+        }
+
+        if (TryGetFrozenFill(path, fillRule, out var cached, out var vgFillRule))
+        {
+            // Every frame: render from cache with current transform
+            _vg.FillColor(ToNvgColor(color));
+            _vg.FillFromCache(cached, vgFillRule);
+            return;
+        }
+
+        ReplayNvgPathCommands(path, fillRule);
+        _vg.FillColor(ToNvgColor(color));
+        _vg.Fill();
+    }
+
+    /// <summary>Tessellation of frozen geometry, built once in object space and reused across
+    /// draws. False when the geometry is not frozen and the caller has to replay it per draw.</summary>
+    private bool TryGetFrozenFill(PathGeometry path, FillRule fillRule,
+        out FrozenFillCache cached, out MewVGFillRule vgFillRule)
+    {
+        vgFillRule = fillRule == FillRule.EvenOdd ? MewVGFillRule.EvenOdd : MewVGFillRule.NonZero;
+        cached = null!;
+        if (!path.IsFrozen)
+        {
+            return false;
+        }
+
+        var entry = _fillCache.GetOrCreateValue(path);
+        var existing = fillRule == FillRule.EvenOdd ? entry.EvenOdd : entry.NonZero;
+
+        // Scale-aware staleness: the cached flattening is calibrated for the
+        // scale it was built at, so drawing the same frozen geometry larger
+        // (an icon size slider, zoom) must rebuild it or curves turn faceted.
+        var xform = _vg.GetTransformMatrix();
+        var scaleX = MathF.Sqrt(xform.M11 * xform.M11 + xform.M12 * xform.M12);
+        var scaleY = MathF.Sqrt(xform.M21 * xform.M21 + xform.M22 * xform.M22);
+        var currentScale = MathF.Max(scaleX, scaleY);
+
+        if (existing == null || existing.IsStale(_vg.TessTol, vgFillRule, currentScale))
+        {
+            // First use or DPI changed: build object-space cache (identity transform)
+            ReplayNvgPathCommands(path, fillRule, identityTransform: true);
+            existing = _vg.BuildFillCache(vgFillRule);
+
+            // Store back into entry
+            if (fillRule == FillRule.EvenOdd)
+                entry.EvenOdd = existing;
+            else
+                entry.NonZero = existing;
+
+            _fillCache.AddOrUpdate(path, entry);
+            AccountFillCacheAndEvict(entry);
+        }
+        else
+        {
+            TouchFillCache(entry);
+        }
+
+        cached = existing;
+        return true;
+    }
+
+    public override void DrawLine(Point start, Point end, Pen pen)
+    {
+        if (pen.Thickness <= 0)
+            return;
+        var bounds = new Rect(
+            Math.Min(start.X, end.X), Math.Min(start.Y, end.Y),
+            Math.Abs(end.X - start.X), Math.Abs(end.Y - start.Y));
+
+        if (pen.StrokeStyle.IsDashed)
+        {
+            NvgStrokeHelper.DrawDashedLine(_vg, (float)start.X, (float)start.Y, (float)end.X, (float)end.Y, pen, bounds);
+            return;
+        }
+
+        _vg.BeginPath();
+        _vg.MoveTo((float)start.X, (float)start.Y);
+        _vg.LineTo((float)end.X, (float)end.Y);
+        NvgStrokeHelper.ApplyPenStyle(_vg, pen);
+        NvgStrokeWidth((float)pen.Thickness);
+        NvgStrokeHelper.ApplyStrokeBrush(_vg, pen, bounds);
+        _vg.Stroke();
+    }
+
+    public override void DrawRectangle(Rect rect, Pen pen)
+    {
+        if (pen.Thickness <= 0)
+            return;
+
+        if (pen.StrokeStyle.IsDashed)
+        {
+            NvgStrokeHelper.DrawDashedRect(_vg, (float)rect.X, (float)rect.Y, (float)rect.Width, (float)rect.Height, pen, rect);
+            return;
+        }
+
+        _vg.ShapeAntiAlias(false);
+        _vg.BeginPath();
+        _vg.Rect((float)rect.X, (float)rect.Y, (float)rect.Width, (float)rect.Height);
+        NvgStrokeHelper.ApplyPenStyle(_vg, pen);
+        NvgStrokeWidth((float)pen.Thickness);
+        NvgStrokeHelper.ApplyStrokeBrush(_vg, pen, rect);
+        _vg.Stroke();
+        _vg.ShapeAntiAlias(true);
+    }
+
+    public override void DrawRoundedRectangle(Rect rect, double radiusX, double radiusY, Pen pen)
+    {
+        if (pen.Thickness <= 0)
+            return;
+        float radius = (float)Math.Max(0, Math.Min(radiusX, radiusY));
+
+        if (pen.StrokeStyle.IsDashed)
+        {
+            NvgStrokeHelper.DrawDashedRoundedRect(_vg, (float)rect.X, (float)rect.Y, (float)rect.Width, (float)rect.Height, radius, pen, rect);
+            return;
+        }
+
+        _vg.BeginPath();
+        _vg.RoundedRect((float)rect.X, (float)rect.Y, (float)rect.Width, (float)rect.Height, radius);
+        NvgStrokeHelper.ApplyPenStyle(_vg, pen);
+        NvgStrokeWidth((float)pen.Thickness);
+        NvgStrokeHelper.ApplyStrokeBrush(_vg, pen, rect);
+        _vg.Stroke();
+    }
+
+    public override void DrawEllipse(Rect bounds, Pen pen)
+    {
+        if (pen.Thickness <= 0)
+            return;
+        float cx = (float)(bounds.X + bounds.Width * 0.5);
+        float cy = (float)(bounds.Y + bounds.Height * 0.5);
+        float rx = (float)(bounds.Width * 0.5);
+        float ry = (float)(bounds.Height * 0.5);
+
+        if (pen.StrokeStyle.IsDashed)
+        {
+            NvgStrokeHelper.DrawDashedEllipse(_vg, cx, cy, rx, ry, pen, bounds);
+            return;
+        }
+
+        _vg.BeginPath();
+        _vg.Ellipse(cx, cy, rx, ry);
+        NvgStrokeHelper.ApplyPenStyle(_vg, pen);
+        NvgStrokeWidth((float)pen.Thickness);
+        NvgStrokeHelper.ApplyStrokeBrush(_vg, pen, bounds);
+        _vg.Stroke();
+    }
+
+    public override void DrawPath(PathGeometry path, Pen pen)
+    {
+        RecordDrawPath();
+        if (path == null || pen.Thickness <= 0)
+            return;
+
+        if (pen.StrokeStyle.IsDashed)
+        {
+            NvgStrokeHelper.DrawDashedStroke(_vg, path, pen, NvgStrokeHelper.ComputePathBounds(path));
+            return;
+        }
+
+        ReplayNvgPathCommands(path);
+        NvgStrokeHelper.ApplyPenStyle(_vg, pen);
+        _vg.StrokeWidth((float)pen.Thickness);
+        NvgStrokeHelper.ApplyStrokeBrush(_vg, pen, NvgStrokeHelper.ComputePathBounds(path));
+        _vg.Stroke();
+    }
+
+    public override void FillRectangle(Rect rect, Brush brush)
+    {
+        if (brush is SolidColorBrush solid)
+        { FillRectangle(rect, solid.Color); return; }
+        if (brush is ImageBrush imageBrush)
+        {
+            _vg.ShapeAntiAlias(false);
+            _vg.BeginPath();
+            _vg.Rect((float)rect.X, (float)rect.Y, (float)rect.Width, (float)rect.Height);
+            if (ApplyImageBrushPaint(imageBrush))
+                _vg.Fill();
+            _vg.ShapeAntiAlias(true);
+            return;
+        }
+        if (brush is not GradientBrush gradient)
+            return;
+
+        _vg.ShapeAntiAlias(false);
+        _vg.BeginPath();
+        _vg.Rect((float)rect.X, (float)rect.Y, (float)rect.Width, (float)rect.Height);
+        NvgStrokeHelper.ApplyGradientPaint(_vg, gradient, rect);
+        _vg.Fill();
+        _vg.ShapeAntiAlias(true);
+    }
+
+    public override void FillRoundedRectangle(Rect rect, double radiusX, double radiusY, Brush brush)
+    {
+        if (brush is SolidColorBrush solid)
+        { FillRoundedRectangle(rect, radiusX, radiusY, solid.Color); return; }
+        if (brush is ImageBrush imageBrush)
+        {
+            float radius = (float)Math.Max(0, Math.Min(radiusX, radiusY));
+            _vg.BeginPath();
+            _vg.RoundedRect((float)rect.X, (float)rect.Y, (float)rect.Width, (float)rect.Height, radius);
+            if (ApplyImageBrushPaint(imageBrush))
+                _vg.Fill();
+            return;
+        }
+        if (brush is not GradientBrush gradient)
+            return;
+
+        float r = (float)Math.Max(0, Math.Min(radiusX, radiusY));
+        _vg.BeginPath();
+        _vg.RoundedRect((float)rect.X, (float)rect.Y, (float)rect.Width, (float)rect.Height, r);
+        NvgStrokeHelper.ApplyGradientPaint(_vg, gradient, rect);
+        _vg.Fill();
+    }
+
+    public override void FillEllipse(Rect bounds, Brush brush)
+    {
+        if (brush is SolidColorBrush solid)
+        { FillEllipse(bounds, solid.Color); return; }
+        if (brush is ImageBrush imageBrush)
+        {
+            float cx = (float)(bounds.X + bounds.Width * 0.5);
+            float cy = (float)(bounds.Y + bounds.Height * 0.5);
+            _vg.BeginPath();
+            _vg.Ellipse(cx, cy, (float)(bounds.Width * 0.5), (float)(bounds.Height * 0.5));
+            if (ApplyImageBrushPaint(imageBrush))
+                _vg.Fill();
+            return;
+        }
+        if (brush is not GradientBrush gradient)
+            return;
+
+        float ecx = (float)(bounds.X + bounds.Width * 0.5);
+        float ecy = (float)(bounds.Y + bounds.Height * 0.5);
+        _vg.BeginPath();
+        _vg.Ellipse(ecx, ecy, (float)(bounds.Width * 0.5), (float)(bounds.Height * 0.5));
+        NvgStrokeHelper.ApplyGradientPaint(_vg, gradient, bounds);
+        _vg.Fill();
+    }
+
+    public override void FillPath(PathGeometry path, Brush brush)
+        => FillPath(path, brush, path?.FillRule ?? FillRule.NonZero);
+
+    public override void FillPath(PathGeometry path, Brush brush, FillRule fillRule)
+    {
+        if (brush is not SolidColorBrush)
+        {
+            RecordFillPath();
+        }
+        if (path == null)
+            return;
+        if (brush is SolidColorBrush solid)
+        { FillPath(path, solid.Color, fillRule); return; }
+        // Frozen geometry takes the same tessellation cache as a solid fill: the cache holds
+        // geometry only, and FillFromCache draws it with whatever paint the state carries.
+        bool frozen = TryGetFrozenFill(path, fillRule, out var cached, out var vgFillRule);
+
+        if (brush is ImageBrush imageBrush)
+        {
+            if (!frozen)
+            {
+                ReplayNvgPathCommands(path, fillRule);
+            }
+            if (!ApplyImageBrushPaint(imageBrush))
+            {
+                return;
+            }
+            if (frozen)
+            {
+                _vg.FillFromCache(cached, vgFillRule);
+            }
+            else
+            {
+                _vg.Fill();
+            }
+            return;
+        }
+        if (brush is not GradientBrush gradient)
+            return;
+
+        if (!frozen)
+        {
+            ReplayNvgPathCommands(path, fillRule);
+        }
+        NvgStrokeHelper.ApplyGradientPaint(_vg, gradient, NvgStrokeHelper.ComputePathBounds(path));
+        if (frozen)
+        {
+            _vg.FillFromCache(cached, vgFillRule);
+        }
+        else
+        {
+            _vg.Fill();
+        }
+    }
+
+    /// <summary>
+    /// Applies an <see cref="ImageBrush"/> as the current NanoVG fill paint. Returns false
+    /// when the brush cannot be rendered by this backend (e.g. image is not a <see cref="MewVGImage"/>).
+    /// The tile is realized via <see cref="MewVGContext.ImagePattern"/>, which takes a pre-flag'd
+    /// NVG texture (RepeatX/RepeatY set at texture creation) and a paint transform that
+    /// positions one tile and sets its size; NanoVG then wraps UVs via GL_REPEAT.
+    /// </summary>
+    private bool ApplyImageBrushPaint(ImageBrush imageBrush)
+    {
+        if (ImageResource.ResolveBackendImage(imageBrush.Image) is not MewVGImage mewImage)
+        {
+            return false;
+        }
+
+        var flags = GetImageFlags() | MewVGImageFlags.Premultiplied;
+        if (imageBrush.TileMode is TileMode.Tile or TileMode.TileX)
+        {
+            flags |= MewVGImageFlags.RepeatX;
+        }
+        if (imageBrush.TileMode is TileMode.Tile or TileMode.TileY)
+        {
+            flags |= MewVGImageFlags.RepeatY;
+        }
+
+        int imageId = mewImage.GetOrCreateImageId(_vg, flags);
+        if (imageId == 0)
+        {
+            return false;
+        }
+
+        var dst = imageBrush.DestinationRect;
+        float patternX = (float)dst.X;
+        float patternY = (float)dst.Y;
+        float patternW = (float)dst.Width;
+        float patternH = (float)dst.Height;
+        float angle = 0f;
+
+        if (imageBrush.Transform is { } t)
+        {
+            // Decompose into translate + rotation + per-axis scale (ignores shear).
+            // NanoVG's ImagePattern supports all three natively: translate via (cx,cy),
+            // rotate via angle, scale by folding into (w,h).
+            float scaleX = MathF.Sqrt(t.M11 * t.M11 + t.M12 * t.M12);
+            float scaleY = MathF.Sqrt(t.M21 * t.M21 + t.M22 * t.M22);
+            angle = MathF.Atan2(t.M12, t.M11);
+            patternW *= scaleX;
+            patternH *= scaleY;
+            patternX += t.M31;
+            patternY += t.M32;
+        }
+
+        float opacity = (float)imageBrush.Opacity;
+        var paint = _vg.ImagePattern(patternX, patternY, patternW, patternH, angle, imageId, opacity);
+        _vg.FillPaint(paint);
+        return true;
+    }
+
+    public override void DrawBoxShadow(Rect bounds, double cornerRadius, double blurRadius,
+        Color shadowColor, double offsetX = 0, double offsetY = 0)
+    {
+        if (blurRadius <= 0 || shadowColor.A == 0)
+            return;
+
+        float x = (float)(bounds.X + offsetX);
+        float y = (float)(bounds.Y + offsetY);
+        float w = (float)bounds.Width;
+        float h = (float)bounds.Height;
+        float cr = (float)Math.Min(Math.Max(cornerRadius, 0), Math.Min(w, h) * 0.5);
+        float br = (float)blurRadius;
+
+        var inner = ToNvgColor(shadowColor);
+        var outer = ToNvgColor(Color.FromArgb(0, shadowColor.R, shadowColor.G, shadowColor.B));
+
+        var paint = _vg.BoxGradient(x, y, w, h, cr, br, inner, outer);
+
+        _vg.ShapeAntiAlias(false);
+        _vg.BeginPath();
+        _vg.Rect(x - br, y - br, w + br * 2, h + br * 2);
+        _vg.FillPaint(paint);
+        _vg.Fill();
+        _vg.ShapeAntiAlias(true);
+    }
+
+    private void ReplayNvgPathCommands(PathGeometry path, FillRule fillRule = FillRule.NonZero,
+        bool identityTransform = false)
+    {
+        if (identityTransform)
+        {
+            _vg.Save();
+            _vg.ResetTransform();
+        }
+
+        _vg.BeginPath();
+        _vg.FillRule(fillRule == FillRule.EvenOdd ? MewVGFillRule.EvenOdd : MewVGFillRule.NonZero);
+
+        foreach (var cmd in path.Commands)
+        {
+            switch (cmd.Type)
+            {
+                case PathCommandType.MoveTo:
+                    _vg.MoveTo((float)cmd.X0, (float)cmd.Y0);
+                    break;
+                case PathCommandType.LineTo:
+                    _vg.LineTo((float)cmd.X0, (float)cmd.Y0);
+                    break;
+                case PathCommandType.BezierTo:
+                    _vg.BezierTo((float)cmd.X0, (float)cmd.Y0,
+                                 (float)cmd.X1, (float)cmd.Y1,
+                                 (float)cmd.X2, (float)cmd.Y2);
+                    break;
+                case PathCommandType.Close:
+                    _vg.ClosePath();
+                    break;
+            }
+        }
+
+        if (identityTransform)
+        {
+            _vg.Restore();
+        }
+    }
+    #endregion
+
+    #region Image Helpers
+
+    private void DrawImagePattern(int imageId, Rect destRect, float alpha, Rect? sourceRect, int imageWidthPx, int imageHeightPx)
+    {
+        if (destRect.Width <= 0 || destRect.Height <= 0)
+        {
+            return;
+        }
+
+        MewVGPaint paint;
+        var fillRect = destRect;
+
+        if (sourceRect is null)
+        {
+            // Within a pixel of native size: snap the quad so GL sampling is identity, or the
+            // fractional-DPI resample softens the bitmap's pixel-snapped text.
+            if (_transform.M12 == 0f && _transform.M21 == 0f && _transform.M11 == 1f && _transform.M22 == 1f)
+            {
+                double tx = _transform.M31;
+                double ty = _transform.M32;
+                var world = new Rect(destRect.X + tx, destRect.Y + ty, destRect.Width, destRect.Height);
+                var snapped = LayoutRounding.SnapRectEdgesToPixels(world, DpiScale);
+                if (Math.Abs(snapped.Width * DpiScale - imageWidthPx) <= 1.0 &&
+                    Math.Abs(snapped.Height * DpiScale - imageHeightPx) <= 1.0)
+                {
+                    snapped = new Rect(snapped.X, snapped.Y, imageWidthPx / DpiScale, imageHeightPx / DpiScale);
+                }
+                fillRect = new Rect(snapped.X - tx, snapped.Y - ty, snapped.Width, snapped.Height);
+            }
+
+            paint = _vg.ImagePattern((float)fillRect.X, (float)fillRect.Y, (float)fillRect.Width, (float)fillRect.Height, 0f, imageId, alpha);
+        }
+        else
+        {
+            var src = sourceRect.Value;
+            if (src.Width <= 0 || src.Height <= 0)
+            {
+                return;
+            }
+
+            double srcWidthDip = src.Width / DpiScale;
+            double srcHeightDip = src.Height / DpiScale;
+            if (srcWidthDip <= 0 || srcHeightDip <= 0)
+            {
+                return;
+            }
+
+            float scaleX = (float)(destRect.Width / srcWidthDip);
+            float scaleY = (float)(destRect.Height / srcHeightDip);
+            float imageWidthDip = (float)(imageWidthPx / DpiScale);
+            float imageHeightDip = (float)(imageHeightPx / DpiScale);
+            float patternW = imageWidthDip * scaleX;
+            float patternH = imageHeightDip * scaleY;
+            float patternX = (float)destRect.X - (float)(src.X / DpiScale * scaleX);
+            float patternY = (float)destRect.Y - (float)(src.Y / DpiScale * scaleY);
+            paint = _vg.ImagePattern(patternX, patternY, patternW, patternH, 0f, imageId, alpha);
+        }
+
+        // Outline AA only matters when the rect is rasterised non-axis-aligned
+        // (rotation/skew). Axis-aligned image fills land on integer pixel boundaries -
+        // the texture's own sampling handles edges and shape AA would add a needless
+        // half-pixel feather. D2D applies the same coverage AA implicitly on its
+        // bitmap draw; this matches that behaviour.
+        bool isAxisAligned = _transform.M12 == 0f && _transform.M21 == 0f;
+        if (isAxisAligned)
+            _vg.ShapeAntiAlias(false);
+        _vg.BeginPath();
+        _vg.Rect((float)fillRect.X, (float)fillRect.Y, (float)fillRect.Width, (float)fillRect.Height);
+        _vg.FillPaint(paint);
+        _vg.Fill();
+        if (isAxisAligned)
+            _vg.ShapeAntiAlias(true);
+    }
+
+    private MewVGImageFlags GetImageFlags()
+    {
+        return ImageScaleQuality switch
+        {
+            ImageScaleQuality.Fast => MewVGImageFlags.Nearest,
+            ImageScaleQuality.HighQuality => MewVGImageFlags.GenerateMipmaps,
+            _ => MewVGImageFlags.None,
+        };
+    }
+
+    #endregion
+
+    #region Utilities
+
+    private Rect TransformRectToWorldAABB(Rect rect)
+    {
+        // Fast path: translation-only transform.
+        if (_transform.M11 == 1f && _transform.M12 == 0f &&
+            _transform.M21 == 0f && _transform.M22 == 1f)
+        {
+            return new Rect(rect.X + _transform.M31, rect.Y + _transform.M32,
+                rect.Width, rect.Height);
+        }
+
+        // General case: transform all 4 corners and compute AABB.
+        var tl = Vector2.Transform(new Vector2((float)rect.X, (float)rect.Y), _transform);
+        var tr = Vector2.Transform(new Vector2((float)rect.Right, (float)rect.Y), _transform);
+        var bl = Vector2.Transform(new Vector2((float)rect.X, (float)rect.Bottom), _transform);
+        var br = Vector2.Transform(new Vector2((float)rect.Right, (float)rect.Bottom), _transform);
+
+        float minX = MathF.Min(MathF.Min(tl.X, tr.X), MathF.Min(bl.X, br.X));
+        float minY = MathF.Min(MathF.Min(tl.Y, tr.Y), MathF.Min(bl.Y, br.Y));
+        float maxX = MathF.Max(MathF.Max(tl.X, tr.X), MathF.Max(bl.X, br.X));
+        float maxY = MathF.Max(MathF.Max(tl.Y, tr.Y), MathF.Max(bl.Y, br.Y));
+
+        return new Rect(minX, minY, Math.Max(0, maxX - minX), Math.Max(0, maxY - minY));
+    }
+
+    private static Rect IntersectClipBounds(Rect? current, Rect next)
+    {
+        if (!current.HasValue)
+        {
+            return next;
+        }
+
+        double left = Math.Max(current.Value.X, next.X);
+        double top = Math.Max(current.Value.Y, next.Y);
+        double right = Math.Min(current.Value.Right, next.Right);
+        double bottom = Math.Min(current.Value.Bottom, next.Bottom);
+        return right > left && bottom > top
+            ? new Rect(left, top, right - left, bottom - top)
+            : new Rect(left, top, 0, 0);
+    }
+
+    private static MewVGColor ToNvgColor(Color color) => MewVGColor.RGBA(color.R, color.G, color.B, color.A);
+
+
+    /// <summary>
+    /// Sets NanoVG stroke width with device-pixel snapping. The thickness is in DIP
+    /// (input units); NanoVG applies the current transform (user × dpi) on its side,
+    /// so we round to whole device pixels at total scale and convert back to DIP for
+    /// NVG to multiply through. Result: stroke scales with transform like Skia/WPF/SVG
+    /// while remaining crisp on fractional DPI.
+    /// </summary>
+    private void NvgStrokeWidth(float thickness)
+    {
+        if (thickness <= 0)
+        { _vg.StrokeWidth(0); return; }
+        float sx = MathF.Sqrt(_transform.M11 * _transform.M11 + _transform.M12 * _transform.M12);
+        float sy = MathF.Sqrt(_transform.M21 * _transform.M21 + _transform.M22 * _transform.M22);
+        float avgScale = (sx + sy) * 0.5f;
+        float totalScale = avgScale * (float)DpiScale;
+        if (totalScale < 0.001f)
+        { _vg.StrokeWidth(thickness); return; }
+        float snappedPx = MathF.Max(1, MathF.Round(thickness * totalScale));
+        _vg.StrokeWidth(snappedPx / totalScale);
+    }
+
+    #endregion
+}

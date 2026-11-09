@@ -1,0 +1,33 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!-- One smoke test per vendored extension: MewDock, Svg (through the committed generated registry), Geometry, MewCharts and Preview type load. Proves the vendored tree builds and its entry points run, nothing more. -->
+
+  <PropertyGroup>
+    <RootNamespace>MewStage.ThirdParty.Tests</RootNamespace>
+    <AssemblyName>MewStage.ThirdParty.Tests</AssemblyName>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Microsoft.NET.Test.Sdk" Version="18.11.0" />
+    <PackageReference Include="xunit" Version="2.9.3" />
+    <PackageReference Include="xunit.runner.visualstudio" Version="4.0.1" />
+    <PackageReference Include="Xunit.SkippableFact" Version="1.5.23" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\..\third_party\MewUI\src\MewUI\MewUI.csproj" />
+    <ProjectReference Include="..\..\third_party\MewUI\extensions\MewUI.MewDock\MewUI.MewDock.csproj" />
+    <ProjectReference Include="..\..\third_party\MewUI\extensions\MewUI.Svg\MewUI.Svg.csproj" />
+    <ProjectReference Include="..\..\third_party\MewUI\extensions\MewUI.Geometry\MewUI.Geometry.csproj" />
+    <ProjectReference Include="..\..\third_party\MewUI\extensions\MewUI.MewCharts\MewUI.MewCharts.csproj" />
+    <ProjectReference Include="..\..\third_party\MewUI\src\MewUI.Preview\MewUI.Preview.csproj" />
+    <ProjectReference Include="..\..\third_party\MewVG\src\MewVG.Core\MewVG.Core.csproj" />
+  </ItemGroup>
+
+  <PropertyGroup>
+    <MewStageUiHost>Embedded</MewStageUiHost>
+  </PropertyGroup>
+  <Import Project="$(MSBuildThisFileDirectory)..\..\third_party\MewUI.Consumer.targets" />
+
+</Project>

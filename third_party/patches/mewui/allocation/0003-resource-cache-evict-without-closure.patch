@@ -1,0 +1,32 @@
+MewStage vendor patch allocation/0003 (third_party/NOTICE): RenderResourceCache.EvictPersistentToBudgetNoLock picks
+the fallback eviction victim with a loop instead of a LINQ lambda that captured a parameter (its closure was allocated
+on every call, i.e. every frame that rents a group surface). Same victim; no behavioural change.
+
+--- a/Rendering/Surfaces/RenderResourceCache.cs
++++ b/Rendering/Surfaces/RenderResourceCache.cs
+@@ -868,9 +868,22 @@
+             var victim = FindOldestReusablePersistentNoLock();
+             if (ReferenceEquals(victim, protectedEntry))
+             {
+-                victim = _entries.Values
+-                    .Where(candidate => !ReferenceEquals(candidate, protectedEntry) && candidate.LeaseCount == 0)
+-                    .MinBy(static candidate => candidate.LastUseSequence);
++                // MewStage vendor patch allocation/0003: a loop, not a LINQ lambda. The lambda captured the parameter, so its
++                // closure was allocated on entry to this method on every call, including the per-frame calls that
++                // return at once because the cache is within budget. Same choice: the first least-recently-used
++                // unleased entry other than the protected one.
++                victim = null;
++                foreach (var candidate in _entries.Values)
++                {
++                    if (ReferenceEquals(candidate, protectedEntry) || candidate.LeaseCount != 0)
++                    {
++                        continue;
++                    }
++                    if (victim == null || candidate.LastUseSequence < victim.LastUseSequence)
++                    {
++                        victim = candidate;
++                    }
++                }
+             }
+             if (victim == null)
+             {

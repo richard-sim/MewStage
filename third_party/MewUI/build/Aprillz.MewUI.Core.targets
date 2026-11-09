@@ -1,0 +1,137 @@
+<Project>
+
+  <!--
+    Framework-wide build policy, carried by Aprillz.MewUI.Core so every consumer gets it, whatever
+    combination of MewUI packages it references. The metapackage targets carry only the publish
+    filtering that their own bundling makes necessary.
+  -->
+
+  <PropertyGroup>
+    <_MewUICoreTargetsImported>true</_MewUICoreTargetsImported>
+  </PropertyGroup>
+
+  <!--
+    Hot Reload opt-out. MewUI auto-registers a MetadataUpdateHandler in its own assembly, so
+    Hot Reload works with no app declaration under `dotnet watch`. Setting
+    <MewUIHotReload>false</MewUIHotReload> emits an AppContext switch that disables the handler
+    at runtime (the assembly attribute is baked into MewUI.dll and cannot be removed by MSBuild).
+  -->
+  <ItemGroup Condition="'$(MewUIHotReload)' == 'false'">
+    <RuntimeHostConfigurationOption Include="Aprillz.MewUI.HotReload.Enabled" Value="false" Trim="false" />
+  </ItemGroup>
+
+  <!--
+    DevTools and profiler opt-in. On in Debug, off in Release, and never available in trimmed or
+    NativeAOT publishes: the property panel enumerates CLR members by reflection, so a trimmed
+    member list would silently lie. Setting <MewUIDevTools>true</MewUIDevTools> turns them on in
+    any non-trimmed configuration. Trim="true" hands the value to the trimmer as well as the
+    runtime, which is what lets ILLink.Substitutions.xml fold the gate to a constant.
+  -->
+  <PropertyGroup>
+    <MewUIDevTools Condition="'$(MewUIDevTools)' == '' And '$(Configuration)' == 'Debug'">true</MewUIDevTools>
+    <MewUIDevTools Condition="'$(MewUIDevTools)' == ''">false</MewUIDevTools>
+    <!-- Only a publish trims, so an app that declares PublishAot still runs the tools under
+         `dotnet run`. Refusing at build time would take them away from every debug session of an
+         app that merely intends to publish AOT later. -->
+    <_MewUIDevToolsRefused Condition="'$(MewUIDevTools)' == 'true' And '$(_IsPublishing)' == 'true' And ('$(PublishAot)' == 'true' Or '$(PublishTrimmed)' == 'true')">true</_MewUIDevToolsRefused>
+    <MewUIDevTools Condition="'$(_MewUIDevToolsRefused)' == 'true'">false</MewUIDevTools>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <RuntimeHostConfigurationOption Include="Aprillz.MewUI.DevTools.Enabled" Value="$(MewUIDevTools)" Trim="true" />
+  </ItemGroup>
+
+  <Target Name="_MewUIWarnDevToolsUnavailable" BeforeTargets="Publish" Condition="'$(_MewUIDevToolsRefused)' == 'true'">
+    <Warning Text="MewUIDevTools was requested but trimmed and NativeAOT publishes cannot host the DevTools; publishing without them." />
+  </Target>
+
+  <!--
+    Environment-variable diagnostics follow the consumer configuration. Debug consumers can opt in
+    at runtime with MEWUI_*_DEBUG variables; Release consumers omit the logging graph by default.
+    Release diagnostics can be retained explicitly with <MewUIEnvironmentDebugLogging>true</MewUIEnvironmentDebugLogging>.
+  -->
+  <PropertyGroup>
+    <MewUIEnvironmentDebugLogging Condition="'$(MewUIEnvironmentDebugLogging)' == '' And '$(Configuration)' == 'Debug'">true</MewUIEnvironmentDebugLogging>
+    <MewUIEnvironmentDebugLogging Condition="'$(MewUIEnvironmentDebugLogging)' == ''">false</MewUIEnvironmentDebugLogging>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <RuntimeHostConfigurationOption Include="Aprillz.MewUI.EnvironmentDebugLogging.Enabled" Value="$(MewUIEnvironmentDebugLogging)" Trim="true" />
+  </ItemGroup>
+
+  <!--
+    Managed file dialogs are included by default. Apps that rely exclusively on native dialogs can
+    disable them; Trim="true" lets ILLink remove the managed dialog implementation from trimmed and
+    NativeAOT output while leaving the PreferNative API available.
+  -->
+  <PropertyGroup>
+    <MewUIManagedFileDialogs Condition="'$(MewUIManagedFileDialogs)' == ''">true</MewUIManagedFileDialogs>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <RuntimeHostConfigurationOption Include="Aprillz.MewUI.ManagedFileDialogs.Enabled" Value="$(MewUIManagedFileDialogs)" Trim="true" />
+  </ItemGroup>
+
+  <!--
+    Touch and pen gestures are included by default. Apps that never run on a touch screen can turn
+    them off; Trim="true" lets ILLink remove the gesture recognizer, the scroll coast, and the
+    platform pointer paths from trimmed and NativeAOT output, and touch then arrives the way the
+    platform promotes it to the mouse.
+  -->
+  <PropertyGroup>
+    <MewUITouch Condition="'$(MewUITouch)' == ''">true</MewUITouch>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <RuntimeHostConfigurationOption Include="Aprillz.MewUI.Touch.Enabled" Value="$(MewUITouch)" Trim="true" />
+  </ItemGroup>
+
+  <!--
+    Win32 text engine. Selects which of the two text paths the GDI and MewVG.Win32 backends keep:
+    GDI (legacy family-name matching, no colour glyphs) or DirectWrite (typographic family matching,
+    colour emoji). Trim="true" hands the value to the trimmer as well as the runtime, so a trimmed
+    or NativeAOT publish drops whichever path the app did not select. Apps that reference neither
+    Win32 backend carry the switch in runtimeconfig.json and nothing reads it.
+
+    Remove first: an app that declares the same option would otherwise leave the item duplicated and
+    the value the trimmer sees undefined.
+  -->
+  <PropertyGroup>
+    <MewUIWin32TextEngine Condition="'$(MewUIWin32TextEngine)' == ''">DirectWrite</MewUIWin32TextEngine>
+    <_MewUIWin32DirectWriteText>false</_MewUIWin32DirectWriteText>
+    <_MewUIWin32DirectWriteText Condition="'$(MewUIWin32TextEngine)' == 'DirectWrite'">true</_MewUIWin32DirectWriteText>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <RuntimeHostConfigurationOption Remove="Aprillz.MewUI.Win32.DirectWriteText.Enabled" />
+    <RuntimeHostConfigurationOption Include="Aprillz.MewUI.Win32.DirectWriteText.Enabled"
+                                    Value="$(_MewUIWin32DirectWriteText)" Trim="true" />
+  </ItemGroup>
+
+  <Target Name="_MewUIValidateWin32TextEngine" BeforeTargets="Build"
+          Condition="'$(MewUIWin32TextEngine)' != 'Gdi' And '$(MewUIWin32TextEngine)' != 'DirectWrite'">
+    <Error Text="MewUIWin32TextEngine must be Gdi or DirectWrite. Actual: '$(MewUIWin32TextEngine)'." />
+  </Target>
+
+  <!--
+    Binding path generator interceptors. The compiler only honours interceptors whose namespace is
+    allow-listed, so opt the generated namespace in here rather than asking every app to do it.
+    This must live in targets, not props: nuget.g.props is imported before the project body, where
+    $(TargetFramework) is not yet set. Csc reads both properties, and MS first-party generators
+    still use the Preview one, so setting both covers every SDK and Roslyn combination.
+
+    The property is set unconditionally. Repo samples import this file from the project body, which
+    runs before the SDK infers $(TargetFrameworkIdentifier), so testing that value here silently
+    skips the injection and the build fails with CS9137.
+  -->
+  <PropertyGroup>
+    <InterceptorsPreviewNamespaces>$(InterceptorsPreviewNamespaces);Aprillz.MewUI.Generated</InterceptorsPreviewNamespaces>
+    <InterceptorsNamespaces>$(InterceptorsNamespaces);Aprillz.MewUI.Generated</InterceptorsNamespaces>
+  </PropertyGroup>
+
+
+  <!-- Editor preview session composition (see agent/preview-tooling/plan.md section 4.2). -->
+  <Import Project="$(MSBuildThisFileDirectory)MewUIPreview.targets"
+          Condition="'$(_MewUIPreviewTargetsImported)' != 'true' and Exists('$(MSBuildThisFileDirectory)MewUIPreview.targets')" />
+
+</Project>

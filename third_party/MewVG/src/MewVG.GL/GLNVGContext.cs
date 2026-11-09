@@ -1,0 +1,2225 @@
+// NanoVG OpenGL backend (GL3 core profile)
+// Ported from nanovg_gl.h
+
+using System.Runtime.CompilerServices;
+
+namespace Aprillz.MewVG;
+
+internal sealed class GLNVGContext : IDisposable, INVGRenderer
+{
+    private const int UniformArraySize = 13;
+    private const int UniformFloatCount = UniformArraySize * 4;
+
+    private struct GLNVGShader
+    {
+        public int Program;
+        public int Vert;
+        public int Frag;
+        public int LocViewSize;
+        public int LocTex;
+        public int LocFrag;
+        public int LocCoverageOrigin;
+        public int LocClipTex;
+        public int LocClipEnabled;
+        public int LocClipOrigin;
+        public int LocClipSize;
+        public int LocMaskTex;
+        public int LocMaskEnabled;
+        public int LocMaskOrigin;
+        public int LocMaskSize;
+        public int LocMaskScale;
+    }
+
+    private struct GLNVGTexture
+    {
+        public int Id;
+        public int Tex;
+        public int Width;
+        public int Height;
+        public NVGtextureType Type;
+        public MewVGImageFlags Flags;
+    }
+
+    private struct GLNVGBlend
+    {
+        public BlendingFactorSrc SrcRGB;
+        public BlendingFactorDest DstRGB;
+        public BlendingFactorSrc SrcAlpha;
+        public BlendingFactorDest DstAlpha;
+    }
+
+    private enum GLNVGCallType
+    {
+        None = 0,
+        Clip,
+        ClipReset,
+        Fill,
+        Stroke,
+        Triangles,
+        MaskFill,
+    }
+
+    private struct GLNVGCall
+    {
+        public GLNVGCallType Type;
+        public int Image;
+        public int MaskImage;
+        public float MaskOriginX;
+        public float MaskOriginY;
+        public int PathOffset;
+        public int PathCount;
+        public int TriangleOffset;
+        public int TriangleCount;
+        public int UniformOffset;
+        public GLNVGBlend BlendFunc;
+        // The call draws through the coverage scratch instead of directly (see RenderFill/RenderStroke).
+        public bool UsesCoverageAA;
+        public int MergedFringeOffset;
+        public int MergedFringeCount;
+        public bool MergedFringeIsStrip;
+        public int MergedStrokeOffset;
+        public int MergedStrokeCount;
+        public bool MergedStrokeIsStrip;
+    }
+
+    private struct GLNVGPath
+    {
+        public int FillOffset;
+        public int FillCount;
+        public int StrokeOffset;
+        public int StrokeCount;
+    }
+
+    private struct GLNVGFragUniforms
+    {
+        public float[] Data;
+    }
+
+    private enum GLNVGShaderType
+    {
+        FillGrad = 0,
+        FillImg = 1,
+        Simple = 2,
+        Img = 3,
+        CoverageOutput = 4,
+        CoverageComposite = 5,
+        GradientRadial = 6,
+        GradientLinear = 7,
+    }
+
+    // MEWVG_GL_DEBUG=1 turns on the glGetError check after each state change.
+    private static readonly bool _debugChecks = Environment.GetEnvironmentVariable("MEWVG_GL_DEBUG") == "1";
+    // Fill programs: the variants that drop the branches a draw does not need, then the uber shader
+    // that handles every combination (see GLNVGShaderSource). Variants compile on first use.
+    private const int VARIANT_FLAG_SCISSOR = 1;
+    private const int VARIANT_FLAG_CLIP = 2;
+    private const int VARIANT_FLAG_MASK = 4;
+    private const int VARIANT_FLAG_COUNT = 8;
+    private const int VARIANT_PAINT_SOLID = 1;
+    private const int VARIANT_PAINT_IMAGE = 2;
+    private const int VARIANT_PAINT_IMAGE_TRIANGLES = 3;
+    private const int VARIANT_PAINT_BOX_GRADIENT = 4;
+    private const int VARIANT_PAINT_LINEAR_GRADIENT = 5;
+    private const int VARIANT_PAINT_RADIAL_GRADIENT = 6;
+    private const int VARIANT_PAINT_SIMPLE = 7;
+    private const int VARIANT_PAINT_COVERAGE_OUTPUT = 8;
+    private const int VARIANT_PAINT_COVERAGE_COMPOSITE = 9;
+    private const int VARIANT_PAINT_COVERAGE_SOLID = 10;
+    private const int VARIANT_PAINT_COUNT = 11;
+    private const int UBER_SHADER = VARIANT_PAINT_COUNT * VARIANT_FLAG_COUNT;
+    // MEWVG_GL_UBERSHADER=1 draws everything with the uber shader (A/B comparison, driver workaround).
+    private static readonly bool _uberShaderOnly = Environment.GetEnvironmentVariable("MEWVG_GL_UBERSHADER") == "1";
+    private readonly GLNVGShader[] _programs = new GLNVGShader[UBER_SHADER + 1];
+    // Flush in which each program last had its per-flush uniforms set.
+    private readonly int[] _programFlush = new int[UBER_SHADER + 1];
+    private readonly bool[] _variantFailed = new bool[UBER_SHADER];
+    private int _flushNumber;
+    private int _currentProgram = -1;
+
+    private int _vao;
+    private int _vbo;
+
+    private GLNVGTexture[] _textures = Array.Empty<GLNVGTexture>();
+    private int _textureCount;
+    private int _textureCapacity;
+    private int _textureId;
+
+    private GLNVGCall[] _calls = Array.Empty<GLNVGCall>();
+    private int _callCount;
+    private int _callCapacity;
+
+    private GLNVGPath[] _paths = Array.Empty<GLNVGPath>();
+    private int _pathCount;
+    private int _pathCapacity;
+
+    private NVGvertex[] _verts = Array.Empty<NVGvertex>();
+    private int _vertCount;
+    private int _vertCapacity;
+
+    private GLNVGFragUniforms[] _uniforms = Array.Empty<GLNVGFragUniforms>();
+    private int _uniformCount;
+    private int _uniformCapacity;
+
+    private readonly float[] _view = new float[2];
+    private int _dummyTex;
+
+    // coverage buffer for transparent fills
+    private int _coverageFbo;
+    private int _coverageTex;
+    private int _vboCapacity;
+    // Device copies of coverage masks; see MaskImageCache for the reuse and eviction policy.
+    private readonly MaskImageCache _maskImages;
+    private int _coverageTexWidth;
+    private int _coverageTexHeight;
+    private float _devicePixelRatio = 1.0f;
+
+    // Bounded R8 clip masks. Two targets are used so nested clips can intersect the
+    // new path with the previous mask without sampling the render target.
+    private readonly int[] _clipMaskFbos = new int[2];
+    private readonly int[] _clipMaskTextures = new int[2];
+    private readonly int[] _clipMaskTextureWidths = new int[2];
+    private readonly int[] _clipMaskTextureHeights = new int[2];
+    private int _clipMaskIndex;
+    private bool _clipMaskActive;
+    private bool _clipMaskEmpty;
+    private int _clipMaskX;
+    private int _clipMaskY;
+    private int _clipMaskWidth;
+    private int _clipMaskHeight;
+
+    // cached state
+    private int _boundTexture;
+    private GLNVGBlend _blendFunc;
+    private bool _disposed;
+
+    // captured once per Flush() so the coverage passes don't re-query GL state per call
+    private int _flushMainFbo;
+    private int _flushViewportX;
+    private int _flushViewportY;
+    private int _flushViewportWidth;
+    private int _flushViewportHeight;
+
+    private static bool PaintHasTransparency(in MewVGPaint paint)
+        => paint.InnerColor.A < 0.999f || paint.OuterColor.A < 0.999f;
+
+    public GLNVGContext()
+    {
+        // GL orders commands: once a frame's calls are flushed, its images may be rewritten.
+        _maskImages = new MaskImageCache(
+            (width, height, coverage) => CreateTexture(NVGtextureType.Alpha, width, height, MewVGImageFlags.Nearest, coverage),
+            (image, width, height, coverage) => UpdateTexture(image, 0, 0, width, height, coverage),
+            DeleteTexture,
+            framesInFlight: 1);
+        GL.EnsureLoaded();
+        CreateResources();
+    }
+
+    public int CreateImageFromHandle(int textureId, int width, int height, MewVGImageFlags flags)
+    {
+        var tex = AllocTexture();
+        if (tex == null)
+        {
+            return 0;
+        }
+
+        var index = tex.Value;
+        ref var t = ref _textures[index];
+
+        t.Type = NVGtextureType.RGBA;
+        t.Tex = textureId;
+        t.Flags = flags;
+        t.Width = width;
+        t.Height = height;
+
+        return t.Id;
+    }
+
+    public int GetImageHandle(int image)
+    {
+        if (!TryFindTexture(image, out var index))
+        {
+            return 0;
+        }
+
+        return _textures[index].Tex;
+    }
+
+    public void BeginFrame(float windowWidth, float windowHeight, float devicePixelRatio)
+    {
+        GL.EnsureLoaded();
+        _view[0] = windowWidth;
+        _view[1] = windowHeight;
+        _devicePixelRatio = devicePixelRatio;
+
+        _callCount = 0;
+        _pathCount = 0;
+        _vertCount = 0;
+        _uniformCount = 0;
+        _maskImages.BeginFrame();
+    }
+
+    public void Cancel()
+    {
+        _callCount = 0;
+        _pathCount = 0;
+        _vertCount = 0;
+        _uniformCount = 0;
+    }
+
+    public void Flush()
+    {
+        if (_callCount <= 0)
+        {
+            return;
+        }
+
+        _flushNumber++;
+        _currentProgram = -1;
+        UseProgram(UBER_SHADER);
+
+        GL.Enable(EnableCap.CullFace);
+        GL.CullFace(CullFaceMode.Back);
+        GL.FrontFace(FrontFaceDirection.Ccw);
+        GL.Enable(EnableCap.Blend);
+        GL.Disable(EnableCap.DepthTest);
+        GL.Disable(EnableCap.ScissorTest);
+        GL.ColorMask(true, true, true, true);
+        GL.ActiveTexture(TextureUnit.Texture0);
+        GL.BindTexture(TextureTarget.Texture2D, 0);
+
+        _boundTexture = 0;
+        _blendFunc = new GLNVGBlend { SrcRGB = 0, SrcAlpha = 0, DstRGB = 0, DstAlpha = 0 };
+
+        // Captured once here instead of per coverage call (FillWithCoverage/StrokeWithCoverage
+        // used to re-query the bound framebuffer on every call and never restored the caller's
+        // actual viewport, only the coverage-sized one).
+        _flushMainFbo = GL.GetInteger(GetPName.FramebufferBinding);
+        GL.GetViewport(out _flushViewportX, out _flushViewportY, out _flushViewportWidth, out _flushViewportHeight);
+
+        // Upload vertex data. Orphan at a fixed, power-of-two capacity and copy in with SubData:
+        // orphaning with a different size every flush defeats the driver's buffer-storage reuse
+        // pool, so a burst of many small flushes leaves one freshly sized storage per flush in
+        // flight instead of recycling a handful of same-sized ones.
+        var vertexSize = Unsafe.SizeOf<NVGvertex>();
+        int uploadBytes = _vertCount * vertexSize;
+        GL.BindVertexArray(_vao);
+        GL.BindBuffer(BufferTarget.ArrayBuffer, _vbo);
+        if (uploadBytes > _vboCapacity)
+        {
+            _vboCapacity = Math.Max(256 * 1024, (int)System.Numerics.BitOperations.RoundUpToPowerOf2((uint)uploadBytes));
+        }
+        GL.BufferDataOrphan(BufferTarget.ArrayBuffer, _vboCapacity, BufferUsageHint.StreamDraw);
+        GL.BufferSubData(BufferTarget.ArrayBuffer, 0, uploadBytes, _verts);
+
+        GL.EnableVertexAttribArray(0);
+        GL.EnableVertexAttribArray(1);
+        GL.VertexAttribPointer(0, 2, VertexAttribPointerType.Float, false, vertexSize, 0);
+        GL.VertexAttribPointer(1, 2, VertexAttribPointerType.Float, false, vertexSize, sizeof(float) * 2);
+
+        _clipMaskActive = false;
+        _clipMaskEmpty = false;
+
+        for (var i = 0; i < _callCount; i++)
+        {
+            ref var call = ref _calls[i];
+
+            switch (call.Type)
+            {
+                case GLNVGCallType.ClipReset:
+                    ClipReset(call);
+                    break;
+                case GLNVGCallType.Clip:
+                    Clip(call);
+                    break;
+                case GLNVGCallType.Fill:
+                    BlendFuncSeparate(call.BlendFunc);
+                    Fill(call);
+                    break;
+                case GLNVGCallType.Stroke:
+                    BlendFuncSeparate(call.BlendFunc);
+                    Stroke(call);
+                    break;
+                case GLNVGCallType.Triangles:
+                    BlendFuncSeparate(call.BlendFunc);
+                    Triangles(call);
+                    break;
+                case GLNVGCallType.MaskFill:
+                    BlendFuncSeparate(call.BlendFunc);
+                    MaskFill(call);
+                    break;
+            }
+        }
+
+        GL.DisableVertexAttribArray(0);
+        GL.DisableVertexAttribArray(1);
+        GL.BindVertexArray(0);
+        GL.BindBuffer(BufferTarget.ArrayBuffer, 0);
+        GL.Disable(EnableCap.CullFace);
+        GL.UseProgram(0);
+        _currentProgram = -1;
+        BindTexture(0);
+
+        // Release the clip and mask units too. Desktop GL tolerates a texture that stays bound while
+        // the framebuffer owning it is drawn into; GLES3/WebGL2 calls that a feedback loop and drops
+        // the draw, so clipped content rendered through an offscreen target disappears.
+        GL.ActiveTexture(TextureUnit.Texture1);
+        GL.BindTexture(TextureTarget.Texture2D, 0);
+        GL.ActiveTexture(TextureUnit.Texture2);
+        GL.BindTexture(TextureTarget.Texture2D, 0);
+        GL.ActiveTexture(TextureUnit.Texture0);
+
+        _vertCount = 0;
+        _pathCount = 0;
+        _callCount = 0;
+        _uniformCount = 0;
+
+        CheckError("flush");
+    }
+
+    void INVGRenderer.BeginFrame(float windowWidth, float windowHeight, float devicePixelRatio) => BeginFrame(windowWidth, windowHeight, devicePixelRatio);
+    void INVGRenderer.Cancel() => Cancel();
+    void INVGRenderer.Flush() => Flush();
+    void INVGRenderer.RenderClip(ref NVGscissorState scissor, float fringe, ReadOnlySpan<float> bounds, ReadOnlySpan<NVGpathData> paths, ReadOnlySpan<NVGvertex> verts)
+        => RenderClip(ref scissor, fringe, bounds, paths, verts);
+    void INVGRenderer.ResetClip() => ResetClip();
+    void INVGRenderer.RenderMaskFill(ref MewVGPaint paint, NVGcompositeOperationState compositeOperation, ref NVGscissorState scissor, float fringe, ReadOnlySpan<float> bounds, ReadOnlySpan<byte> coverage, int maskWidth, int maskHeight, float maskOriginX, float maskOriginY, object? cacheKey, int cacheVersion)
+        => RenderMaskFill(ref paint, compositeOperation, ref scissor, fringe, bounds, coverage, maskWidth, maskHeight, maskOriginX, maskOriginY, cacheKey, cacheVersion);
+
+    private void RenderClip(
+        ref NVGscissorState scissor,
+        float fringe,
+        ReadOnlySpan<float> bounds,
+        ReadOnlySpan<NVGpathData> paths,
+        ReadOnlySpan<NVGvertex> verts)
+    {
+        ref var call = ref AllocCall();
+        call.Type = GLNVGCallType.Clip;
+        call.PathOffset = AllocPaths(paths.Length);
+        call.PathCount = paths.Length;
+        call.Image = 0;
+        call.BlendFunc = default;
+
+        // The clip is written into its mask the way a fill is written into the coverage buffer:
+        // the tessellated body (full coverage) and the AA fringe strip, merged into one draw and
+        // accumulated with max blending. The body is a triangle list from the core's tessellator,
+        // so nothing overlaps and no winding pass is needed.
+        var singlePath = paths.Length == 1;
+        var maxVerts = 4;
+        for (var i = 0; i < paths.Length; i++)
+        {
+            maxVerts += paths[i].NFill + (singlePath ? paths[i].NStroke : StripToTriangleCount(paths[i].NStroke));
+        }
+
+        var vertOffset = AllocVerts(maxVerts);
+        call.MergedFringeOffset = vertOffset;
+        call.MergedFringeIsStrip = false;
+        for (var i = 0; i < paths.Length; i++)
+        {
+            ref var copy = ref _paths[call.PathOffset + i];
+            ref readonly var path = ref paths[i];
+            copy = default;
+
+            if (path.NFill > 0)
+            {
+                copy.FillOffset = vertOffset;
+                verts.Slice(path.FillOffset, path.NFill).CopyTo(_verts.AsSpan(vertOffset));
+                copy.FillCount = path.NFill;
+                vertOffset += path.NFill;
+            }
+        }
+        for (var i = 0; i < paths.Length; i++)
+        {
+            ref var copy = ref _paths[call.PathOffset + i];
+            ref readonly var path = ref paths[i];
+            if (path.NStroke > 0)
+            {
+                copy.StrokeOffset = vertOffset;
+                // A fringe strip can only follow the body triangles in one draw as triangles.
+                var written = ConvertStripToTriangles(verts.Slice(path.StrokeOffset, path.NStroke), _verts.AsSpan(vertOffset));
+                copy.StrokeCount = written;
+                vertOffset += written;
+            }
+        }
+        call.MergedFringeCount = vertOffset - call.MergedFringeOffset;
+
+        call.TriangleOffset = vertOffset;
+        call.TriangleCount = 4;
+        var quad = _verts.AsSpan(call.TriangleOffset, 4);
+        quad[0] = new NVGvertex(_view[0], _view[1], 0.5f, 1.0f);
+        quad[1] = new NVGvertex(_view[0], 0, 0.5f, 1.0f);
+        quad[2] = new NVGvertex(0, _view[1], 0.5f, 1.0f);
+        quad[3] = new NVGvertex(0, 0, 0.5f, 1.0f);
+
+        // Coverage output: the body texcoord reads as full coverage under the analytical-fill
+        // strokeMult, the fringe ramps, and the scissor is left to each draw that samples the mask.
+        call.UniformOffset = AllocUniforms(1);
+        var coverageOut = _uniforms[call.UniformOffset].Data;
+        Array.Clear(coverageOut);
+        SetUniformVec4(coverageOut, 8, 1.0f, 1.0f, 1.0f, 1.0f);
+        SetUniformValue(coverageOut, 12, 0, -1.0f);
+        SetUniformValue(coverageOut, 12, 1, -1.0f);
+        SetUniformValue(coverageOut, 12, 3, (float)GLNVGShaderType.CoverageOutput);
+    }
+
+    private void ResetClip()
+    {
+        ref var call = ref AllocCall();
+        call.Type = GLNVGCallType.ClipReset;
+        call.Image = 0;
+        call.BlendFunc = default;
+
+        call.TriangleOffset = AllocVerts(4);
+        call.TriangleCount = 4;
+        var quad = _verts.AsSpan(call.TriangleOffset, 4);
+        quad[0] = new NVGvertex(_view[0], _view[1], 0.5f, 1.0f);
+        quad[1] = new NVGvertex(_view[0], 0, 0.5f, 1.0f);
+        quad[2] = new NVGvertex(0, _view[1], 0.5f, 1.0f);
+        quad[3] = new NVGvertex(0, 0, 0.5f, 1.0f);
+        call.UniformOffset = AllocUniforms(1);
+        var simple = _uniforms[call.UniformOffset].Data;
+        Array.Clear(simple);
+        SetUniformVec4(simple, 8, 1.0f, 1.0f, 1.0f, 1.0f);
+        SetUniformValue(simple, 12, 1, -1.0f);
+        SetUniformValue(simple, 12, 3, (float)GLNVGShaderType.Simple);
+    }
+
+    public void RenderFill(
+        ref MewVGPaint paint,
+        NVGcompositeOperationState compositeOperation,
+        ref NVGscissorState scissor,
+        float fringe,
+        ReadOnlySpan<float> bounds,
+        ReadOnlySpan<NVGpathData> paths,
+        ReadOnlySpan<NVGvertex> verts)
+    {
+        ref var call = ref AllocCall();
+        call.Type = GLNVGCallType.Fill;
+        call.PathOffset = AllocPaths(paths.Length);
+        call.PathCount = paths.Length;
+        call.Image = paint.Image;
+        call.BlendFunc = BlendCompositeOperation(compositeOperation);
+        call.TriangleCount = 4;
+
+        var singlePath = paths.Length == 1;
+        var maxVerts = 0;
+        for (var i = 0; i < paths.Length; i++)
+        {
+            maxVerts += paths[i].NFill + (singlePath ? paths[i].NStroke : StripToTriangleCount(paths[i].NStroke));
+        }
+
+        maxVerts += call.TriangleCount;
+        var vertOffset = AllocVerts(maxVerts);
+
+        // Pass 1: fill vertices (contiguous)
+        for (var i = 0; i < paths.Length; i++)
+        {
+            ref var copy = ref _paths[call.PathOffset + i];
+            ref readonly var path = ref paths[i];
+
+            copy = default;
+            if (path.NFill > 0)
+            {
+                copy.FillOffset = vertOffset;
+                copy.FillCount = path.NFill;
+                verts.Slice(path.FillOffset, path.NFill).CopyTo(_verts.AsSpan(vertOffset));
+                vertOffset += path.NFill;
+                if ((path.NFill % 3) != 0)
+                {
+                    throw new InvalidOperationException("MewVG.GL: fill vertices must form a triangle list; the renderer has no stencil winding route.");
+                }
+            }
+        }
+
+        // Pass 2: fringe vertices (strip→triangle, or keep strip for single path)
+        var singleFringePath = paths.Length == 1 && paths[0].NStroke > 0;
+        call.MergedFringeOffset = vertOffset;
+        call.MergedFringeIsStrip = singleFringePath;
+        for (var i = 0; i < paths.Length; i++)
+        {
+            ref var copy = ref _paths[call.PathOffset + i];
+            ref readonly var path = ref paths[i];
+
+            if (path.NStroke > 0)
+            {
+                var strokeSrc = verts.Slice(path.StrokeOffset, path.NStroke);
+
+                copy.StrokeOffset = vertOffset;
+                if (singleFringePath)
+                {
+                    strokeSrc.CopyTo(_verts.AsSpan(vertOffset));
+                    copy.StrokeCount = strokeSrc.Length;
+                    vertOffset += strokeSrc.Length;
+                }
+                else
+                {
+                    var written = ConvertStripToTriangles(strokeSrc, _verts.AsSpan(vertOffset));
+                    copy.StrokeCount = written;
+                    vertOffset += written;
+                }
+            }
+        }
+        call.MergedFringeCount = vertOffset - call.MergedFringeOffset;
+
+        call.TriangleOffset = vertOffset;
+        // The AA fringe extends half a fringe beyond the path bounds. The
+        // coverage pipeline composites only pixels covered by this quad, so an
+        // unexpanded quad would drop the outermost partial-coverage pixels on
+        // the bounds-facing edges (visible as a missing AA column when an edge
+        // lands past a pixel center).
+        var quadMargin = fringe;
+        var quad = _verts.AsSpan(call.TriangleOffset, 4);
+        quad[0] = new NVGvertex(bounds[2] + quadMargin, bounds[3] + quadMargin, 0.5f, 1.0f);
+        quad[1] = new NVGvertex(bounds[2] + quadMargin, bounds[1] - quadMargin, 0.5f, 1.0f);
+        quad[2] = new NVGvertex(bounds[0] - quadMargin, bounds[3] + quadMargin, 0.5f, 1.0f);
+        quad[3] = new NVGvertex(bounds[0] - quadMargin, bounds[1] - quadMargin, 0.5f, 1.0f);
+
+        // Check convexity based on fill paths only; fringe-only paths (NFill==0) don't affect fill overlap.
+        var isConvexFill = false;
+        {
+            int fillPathCount = 0;
+            int fillPathIndex = -1;
+            for (var i = 0; i < paths.Length; i++)
+            {
+                if (paths[i].NFill > 0)
+                {
+                    fillPathCount++;
+                    fillPathIndex = i;
+                }
+            }
+            if (fillPathCount == 1 && fillPathIndex >= 0 && paths[fillPathIndex].Convex)
+                isConvexFill = true;
+        }
+        // Coverage AA triggers when the fill path was flagged non-convex by the core
+        // tessellator - this happens for transparent paints (to avoid double-blending
+        // in the fringe overlay) AND for self-intersecting sources like a pentagram.
+        // The coverage buffer's Max-blended accumulation collapses overlapping fringe
+        // strips to a clean boundary, where the direct fill + fringe-overlay path
+        // would leave visible seams cutting across the fill interior.
+        call.UsesCoverageAA = !isConvexFill && paint.Image == 0;
+
+        if (call.UsesCoverageAA)
+        {
+            // Coverage buffer path: 3 uniform sets
+            call.UniformOffset = AllocUniforms(3);
+
+            // uniformOffset+0: Simple (coverage build pass, interior coverage = 1.0)
+            var simple = _uniforms[call.UniformOffset].Data;
+            Array.Clear(simple);
+            SetUniformVec4(simple, 8, 1.0f, 1.0f, 1.0f, 1.0f); // no scissor
+            SetUniformValue(simple, 12, 1, -1.0f); // strokeThr
+            SetUniformValue(simple, 12, 3, (float)GLNVGShaderType.Simple);
+
+            // uniformOffset+1: Paint for composite (type = CoverageComposite)
+            if (!ConvertPaint(_uniforms[call.UniformOffset + 1].Data, ref paint, ref scissor, fringe, fringe, -1.0f))
+            {
+                return;
+            }
+            SetUniformValue(_uniforms[call.UniformOffset + 1].Data, 12, 0, -1.0f); // strokeMult
+            SetUniformValue(_uniforms[call.UniformOffset + 1].Data, 12, 3, (float)GLNVGShaderType.CoverageComposite);
+
+            // uniformOffset+2: Coverage output (type = CoverageOutput)
+            var coverageOut = _uniforms[call.UniformOffset + 2].Data;
+            Array.Clear(coverageOut);
+            SetUniformVec4(coverageOut, 8, 1.0f, 1.0f, 1.0f, 1.0f); // no scissor
+            SetUniformValue(coverageOut, 12, 0, -1.0f); // strokeMult (analytical fill)
+            SetUniformValue(coverageOut, 12, 1, -1.0f); // strokeThr (no discard)
+            SetUniformValue(coverageOut, 12, 3, (float)GLNVGShaderType.CoverageOutput);
+        }
+        else
+        {
+            call.UniformOffset = AllocUniforms(2);
+            var simple = _uniforms[call.UniformOffset].Data;
+            Array.Clear(simple);
+            SetUniformValue(simple, 12, 1, -1.0f); // strokeThr
+            SetUniformValue(simple, 12, 3, (float)GLNVGShaderType.Simple);
+
+            if (!ConvertPaint(_uniforms[call.UniformOffset + 1].Data, ref paint, ref scissor, fringe, fringe, -1.0f))
+            {
+                return;
+            }
+            SetUniformValue(_uniforms[call.UniformOffset + 1].Data, 12, 0, -1.0f); // strokeMult < 0 → analytical fill coverage
+        }
+    }
+
+    public void RenderStroke(
+        ref MewVGPaint paint,
+        NVGcompositeOperationState compositeOperation,
+        ref NVGscissorState scissor,
+        float fringe,
+        float strokeWidth,
+        ReadOnlySpan<NVGpathData> paths,
+        ReadOnlySpan<NVGvertex> verts)
+    {
+        ref var call = ref AllocCall();
+        call.Type = GLNVGCallType.Stroke;
+        call.PathOffset = AllocPaths(paths.Length);
+        call.PathCount = paths.Length;
+        call.Image = paint.Image;
+        call.BlendFunc = BlendCompositeOperation(compositeOperation);
+        var isConvexStroke = paths.Length == 1 && paths[0].Convex;
+        call.UsesCoverageAA = !isConvexStroke && paint.Image == 0 && PaintHasTransparency(paint);
+
+        var singleStrokePath = paths.Length == 1;
+        var maxVerts = 0;
+        for (var i = 0; i < paths.Length; i++)
+        {
+            maxVerts += singleStrokePath ? paths[i].NStroke : StripToTriangleCount(paths[i].NStroke);
+        }
+
+        // Reserve 4 extra verts for the composite-pass bounds quad used by
+        // StrokeWithCoverage (must come AFTER the stroke geometry so MergedStrokeOffset
+        // points at the original strip head).
+        var vertOffset = AllocVerts(maxVerts + 4);
+        call.MergedStrokeOffset = vertOffset;
+        call.MergedStrokeIsStrip = singleStrokePath;
+        float minX = float.PositiveInfinity, minY = float.PositiveInfinity;
+        float maxX = float.NegativeInfinity, maxY = float.NegativeInfinity;
+        for (var i = 0; i < paths.Length; i++)
+        {
+            ref var copy = ref _paths[call.PathOffset + i];
+            ref readonly var path = ref paths[i];
+            copy = default;
+            if (path.NStroke > 0)
+            {
+                copy.StrokeOffset = vertOffset;
+                var strokeSrc = verts.Slice(path.StrokeOffset, path.NStroke);
+                if (singleStrokePath)
+                {
+                    strokeSrc.CopyTo(_verts.AsSpan(vertOffset));
+                    copy.StrokeCount = strokeSrc.Length;
+                    vertOffset += strokeSrc.Length;
+                }
+                else
+                {
+                    var written = ConvertStripToTriangles(strokeSrc, _verts.AsSpan(vertOffset));
+                    copy.StrokeCount = written;
+                    vertOffset += written;
+                }
+                for (var j = 0; j < strokeSrc.Length; j++)
+                {
+                    ref readonly var v = ref strokeSrc[j];
+                    if (v.X < minX) minX = v.X;
+                    if (v.Y < minY) minY = v.Y;
+                    if (v.X > maxX) maxX = v.X;
+                    if (v.Y > maxY) maxY = v.Y;
+                }
+            }
+        }
+        call.MergedStrokeCount = vertOffset - call.MergedStrokeOffset;
+
+        // Bounds quad (TriangleStrip) for the coverage-composite pass. Drawing the
+        // stroke geometry itself for composite would re-rasterize overlapping segment
+        // quads at sharp corners and SrcOver-blend the same pixel multiple times -
+        // visible as darker spikes at every join with transparent strokes (issue 224-01).
+        // The quad covers each pixel exactly once; the coverage texture (built earlier
+        // with MAX blending) provides the real per-pixel alpha.
+        call.TriangleOffset = vertOffset;
+        call.TriangleCount = 4;
+        if (float.IsPositiveInfinity(minX))
+        {
+            // No stroke verts - use a degenerate quad. Composite pass becomes a no-op.
+            minX = minY = 0f;
+            maxX = maxY = 0f;
+        }
+        _verts[vertOffset++] = new NVGvertex(maxX, maxY, 0.5f, 1.0f);
+        _verts[vertOffset++] = new NVGvertex(maxX, minY, 0.5f, 1.0f);
+        _verts[vertOffset++] = new NVGvertex(minX, maxY, 0.5f, 1.0f);
+        _verts[vertOffset++] = new NVGvertex(minX, minY, 0.5f, 1.0f);
+
+        if (call.UsesCoverageAA)
+        {
+            call.UniformOffset = AllocUniforms(2);
+            if (!ConvertPaint(_uniforms[call.UniformOffset].Data, ref paint, ref scissor, strokeWidth, fringe, -1.0f))
+            {
+                return;
+            }
+            SetUniformValue(_uniforms[call.UniformOffset].Data, 12, 3, (float)GLNVGShaderType.CoverageComposite);
+
+            var coverageOut = _uniforms[call.UniformOffset + 1].Data;
+            _uniforms[call.UniformOffset].Data.CopyTo(coverageOut, 0);
+            SetUniformValue(coverageOut, 12, 1, -1.0f);
+            SetUniformValue(coverageOut, 12, 3, (float)GLNVGShaderType.CoverageOutput);
+        }
+        else
+        {
+            call.UniformOffset = AllocUniforms(1);
+            if (!ConvertPaint(_uniforms[call.UniformOffset].Data, ref paint, ref scissor, strokeWidth, fringe, -1.0f))
+            {
+                return;
+            }
+        }
+    }
+
+    public void RenderTriangles(
+        ref MewVGPaint paint,
+        NVGcompositeOperationState compositeOperation,
+        ref NVGscissorState scissor,
+        ReadOnlySpan<NVGvertex> verts,
+        float fringe)
+    {
+        ref var call = ref AllocCall();
+        call.Type = GLNVGCallType.Triangles;
+        call.Image = paint.Image;
+        call.BlendFunc = BlendCompositeOperation(compositeOperation);
+
+        call.TriangleOffset = AllocVerts(verts.Length);
+        call.TriangleCount = verts.Length;
+        verts.CopyTo(_verts.AsSpan(call.TriangleOffset, verts.Length));
+
+        call.UniformOffset = AllocUniforms(1);
+        if (!ConvertPaint(_uniforms[call.UniformOffset].Data, ref paint, ref scissor, 1.0f, fringe, -1.0f))
+        {
+            return;
+        }
+
+        SetUniformValue(_uniforms[call.UniformOffset].Data, 12, 3, (float)GLNVGShaderType.Img);
+    }
+
+    public void RenderMaskFill(
+        ref MewVGPaint paint,
+        NVGcompositeOperationState compositeOperation,
+        ref NVGscissorState scissor,
+        float fringe,
+        ReadOnlySpan<float> bounds,
+        ReadOnlySpan<byte> coverage,
+        int maskWidth,
+        int maskHeight,
+        float maskOriginX,
+        float maskOriginY,
+        object? cacheKey,
+        int cacheVersion)
+    {
+        var maskImage = _maskImages.Acquire(coverage, maskWidth, maskHeight, cacheKey, cacheVersion);
+        if (maskImage == 0)
+        {
+            return;
+        }
+
+        ref var call = ref AllocCall();
+        call.Type = GLNVGCallType.MaskFill;
+        call.Image = paint.Image;
+        call.MaskImage = maskImage;
+        call.MaskOriginX = maskOriginX;
+        call.MaskOriginY = maskOriginY;
+        call.BlendFunc = BlendCompositeOperation(compositeOperation);
+
+        // Bounds quad with the fill-body texcoord (0.5, 1): strokeMask reads 1 for it under
+        // the analytical-fill strokeMult below, so only the mask shapes the coverage.
+        call.TriangleOffset = AllocVerts(4);
+        call.TriangleCount = 4;
+        var quad = _verts.AsSpan(call.TriangleOffset, 4);
+        quad[0] = new NVGvertex(bounds[2], bounds[3], 0.5f, 1.0f);
+        quad[1] = new NVGvertex(bounds[2], bounds[1], 0.5f, 1.0f);
+        quad[2] = new NVGvertex(bounds[0], bounds[3], 0.5f, 1.0f);
+        quad[3] = new NVGvertex(bounds[0], bounds[1], 0.5f, 1.0f);
+
+        call.UniformOffset = AllocUniforms(1);
+        if (!ConvertPaint(_uniforms[call.UniformOffset].Data, ref paint, ref scissor, fringe, fringe, -1.0f))
+        {
+            call.Type = GLNVGCallType.None;
+            return;
+        }
+        SetUniformValue(_uniforms[call.UniformOffset].Data, 12, 0, -1.0f); // strokeMult < 0: analytical fill
+    }
+
+    private void MaskFill(in GLNVGCall call)
+    {
+        if (!TryFindTexture(call.MaskImage, out var maskIndex))
+        {
+            return;
+        }
+
+        GL.Disable(EnableCap.CullFace);
+        SetUniforms(call.UniformOffset, call.Image, mask: true);
+
+        ref var shader = ref _programs[_currentProgram];
+        ref var mask = ref _textures[maskIndex];
+        GL.ActiveTexture(TextureUnit.Texture2);
+        GL.BindTexture(TextureTarget.Texture2D, mask.Tex);
+        GL.ActiveTexture(TextureUnit.Texture0);
+        GL.Uniform1(shader.LocMaskEnabled, 1);
+        Span<float> origin = stackalloc float[2] { call.MaskOriginX, call.MaskOriginY };
+        Span<float> size = stackalloc float[2] { mask.Width, mask.Height };
+        GL.Uniform2(shader.LocMaskOrigin, 1, origin);
+        GL.Uniform2(shader.LocMaskSize, 1, size);
+        GL.Uniform1(shader.LocMaskScale, _devicePixelRatio);
+
+        GL.DrawArrays(PrimitiveType.TriangleStrip, call.TriangleOffset, call.TriangleCount);
+
+        GL.Uniform1(shader.LocMaskEnabled, 0);
+        GL.Enable(EnableCap.CullFace);
+    }
+
+    public int CreateTexture(NVGtextureType type, int width, int height, MewVGImageFlags flags, ReadOnlySpan<byte> data)
+    {
+        var texIndex = AllocTexture();
+        if (texIndex == null)
+        {
+            return 0;
+        }
+
+        ref var tex = ref _textures[texIndex.Value];
+
+        var glTex = GL.GenTexture();
+        tex.Tex = glTex;
+        tex.Width = width;
+        tex.Height = height;
+        tex.Type = type;
+        tex.Flags = flags;
+
+        // Mipmapped colour textures must be premultiplied. glGenerateMipmap averages texels, and averaging
+        // straight (non-premultiplied) alpha bleeds transparent-pixel RGB into lower mip levels, which shows
+        // as fuzzy / haloed edges when the image is minified (the base level at 100% looks fine). Premultiply
+        // here and flag the texture premultiplied so the shader samples the already-correct texels.
+        ReadOnlySpan<byte> uploadData = data;
+        if ((flags & MewVGImageFlags.GenerateMipmaps) != 0
+            && (flags & MewVGImageFlags.Premultiplied) == 0
+            && (type == NVGtextureType.RGBA || type == NVGtextureType.BGRA)
+            && data.Length >= width * height * 4)
+        {
+            uploadData = PremultiplyCopy(data, width, height);
+            flags |= MewVGImageFlags.Premultiplied;
+            tex.Flags = flags;
+        }
+
+        BindTexture(glTex);
+
+        GL.PixelStore(PixelStoreParameter.UnpackAlignment, 1);
+        GL.PixelStore(PixelStoreParameter.UnpackRowLength, width);
+        GL.PixelStore(PixelStoreParameter.UnpackSkipPixels, 0);
+        GL.PixelStore(PixelStoreParameter.UnpackSkipRows, 0);
+
+        if (type == NVGtextureType.RGBA)
+        {
+            GL.TexImage2D(TextureTarget.Texture2D, 0, PixelInternalFormat.Rgba, width, height, 0,
+                PixelFormat.Rgba, PixelType.UnsignedByte, uploadData);
+        }
+        else if (type == NVGtextureType.BGRA)
+        {
+            // Internal format is GL_RGBA8 (driver swizzles for shader sampling). The
+            // BGRA + UnsignedInt_8_8_8_8_Rev pair tells the driver "the source is BGRA
+            // little-endian bytes" - on desktop NV/AMD/Intel this is the native upload
+            // path, faster than RGBA because no CPU/driver swizzle is needed.
+            GL.TexImage2D(TextureTarget.Texture2D, 0, PixelInternalFormat.Rgba, width, height, 0,
+                PixelFormat.Bgra, PixelType.UnsignedInt_8_8_8_8_Rev, uploadData);
+        }
+        else
+        {
+            GL.TexImage2D(TextureTarget.Texture2D, 0, PixelInternalFormat.R8, width, height, 0,
+                PixelFormat.Red, PixelType.UnsignedByte, data);
+        }
+
+        if ((flags & MewVGImageFlags.GenerateMipmaps) != 0)
+        {
+            if ((flags & MewVGImageFlags.Nearest) != 0)
+            {
+                GL.TexParameter(TextureTarget.Texture2D, TextureParameterName.TextureMinFilter, (int)TextureMinFilter.NearestMipmapNearest);
+            }
+            else
+            {
+                GL.TexParameter(TextureTarget.Texture2D, TextureParameterName.TextureMinFilter, (int)TextureMinFilter.LinearMipmapLinear);
+            }
+        }
+        else
+        {
+            if ((flags & MewVGImageFlags.Nearest) != 0)
+            {
+                GL.TexParameter(TextureTarget.Texture2D, TextureParameterName.TextureMinFilter, (int)TextureMinFilter.Nearest);
+            }
+            else
+            {
+                GL.TexParameter(TextureTarget.Texture2D, TextureParameterName.TextureMinFilter, (int)TextureMinFilter.Linear);
+            }
+        }
+
+        if ((flags & MewVGImageFlags.Nearest) != 0)
+        {
+            GL.TexParameter(TextureTarget.Texture2D, TextureParameterName.TextureMagFilter, (int)TextureMagFilter.Nearest);
+        }
+        else
+        {
+            GL.TexParameter(TextureTarget.Texture2D, TextureParameterName.TextureMagFilter, (int)TextureMagFilter.Linear);
+        }
+
+        GL.TexParameter(TextureTarget.Texture2D, TextureParameterName.TextureWrapS,
+            (int)((flags & MewVGImageFlags.RepeatX) != 0 ? TextureWrapMode.Repeat : TextureWrapMode.ClampToEdge));
+        GL.TexParameter(TextureTarget.Texture2D, TextureParameterName.TextureWrapT,
+            (int)((flags & MewVGImageFlags.RepeatY) != 0 ? TextureWrapMode.Repeat : TextureWrapMode.ClampToEdge));
+
+        GL.PixelStore(PixelStoreParameter.UnpackAlignment, 4);
+        GL.PixelStore(PixelStoreParameter.UnpackRowLength, 0);
+        GL.PixelStore(PixelStoreParameter.UnpackSkipPixels, 0);
+        GL.PixelStore(PixelStoreParameter.UnpackSkipRows, 0);
+
+        if ((flags & MewVGImageFlags.GenerateMipmaps) != 0)
+        {
+            GL.GenerateMipmap(GenerateMipmapTarget.Texture2D);
+        }
+
+        BindTexture(0);
+        CheckError("create texture");
+        return tex.Id;
+    }
+
+    // Returns a premultiplied (straight RGB * alpha) copy of a tight width*height*4 BGRA/RGBA buffer.
+    // Byte order is irrelevant: indices 0..2 are colour channels, index 3 is alpha for both layouts.
+    private static byte[] PremultiplyCopy(ReadOnlySpan<byte> src, int width, int height)
+    {
+        int count = width * height;
+        var dst = new byte[count * 4];
+        for (int i = 0; i < count; i++)
+        {
+            int offset = i * 4;
+            byte alpha = src[offset + 3];
+            if (alpha == 255)
+            {
+                dst[offset] = src[offset];
+                dst[offset + 1] = src[offset + 1];
+                dst[offset + 2] = src[offset + 2];
+            }
+            else if (alpha != 0)
+            {
+                dst[offset] = (byte)(src[offset] * alpha / 255);
+                dst[offset + 1] = (byte)(src[offset + 1] * alpha / 255);
+                dst[offset + 2] = (byte)(src[offset + 2] * alpha / 255);
+            }
+            // alpha == 0 leaves colour channels at 0 (clean transparent texel for mip averaging).
+            dst[offset + 3] = alpha;
+        }
+        return dst;
+    }
+
+    public void DeleteTexture(int id)
+    {
+        for (var i = 0; i < _textureCount; i++)
+        {
+            if (_textures[i].Id != id)
+            {
+                continue;
+            }
+
+            int glTex = _textures[i].Tex;
+            if (glTex != 0 && (_textures[i].Flags & MewVGImageFlags.NoDelete) == 0)
+            {
+                // Invalidate bind cache before GL frees the name; otherwise a later
+                // GenTextures reusing the same name would skip the real bind call.
+                if (_boundTexture == glTex)
+                {
+                    _boundTexture = -1;
+                }
+                GL.DeleteTexture(glTex);
+            }
+
+            _textures[i] = default;
+            return;
+        }
+    }
+
+    public bool UpdateTexture(int image, int x, int y, int width, int height, ReadOnlySpan<byte> data)
+    {
+        if (!TryFindTexture(image, out var index))
+        {
+            return false;
+        }
+
+        ref var tex = ref _textures[index];
+        BindTexture(tex.Tex);
+        GL.PixelStore(PixelStoreParameter.UnpackAlignment, 1);
+        GL.PixelStore(PixelStoreParameter.UnpackRowLength, tex.Width);
+        GL.PixelStore(PixelStoreParameter.UnpackSkipPixels, x);
+        GL.PixelStore(PixelStoreParameter.UnpackSkipRows, y);
+
+        if (tex.Type == NVGtextureType.RGBA)
+        {
+            GL.TexSubImage2D(TextureTarget.Texture2D, 0, x, y, width, height,
+                PixelFormat.Rgba, PixelType.UnsignedByte, data);
+        }
+        else if (tex.Type == NVGtextureType.BGRA)
+        {
+            GL.TexSubImage2D(TextureTarget.Texture2D, 0, x, y, width, height,
+                PixelFormat.Bgra, PixelType.UnsignedInt_8_8_8_8_Rev, data);
+        }
+        else
+        {
+            GL.TexSubImage2D(TextureTarget.Texture2D, 0, x, y, width, height,
+                PixelFormat.Red, PixelType.UnsignedByte, data);
+        }
+
+        GL.PixelStore(PixelStoreParameter.UnpackAlignment, 4);
+        GL.PixelStore(PixelStoreParameter.UnpackRowLength, 0);
+        GL.PixelStore(PixelStoreParameter.UnpackSkipPixels, 0);
+        GL.PixelStore(PixelStoreParameter.UnpackSkipRows, 0);
+
+        BindTexture(0);
+        return true;
+    }
+
+
+    public bool GetTextureSize(int image, out int width, out int height)
+    {
+        if (!TryFindTexture(image, out var index))
+        {
+            width = 0;
+            height = 0;
+            return false;
+        }
+
+        ref var tex = ref _textures[index];
+        width = tex.Width;
+        height = tex.Height;
+        return true;
+    }
+
+    private void Fill(in GLNVGCall call)
+    {
+        if (call.UsesCoverageAA)
+        {
+            FillWithCoverage(call);
+            return;
+        }
+
+        var paths = _paths.AsSpan(call.PathOffset, call.PathCount);
+        GL.Disable(EnableCap.CullFace);
+
+        SetUniforms(call.UniformOffset + 1, call.Image);
+        var fillStart = -1;
+        var fillCount = 0;
+        for (var i = 0; i < paths.Length; i++)
+        {
+            if (paths[i].FillCount > 0)
+            {
+                if (fillStart < 0)
+                {
+                    fillStart = paths[i].FillOffset;
+                }
+
+                fillCount += paths[i].FillCount;
+            }
+        }
+        if (fillStart >= 0 && fillCount > 0)
+        {
+            GL.DrawArrays(PrimitiveType.Triangles, fillStart, fillCount);
+        }
+
+        if (call.MergedFringeCount > 0)
+        {
+            var fringeMode = call.MergedFringeIsStrip ? PrimitiveType.TriangleStrip : PrimitiveType.Triangles;
+            GL.DrawArrays(fringeMode, call.MergedFringeOffset, call.MergedFringeCount);
+        }
+
+        GL.Enable(EnableCap.CullFace);
+    }
+
+    private void Stroke(in GLNVGCall call)
+    {
+        if (call.UsesCoverageAA)
+        {
+            StrokeWithCoverage(call);
+            return;
+        }
+
+        var strokeMode = call.MergedStrokeIsStrip ? PrimitiveType.TriangleStrip : PrimitiveType.Triangles;
+
+        GL.Disable(EnableCap.CullFace);
+        SetUniforms(call.UniformOffset, call.Image);
+        if (call.MergedStrokeCount > 0)
+            GL.DrawArrays(strokeMode, call.MergedStrokeOffset, call.MergedStrokeCount);
+        GL.Enable(EnableCap.CullFace);
+    }
+
+    private void Triangles(in GLNVGCall call)
+    {
+        GL.Disable(EnableCap.CullFace);
+        SetUniforms(call.UniformOffset, call.Image);
+
+        GL.DrawArrays(PrimitiveType.Triangles, call.TriangleOffset, call.TriangleCount);
+        GL.Enable(EnableCap.CullFace);
+    }
+
+    private void Clip(in GLNVGCall call) => RenderShaderClip(call);
+
+    private void ClipReset(in GLNVGCall call)
+    {
+        _clipMaskActive = false;
+        _clipMaskEmpty = false;
+    }
+
+    private void EnsureClipMaskTexture(int index, int width, int height)
+    {
+        width = Math.Max(16, (width + 15) & ~15);
+        height = Math.Max(16, (height + 15) & ~15);
+        if (_clipMaskTextures[index] != 0 &&
+            _clipMaskTextureWidths[index] >= width && _clipMaskTextureHeights[index] >= height)
+        {
+            return;
+        }
+
+        var defaultFbo = GL.GetInteger(GetPName.FramebufferBinding);
+        if (_clipMaskTextures[index] != 0) GL.DeleteTexture(_clipMaskTextures[index]);
+        if (_clipMaskFbos[index] != 0) GL.DeleteFramebuffer(_clipMaskFbos[index]);
+
+        _clipMaskTextures[index] = GL.GenTexture();
+        GL.BindTexture(TextureTarget.Texture2D, _clipMaskTextures[index]);
+        GL.TexImage2D(TextureTarget.Texture2D, 0, PixelInternalFormat.R8, width, height, 0,
+            PixelFormat.Red, PixelType.UnsignedByte, ReadOnlySpan<byte>.Empty);
+        GL.TexParameter(TextureTarget.Texture2D, TextureParameterName.TextureMinFilter, (int)TextureMinFilter.Nearest);
+        GL.TexParameter(TextureTarget.Texture2D, TextureParameterName.TextureMagFilter, (int)TextureMagFilter.Nearest);
+        GL.TexParameter(TextureTarget.Texture2D, TextureParameterName.TextureWrapS, (int)TextureWrapMode.ClampToEdge);
+        GL.TexParameter(TextureTarget.Texture2D, TextureParameterName.TextureWrapT, (int)TextureWrapMode.ClampToEdge);
+
+        _clipMaskFbos[index] = GL.GenFramebuffer();
+        GL.BindFramebuffer(FramebufferTarget.Framebuffer, _clipMaskFbos[index]);
+        GL.FramebufferTexture2D(FramebufferTarget.Framebuffer, FramebufferAttachment.ColorAttachment0,
+            TextureTarget.Texture2D, _clipMaskTextures[index], 0);
+        var status = GL.CheckFramebufferStatus(FramebufferTarget.Framebuffer);
+        if (status != FramebufferErrorCode.FramebufferComplete)
+        {
+            GL.BindFramebuffer(FramebufferTarget.Framebuffer, defaultFbo);
+            throw new InvalidOperationException($"MewVG.GL: clip mask framebuffer incomplete (status={status}).");
+        }
+
+        GL.BindFramebuffer(FramebufferTarget.Framebuffer, defaultFbo);
+        GL.BindTexture(TextureTarget.Texture2D, 0);
+        _boundTexture = 0;
+        _clipMaskTextureWidths[index] = width;
+        _clipMaskTextureHeights[index] = height;
+    }
+
+    private void RenderShaderClip(in GLNVGCall call)
+    {
+        if (_flushViewportWidth <= 0 || _flushViewportHeight <= 0 || call.MergedFringeCount <= 0)
+        {
+            _clipMaskActive = true;
+            _clipMaskEmpty = true;
+            return;
+        }
+
+        var previousActive = _clipMaskActive;
+        var destination = previousActive ? 1 - _clipMaskIndex : 0;
+        GetCoverageScissor(call.MergedFringeOffset, call.MergedFringeCount,
+            _flushViewportWidth, _flushViewportHeight,
+            out var clipX, out var clipY, out var clipWidth, out var clipHeight);
+
+        if (previousActive)
+        {
+            var right = Math.Min(clipX + clipWidth, _clipMaskX + _clipMaskWidth);
+            var top = Math.Min(clipY + clipHeight, _clipMaskY + _clipMaskHeight);
+            clipX = Math.Max(clipX, _clipMaskX);
+            clipY = Math.Max(clipY, _clipMaskY);
+            clipWidth = Math.Max(0, right - clipX);
+            clipHeight = Math.Max(0, top - clipY);
+        }
+
+        if (clipWidth == 0 || clipHeight == 0 || (previousActive && _clipMaskEmpty))
+        {
+            _clipMaskActive = true;
+            _clipMaskEmpty = true;
+            _clipMaskX = clipX;
+            _clipMaskY = clipY;
+            _clipMaskWidth = clipWidth;
+            _clipMaskHeight = clipHeight;
+            return;
+        }
+
+        EnsureClipMaskTexture(destination, clipWidth, clipHeight);
+
+        GL.BindFramebuffer(FramebufferTarget.Framebuffer, _clipMaskFbos[destination]);
+        GL.Viewport(-clipX, -clipY, _flushViewportWidth, _flushViewportHeight);
+        GL.Disable(EnableCap.ScissorTest);
+        GL.Disable(EnableCap.CullFace);
+        GL.ColorMask(true, true, true, true);
+        GL.ClearColor(0, 0, 0, 0);
+        GL.Clear(ClearBufferMask.ColorBufferBit);
+
+        // Coverage accumulates by max: the body writes 1, the fringe its ramp, and where they meet
+        // the larger value wins instead of adding up. A previous clip bound as clipTex multiplies
+        // in, which is how nested clips intersect.
+        var previousBlend = _blendFunc;
+        BlendFuncSeparate(new GLNVGBlend
+        {
+            SrcRGB = BlendingFactorSrc.One,
+            DstRGB = BlendingFactorDest.One,
+            SrcAlpha = BlendingFactorSrc.One,
+            DstAlpha = BlendingFactorDest.One
+        });
+        GL.BlendEquation(BlendEquationMode.Max);
+
+        GL.Enable(EnableCap.ScissorTest);
+        GL.Scissor(0, 0, clipWidth, clipHeight);
+        SetUniforms(call.UniformOffset, 0, applyClipMask: false, callerBindsClip: previousActive);
+        if (previousActive)
+        {
+            BindClipMask(_clipMaskX - clipX, _clipMaskY - clipY, _clipMaskWidth, _clipMaskHeight);
+        }
+        GL.DrawArrays(PrimitiveType.Triangles, call.MergedFringeOffset, call.MergedFringeCount);
+
+        GL.Disable(EnableCap.ScissorTest);
+        GL.BindFramebuffer(FramebufferTarget.Framebuffer, _flushMainFbo);
+        GL.Viewport(_flushViewportX, _flushViewportY, _flushViewportWidth, _flushViewportHeight);
+        GL.BlendEquation(BlendEquationMode.FuncAdd);
+        BlendFuncSeparate(previousBlend);
+        GL.Enable(EnableCap.CullFace);
+        _clipMaskIndex = destination;
+        _clipMaskActive = true;
+        _clipMaskEmpty = false;
+        _clipMaskX = clipX;
+        _clipMaskY = clipY;
+        _clipMaskWidth = clipWidth;
+        _clipMaskHeight = clipHeight;
+    }
+
+    private void EnsureCoverageTexture(int width, int height)
+    {
+        if (_coverageTex != 0 && _coverageTexWidth >= width && _coverageTexHeight >= height)
+        {
+            return;
+        }
+
+        // Never give up an axis already allocated: callers pass per-call scissor sizes, so
+        // reallocating at exactly the requested size makes alternating shapes rebuild the
+        // texture, its renderbuffer, and its framebuffer on every draw.
+        width = Math.Max(width, _coverageTexWidth);
+        height = Math.Max(height, _coverageTexHeight);
+
+        if (_coverageTex != 0) GL.DeleteTexture(_coverageTex);
+        if (_coverageFbo != 0) GL.DeleteFramebuffer(_coverageFbo);
+
+        var defaultFbo = GL.GetInteger(GetPName.FramebufferBinding);
+
+        _coverageTex = GL.GenTexture();
+        GL.BindTexture(TextureTarget.Texture2D, _coverageTex);
+        GL.TexImage2D(TextureTarget.Texture2D, 0, PixelInternalFormat.R8, width, height, 0, PixelFormat.Red, PixelType.UnsignedByte, ReadOnlySpan<byte>.Empty);
+        GL.TexParameter(TextureTarget.Texture2D, TextureParameterName.TextureMinFilter, (int)TextureMinFilter.Nearest);
+        GL.TexParameter(TextureTarget.Texture2D, TextureParameterName.TextureMagFilter, (int)TextureMagFilter.Nearest);
+
+        _coverageFbo = GL.GenFramebuffer();
+        GL.BindFramebuffer(FramebufferTarget.Framebuffer, _coverageFbo);
+        GL.FramebufferTexture2D(FramebufferTarget.Framebuffer, FramebufferAttachment.ColorAttachment0, TextureTarget.Texture2D, _coverageTex, 0);
+
+        var status = GL.CheckFramebufferStatus(FramebufferTarget.Framebuffer);
+        if (status != FramebufferErrorCode.FramebufferComplete)
+        {
+            GL.BindFramebuffer(FramebufferTarget.Framebuffer, defaultFbo);
+            GL.BindTexture(TextureTarget.Texture2D, 0);
+            _boundTexture = 0;
+
+            GL.DeleteTexture(_coverageTex);
+            GL.DeleteFramebuffer(_coverageFbo);
+            _coverageTex = 0;
+            _coverageFbo = 0;
+            _coverageTexWidth = 0;
+            _coverageTexHeight = 0;
+
+            throw new InvalidOperationException($"MewVG.GL: coverage framebuffer incomplete (status={status}).");
+        }
+
+        GL.BindFramebuffer(FramebufferTarget.Framebuffer, defaultFbo);
+        GL.BindTexture(TextureTarget.Texture2D, 0);
+        _boundTexture = 0;
+
+        _coverageTexWidth = width;
+        _coverageTexHeight = height;
+    }
+
+    private static int ConvertStripToTriangles(ReadOnlySpan<NVGvertex> strip, Span<NVGvertex> output)
+    {
+        if (strip.Length < 3) return 0;
+        var written = 0;
+        for (var i = 0; i < strip.Length - 2; i++)
+        {
+            if ((i & 1) == 0)
+            {
+                output[written++] = strip[i];
+                output[written++] = strip[i + 1];
+                output[written++] = strip[i + 2];
+            }
+            else
+            {
+                output[written++] = strip[i + 1];
+                output[written++] = strip[i];
+                output[written++] = strip[i + 2];
+            }
+        }
+        return written;
+    }
+
+    private static int StripToTriangleCount(int stripVertCount)
+        => stripVertCount < 3 ? 0 : (stripVertCount - 2) * 3;
+
+    // Bounds quad vertices are in NanoVG space (y-down, CSS pixels). The coverage
+    // texture is device pixels, and GL's scissor rect is y-up with origin at the
+    // bottom-left, so the y range must be flipped using the coverage buffer height.
+    private void GetCoverageScissor(
+        int triangleOffset,
+        int triangleCount,
+        int coverageWidth,
+        int coverageHeight,
+        out int scissorX,
+        out int scissorY,
+        out int scissorWidth,
+        out int scissorHeight)
+    {
+        const int scissorMargin = 2; // extra room for the AA fringe
+
+        var quad = _verts.AsSpan(triangleOffset, triangleCount);
+        var minX = float.PositiveInfinity;
+        var minY = float.PositiveInfinity;
+        var maxX = float.NegativeInfinity;
+        var maxY = float.NegativeInfinity;
+        for (var i = 0; i < quad.Length; i++)
+        {
+            if (quad[i].X < minX) minX = quad[i].X;
+            if (quad[i].X > maxX) maxX = quad[i].X;
+            if (quad[i].Y < minY) minY = quad[i].Y;
+            if (quad[i].Y > maxY) maxY = quad[i].Y;
+        }
+
+        var left = (int)MathF.Floor(minX * _devicePixelRatio) - scissorMargin;
+        var right = (int)MathF.Ceiling(maxX * _devicePixelRatio) + scissorMargin;
+        var top = (int)MathF.Floor(minY * _devicePixelRatio) - scissorMargin;
+        var bottom = (int)MathF.Ceiling(maxY * _devicePixelRatio) + scissorMargin;
+
+        scissorX = Math.Clamp(left, 0, coverageWidth);
+        var clampedRight = Math.Clamp(right, 0, coverageWidth);
+        scissorWidth = Math.Max(0, clampedRight - scissorX);
+
+        scissorY = Math.Clamp(coverageHeight - bottom, 0, coverageHeight);
+        var clampedTop = Math.Clamp(coverageHeight - top, 0, coverageHeight);
+        scissorHeight = Math.Max(0, clampedTop - scissorY);
+    }
+
+    private void FillWithCoverage(in GLNVGCall call)
+    {
+        var paths = _paths.AsSpan(call.PathOffset, call.PathCount);
+
+        var viewportW = (int)MathF.Ceiling(_view[0] * _devicePixelRatio);
+        var viewportH = (int)MathF.Ceiling(_view[1] * _devicePixelRatio);
+
+        var mainFbo = _flushMainFbo;
+
+        GetCoverageScissor(call.TriangleOffset, call.TriangleCount, viewportW, viewportH,
+            out var scissorX, out var scissorY, out var scissorWidth, out var scissorHeight);
+        if (scissorWidth == 0 || scissorHeight == 0)
+        {
+            return;
+        }
+        EnsureCoverageTexture(scissorWidth, scissorHeight);
+
+        GL.BindFramebuffer(FramebufferTarget.Framebuffer, _coverageFbo);
+        // Keep NanoVG's full-window clip-space transform, but translate its viewport so
+        // this call's device-pixel bounds land at (0,0) in the smaller shared scratch.
+        GL.Viewport(-scissorX, -scissorY, viewportW, viewportH);
+        GL.Enable(EnableCap.ScissorTest);
+        GL.Scissor(0, 0, scissorWidth, scissorHeight);
+        GL.ClearColor(0, 0, 0, 0);
+        GL.Clear(ClearBufferMask.ColorBufferBit);
+
+        BlendFuncSeparate(new GLNVGBlend
+        {
+            SrcRGB = BlendingFactorSrc.One,
+            DstRGB = BlendingFactorDest.One,
+            SrcAlpha = BlendingFactorSrc.One,
+            DstAlpha = BlendingFactorDest.One
+        });
+        GL.BlendEquation(BlendEquationMode.Max);
+
+        GL.Disable(EnableCap.CullFace);
+        SetUniforms(call.UniformOffset, 0, applyClipMask: false);
+        {
+            var fillStart = -1;
+            var fillCount = 0;
+            for (var i = 0; i < paths.Length; i++)
+            {
+                if (paths[i].FillCount > 0)
+                {
+                    if (fillStart < 0) fillStart = paths[i].FillOffset;
+                    fillCount += paths[i].FillCount;
+                }
+            }
+            if (fillStart >= 0 && fillCount > 0)
+                GL.DrawArrays(PrimitiveType.Triangles, fillStart, fillCount);
+        }
+
+        SetUniforms(call.UniformOffset + 2, 0, applyClipMask: false);
+        GL.Disable(EnableCap.CullFace);
+        if (call.MergedFringeCount > 0)
+        {
+            var fringeMode = call.MergedFringeIsStrip ? PrimitiveType.TriangleStrip : PrimitiveType.Triangles;
+            GL.DrawArrays(fringeMode, call.MergedFringeOffset, call.MergedFringeCount);
+        }
+
+        GL.Disable(EnableCap.ScissorTest);
+        GL.BindFramebuffer(FramebufferTarget.Framebuffer, mainFbo);
+        GL.Viewport(_flushViewportX, _flushViewportY, _flushViewportWidth, _flushViewportHeight);
+        GL.BlendEquation(BlendEquationMode.FuncAdd);
+        BlendFuncSeparate(call.BlendFunc);
+
+        SetUniforms(call.UniformOffset + 1, call.Image, bindTexture: false);
+        SetCoverageOrigin(scissorX, scissorY);
+        BindTexture(_coverageTex);
+        GL.DrawArrays(PrimitiveType.TriangleStrip, call.TriangleOffset, call.TriangleCount);
+        GL.Enable(EnableCap.CullFace);
+        _boundTexture = -1;
+    }
+
+    private void StrokeWithCoverage(in GLNVGCall call)
+    {
+        var paths = _paths.AsSpan(call.PathOffset, call.PathCount);
+        var viewportW = (int)MathF.Ceiling(_view[0] * _devicePixelRatio);
+        var viewportH = (int)MathF.Ceiling(_view[1] * _devicePixelRatio);
+
+        var mainFbo = _flushMainFbo;
+
+        GetCoverageScissor(call.TriangleOffset, call.TriangleCount, viewportW, viewportH,
+            out var scissorX, out var scissorY, out var scissorWidth, out var scissorHeight);
+        if (scissorWidth == 0 || scissorHeight == 0)
+        {
+            return;
+        }
+        EnsureCoverageTexture(scissorWidth, scissorHeight);
+
+        GL.BindFramebuffer(FramebufferTarget.Framebuffer, _coverageFbo);
+        GL.Viewport(-scissorX, -scissorY, viewportW, viewportH);
+        GL.Enable(EnableCap.ScissorTest);
+        GL.Scissor(0, 0, scissorWidth, scissorHeight);
+        GL.ClearColor(0, 0, 0, 0);
+        GL.Clear(ClearBufferMask.ColorBufferBit);
+        GL.Disable(EnableCap.CullFace);
+
+        BlendFuncSeparate(new GLNVGBlend
+        {
+            SrcRGB = BlendingFactorSrc.One,
+            DstRGB = BlendingFactorDest.One,
+            SrcAlpha = BlendingFactorSrc.One,
+            DstAlpha = BlendingFactorDest.One
+        });
+        GL.BlendEquation(BlendEquationMode.Max);
+
+        var strokeMode = call.MergedStrokeIsStrip ? PrimitiveType.TriangleStrip : PrimitiveType.Triangles;
+        SetUniforms(call.UniformOffset + 1, call.Image, applyClipMask: false);
+        if (call.MergedStrokeCount > 0)
+            GL.DrawArrays(strokeMode, call.MergedStrokeOffset, call.MergedStrokeCount);
+
+        GL.Disable(EnableCap.ScissorTest);
+        GL.BindFramebuffer(FramebufferTarget.Framebuffer, mainFbo);
+        GL.Viewport(_flushViewportX, _flushViewportY, _flushViewportWidth, _flushViewportHeight);
+        GL.BlendEquation(BlendEquationMode.FuncAdd);
+        BlendFuncSeparate(call.BlendFunc);
+        SetUniforms(call.UniformOffset, call.Image, bindTexture: false);
+        SetCoverageOrigin(scissorX, scissorY);
+        BindTexture(_coverageTex);
+        // Composite via the bounds quad (4 verts as TriangleStrip), not the stroke
+        // geometry itself - see RenderStroke for the rationale (avoid SrcOver double-
+        // blend at sharp corners where segment quads/joins overlap).
+        if (call.TriangleCount > 0)
+            GL.DrawArrays(PrimitiveType.TriangleStrip, call.TriangleOffset, call.TriangleCount);
+        GL.Enable(EnableCap.CullFace);
+        _boundTexture = -1;
+    }
+
+    private void SetCoverageOrigin(int x, int y)
+    {
+        Span<float> origin = stackalloc float[2] { x, y };
+        GL.Uniform2(_programs[_currentProgram].LocCoverageOrigin, 1, origin);
+    }
+
+    private static void SetSimpleUniform(float[] frag, ref NVGscissorState scissor, float fringe)
+    {
+        Array.Clear(frag);
+
+        if (scissor.Extent[0] < -0.5f || scissor.Extent[1] < -0.5f)
+        {
+            SetUniformVec4(frag, 0, 0, 0, 0, 0);
+            SetUniformVec4(frag, 1, 0, 0, 0, 0);
+            SetUniformVec4(frag, 2, 0, 0, 0, 0);
+            SetUniformVec4(frag, 8, 1.0f, 1.0f, 1.0f, 1.0f);
+        }
+        else
+        {
+            Span<float> invxform = stackalloc float[6];
+            NVGMath.TransformInverse(invxform, scissor.Xform);
+            SetUniformMat3x4(frag, 0, invxform);
+
+            var sx = MathF.Sqrt(scissor.Xform[0] * scissor.Xform[0] + scissor.Xform[2] * scissor.Xform[2]) / fringe;
+            var sy = MathF.Sqrt(scissor.Xform[1] * scissor.Xform[1] + scissor.Xform[3] * scissor.Xform[3]) / fringe;
+            SetUniformVec4(frag, 8, scissor.Extent[0], scissor.Extent[1], sx, sy);
+        }
+
+        SetUniformValue(frag, 12, 1, -1.0f); // strokeThr
+        SetUniformValue(frag, 12, 3, (float)GLNVGShaderType.Simple);
+    }
+
+    private void CheckError(string label)
+    {
+        if (!_debugChecks)
+        {
+            return;
+        }
+
+        var error = GL.GetError();
+        if (error != 0)
+        {
+            Console.Error.WriteLine($"[MewVG.GL] GL error 0x{error:X} after {label}");
+        }
+    }
+
+    private void BindTexture(int tex)
+    {
+        if (_boundTexture == tex)
+        {
+            return;
+        }
+
+        _boundTexture = tex;
+        GL.BindTexture(TextureTarget.Texture2D, tex);
+    }
+
+    private void BlendFuncSeparate(GLNVGBlend blend)
+    {
+        if (_blendFunc.SrcRGB == blend.SrcRGB && _blendFunc.DstRGB == blend.DstRGB &&
+            _blendFunc.SrcAlpha == blend.SrcAlpha && _blendFunc.DstAlpha == blend.DstAlpha)
+        {
+            return;
+        }
+
+        _blendFunc = blend;
+        GL.BlendFuncSeparate(blend.SrcRGB, blend.DstRGB, blend.SrcAlpha, blend.DstAlpha);
+    }
+
+    private void SetUniforms(int uniformOffset, int image, bool bindTexture = true, bool applyClipMask = true, bool mask = false, bool callerBindsClip = false)
+    {
+        var frag = _uniforms[uniformOffset].Data;
+        var clip = applyClipMask && _clipMaskActive;
+        // A caller that binds a clip itself (a nested clip reading the previous one) needs a program that samples it.
+        UseProgram(callerBindsClip ? SelectProgram(frag, true, mask, clipEmpty: false) : SelectProgram(frag, clip, mask, _clipMaskEmpty));
+        GL.Uniform4(_programs[_currentProgram].LocFrag, UniformArraySize, frag);
+
+        if (bindTexture)
+        {
+            var index = -1;
+            if (image != 0)
+            {
+                TryFindTexture(image, out index);
+            }
+
+            if (index < 0)
+            {
+                TryFindTexture(_dummyTex, out index);
+            }
+
+            BindTexture(index >= 0 ? _textures[index].Tex : 0);
+        }
+
+        if (!clip)
+        {
+            GL.Uniform1(_programs[_currentProgram].LocClipEnabled, 0);
+            UnbindClipMask();
+        }
+        else if (_clipMaskEmpty)
+        {
+            GL.Uniform1(_programs[_currentProgram].LocClipEnabled, 2);
+            UnbindClipMask();
+        }
+        else
+        {
+            BindClipMask(_flushViewportX + _clipMaskX, _flushViewportY + _clipMaskY,
+                _clipMaskWidth, _clipMaskHeight);
+        }
+
+        CheckError("set uniforms");
+    }
+
+    /// <summary>
+    /// Drops the clip sampler's binding. The shader ignores it once clipEnabled is 0, but a mask
+    /// texture left bound is still a feedback loop the moment its own framebuffer is drawn into,
+    /// and GLES3/WebGL2 discards that draw instead of reading stale texels.
+    /// </summary>
+    private void UnbindClipMask()
+    {
+        GL.ActiveTexture(TextureUnit.Texture1);
+        GL.BindTexture(TextureTarget.Texture2D, 0);
+        GL.ActiveTexture(TextureUnit.Texture0);
+    }
+
+    private void BindClipMask(int originX, int originY, int width, int height)
+    {
+        ref var shader = ref _programs[_currentProgram];
+        GL.Uniform1(shader.LocClipEnabled, 1);
+        GL.ActiveTexture(TextureUnit.Texture1);
+        GL.BindTexture(TextureTarget.Texture2D, _clipMaskTextures[_clipMaskIndex]);
+        GL.ActiveTexture(TextureUnit.Texture0);
+        Span<float> origin = stackalloc float[2] { originX, originY };
+        Span<float> size = stackalloc float[2] { width, height };
+        GL.Uniform2(shader.LocClipOrigin, 1, origin);
+        GL.Uniform2(shader.LocClipSize, 1, size);
+    }
+
+    private static void SetUniformValue(float[] data, int vecIndex, int component, float value) => data[vecIndex * 4 + component] = value;
+
+    private static void SetUniformVec4(float[] data, int vecIndex, float x, float y, float z, float w)
+    {
+        var baseIndex = vecIndex * 4;
+        data[baseIndex] = x;
+        data[baseIndex + 1] = y;
+        data[baseIndex + 2] = z;
+        data[baseIndex + 3] = w;
+    }
+
+    private static void SetUniformMat3x4(float[] data, int vecIndex, ReadOnlySpan<float> t)
+    {
+        SetUniformVec4(data, vecIndex + 0, t[0], t[1], 0.0f, 0.0f);
+        SetUniformVec4(data, vecIndex + 1, t[2], t[3], 0.0f, 0.0f);
+        SetUniformVec4(data, vecIndex + 2, t[4], t[5], 1.0f, 0.0f);
+    }
+
+    private static MewVGColor Premultiply(MewVGColor color) => new MewVGColor(color.R * color.A, color.G * color.A, color.B * color.A, color.A);
+
+    private bool ConvertPaint(float[] frag, ref MewVGPaint paint, ref NVGscissorState scissor, float width, float fringe, float strokeThr)
+    {
+        Span<float> invxform = stackalloc float[6];
+
+        Array.Clear(frag);
+
+        var inner = Premultiply(paint.InnerColor);
+        var outer = Premultiply(paint.OuterColor);
+        SetUniformVec4(frag, 6, inner.R, inner.G, inner.B, inner.A);
+        SetUniformVec4(frag, 7, outer.R, outer.G, outer.B, outer.A);
+
+        if (scissor.Extent[0] < -0.5f || scissor.Extent[1] < -0.5f)
+        {
+            SetUniformVec4(frag, 0, 0, 0, 0, 0);
+            SetUniformVec4(frag, 1, 0, 0, 0, 0);
+            SetUniformVec4(frag, 2, 0, 0, 0, 0);
+            SetUniformVec4(frag, 8, 1.0f, 1.0f, 1.0f, 1.0f);
+        }
+        else
+        {
+            NVGMath.TransformInverse(invxform, scissor.Xform);
+            SetUniformMat3x4(frag, 0, invxform);
+
+            var sx = MathF.Sqrt(scissor.Xform[0] * scissor.Xform[0] + scissor.Xform[2] * scissor.Xform[2]) / fringe;
+            var sy = MathF.Sqrt(scissor.Xform[1] * scissor.Xform[1] + scissor.Xform[3] * scissor.Xform[3]) / fringe;
+            SetUniformVec4(frag, 8, scissor.Extent[0], scissor.Extent[1], sx, sy);
+        }
+
+        var extentX = paint.Extent[0];
+        var extentY = paint.Extent[1];
+        SetUniformVec4(frag, 9, extentX, extentY, paint.Radius, paint.Feather);
+
+        var strokeMult = (width * 0.5f + fringe * 0.5f) / fringe;
+        SetUniformVec4(frag, 12, strokeMult, strokeThr, 0.0f, 0.0f);
+
+        if (paint.PaintKind == (int)NVGpaintKind.GradientRadial)
+        {
+            if (!TryFindTexture(paint.Image, out _))
+            {
+                return false;
+            }
+
+            SetUniformVec4(frag, 10, paint.Center[0], paint.Center[1], paint.Radius2[0], paint.Radius2[1]);
+            SetUniformVec4(frag, 11, paint.Focal[0], paint.Focal[1], paint.SpreadMethod, 0.0f);
+            SetUniformValue(frag, 12, 2, 0.0f);
+            SetUniformValue(frag, 12, 3, (float)GLNVGShaderType.GradientRadial);
+            NVGMath.TransformInverse(invxform, paint.Xform);
+        }
+        else if (paint.PaintKind == (int)NVGpaintKind.GradientLinear)
+        {
+            if (!TryFindTexture(paint.Image, out _))
+            {
+                return false;
+            }
+
+            SetUniformVec4(frag, 10, paint.Center[0], paint.Center[1], 0.0f, 0.0f);
+            SetUniformVec4(frag, 11, paint.Focal[0], paint.Focal[1], paint.SpreadMethod, 0.0f);
+            SetUniformValue(frag, 12, 2, 0.0f);
+            SetUniformValue(frag, 12, 3, (float)GLNVGShaderType.GradientLinear);
+            NVGMath.TransformInverse(invxform, paint.Xform);
+        }
+        else if (paint.Image != 0)
+        {
+            if (!TryFindTexture(paint.Image, out var index))
+            {
+                return false;
+            }
+
+            ref var tex = ref _textures[index];
+            if ((tex.Flags & MewVGImageFlags.FlipY) != 0)
+            {
+                Span<float> m1 = stackalloc float[6];
+                Span<float> m2 = stackalloc float[6];
+                Span<float> px = stackalloc float[6];
+                px = paint.Xform;
+
+                NVGMath.TransformTranslate(m1, 0.0f, extentY * 0.5f);
+                NVGMath.TransformMultiply(m1, px);
+                NVGMath.TransformScale(m2, 1.0f, -1.0f);
+                NVGMath.TransformMultiply(m2, m1);
+                NVGMath.TransformTranslate(m1, 0.0f, -extentY * 0.5f);
+                NVGMath.TransformMultiply(m1, m2);
+                NVGMath.TransformInverse(invxform, m1);
+            }
+            else
+            {
+                NVGMath.TransformInverse(invxform, paint.Xform);
+            }
+
+            SetUniformValue(frag, 12, 3, (float)GLNVGShaderType.FillImg);
+            // BGRA textures sample to (R,G,B,A) the same as RGBA - the GL_BGRA + REV upload
+            // already swizzled at upload time. So texType is colour (0/1) for both formats;
+            // only ALPHA textures take texType=2 (replicate red to alpha).
+            if (tex.Type == NVGtextureType.RGBA || tex.Type == NVGtextureType.BGRA)
+            {
+                SetUniformValue(frag, 12, 2, (tex.Flags & MewVGImageFlags.Premultiplied) != 0 ? 0.0f : 1.0f);
+            }
+            else
+            {
+                SetUniformValue(frag, 12, 2, 2.0f);
+            }
+        }
+        else
+        {
+            SetUniformValue(frag, 12, 3, (float)GLNVGShaderType.FillGrad);
+            NVGMath.TransformInverse(invxform, paint.Xform);
+        }
+
+        SetUniformMat3x4(frag, 3, invxform);
+        return true;
+    }
+
+    private GLNVGBlend BlendCompositeOperation(NVGcompositeOperationState op)
+    {
+        var ok = true;
+        var blend = new GLNVGBlend
+        {
+            SrcRGB = ConvertBlendFuncFactorSrc(op.SrcRGB, ref ok),
+            DstRGB = ConvertBlendFuncFactorDst(op.DstRGB, ref ok),
+            SrcAlpha = ConvertBlendFuncFactorSrc(op.SrcAlpha, ref ok),
+            DstAlpha = ConvertBlendFuncFactorDst(op.DstAlpha, ref ok)
+        };
+
+        if (!ok)
+        {
+            blend.SrcRGB = BlendingFactorSrc.One;
+            blend.DstRGB = BlendingFactorDest.OneMinusSrcAlpha;
+            blend.SrcAlpha = BlendingFactorSrc.One;
+            blend.DstAlpha = BlendingFactorDest.OneMinusSrcAlpha;
+        }
+
+        return blend;
+    }
+
+    private static BlendingFactorSrc ConvertBlendFuncFactorSrc(int factor, ref bool ok) => factor switch
+    {
+        (int)NVGblendFactor.Zero => BlendingFactorSrc.Zero,
+        (int)NVGblendFactor.One => BlendingFactorSrc.One,
+        (int)NVGblendFactor.SrcColor => BlendingFactorSrc.SrcColor,
+        (int)NVGblendFactor.OneMinusSrcColor => BlendingFactorSrc.OneMinusSrcColor,
+        (int)NVGblendFactor.DstColor => BlendingFactorSrc.DstColor,
+        (int)NVGblendFactor.OneMinusDstColor => BlendingFactorSrc.OneMinusDstColor,
+        (int)NVGblendFactor.SrcAlpha => BlendingFactorSrc.SrcAlpha,
+        (int)NVGblendFactor.OneMinusSrcAlpha => BlendingFactorSrc.OneMinusSrcAlpha,
+        (int)NVGblendFactor.DstAlpha => BlendingFactorSrc.DstAlpha,
+        (int)NVGblendFactor.OneMinusDstAlpha => BlendingFactorSrc.OneMinusDstAlpha,
+        (int)NVGblendFactor.SrcAlphaSaturate => BlendingFactorSrc.SrcAlphaSaturate,
+        _ => FailBlendSrc(ref ok)
+    };
+
+    private static BlendingFactorDest ConvertBlendFuncFactorDst(int factor, ref bool ok) => factor switch
+    {
+        (int)NVGblendFactor.Zero => BlendingFactorDest.Zero,
+        (int)NVGblendFactor.One => BlendingFactorDest.One,
+        (int)NVGblendFactor.SrcColor => BlendingFactorDest.SrcColor,
+        (int)NVGblendFactor.OneMinusSrcColor => BlendingFactorDest.OneMinusSrcColor,
+        (int)NVGblendFactor.DstColor => BlendingFactorDest.DstColor,
+        (int)NVGblendFactor.OneMinusDstColor => BlendingFactorDest.OneMinusDstColor,
+        (int)NVGblendFactor.SrcAlpha => BlendingFactorDest.SrcAlpha,
+        (int)NVGblendFactor.OneMinusSrcAlpha => BlendingFactorDest.OneMinusSrcAlpha,
+        (int)NVGblendFactor.DstAlpha => BlendingFactorDest.DstAlpha,
+        (int)NVGblendFactor.OneMinusDstAlpha => BlendingFactorDest.OneMinusDstAlpha,
+        (int)NVGblendFactor.SrcAlphaSaturate => BlendingFactorDest.SrcAlphaSaturate,
+        _ => FailBlendDst(ref ok)
+    };
+
+    private static BlendingFactorSrc FailBlendSrc(ref bool ok)
+    {
+        ok = false;
+        return BlendingFactorSrc.One;
+    }
+
+    private static BlendingFactorDest FailBlendDst(ref bool ok)
+    {
+        ok = false;
+        return BlendingFactorDest.One;
+    }
+
+    private bool TryFindTexture(int id, out int index)
+    {
+        for (var i = 0; i < _textureCount; i++)
+        {
+            if (_textures[i].Id == id)
+            {
+                index = i;
+                return true;
+            }
+        }
+
+        index = -1;
+        return false;
+    }
+
+    private int? AllocTexture()
+    {
+        for (var i = 0; i < _textureCount; i++)
+        {
+            if (_textures[i].Id == 0)
+            {
+                ref var tex = ref _textures[i];
+                tex = default;
+                tex.Id = ++_textureId;
+                return i;
+            }
+        }
+
+        if (_textureCount + 1 > _textureCapacity)
+        {
+            var newCapacity = Math.Max(_textureCount + 1, 4) + _textureCapacity / 2;
+            Array.Resize(ref _textures, newCapacity);
+            _textureCapacity = newCapacity;
+        }
+
+        var index = _textureCount++;
+        ref var newTex = ref _textures[index];
+        newTex = default;
+        newTex.Id = ++_textureId;
+        return index;
+    }
+
+    private ref GLNVGCall AllocCall()
+    {
+        if (_callCount + 1 > _callCapacity)
+        {
+            var newCapacity = Math.Max(_callCount + 1, 128) + _callCapacity / 2;
+            Array.Resize(ref _calls, newCapacity);
+            _callCapacity = newCapacity;
+        }
+
+        ref var call = ref _calls[_callCount++];
+        call = default;
+        return ref call;
+    }
+
+    private int AllocPaths(int n)
+    {
+        if (_pathCount + n > _pathCapacity)
+        {
+            var newCapacity = Math.Max(_pathCount + n, 128) + _pathCapacity / 2;
+            Array.Resize(ref _paths, newCapacity);
+            _pathCapacity = newCapacity;
+        }
+
+        var offset = _pathCount;
+        _pathCount += n;
+        return offset;
+    }
+
+    private int AllocVerts(int n)
+    {
+        if (_vertCount + n > _vertCapacity)
+        {
+            var newCapacity = Math.Max(_vertCount + n, 4096) + _vertCapacity / 2;
+            Array.Resize(ref _verts, newCapacity);
+            _vertCapacity = newCapacity;
+        }
+
+        var offset = _vertCount;
+        _vertCount += n;
+        return offset;
+    }
+
+    private int AllocUniforms(int n)
+    {
+        if (_uniformCount + n > _uniformCapacity)
+        {
+            var newCapacity = Math.Max(_uniformCount + n, 128) + _uniformCapacity / 2;
+            Array.Resize(ref _uniforms, newCapacity);
+            for (var i = _uniformCapacity; i < newCapacity; i++)
+            {
+                _uniforms[i].Data = new float[UniformFloatCount];
+            }
+
+            _uniformCapacity = newCapacity;
+        }
+
+        var offset = _uniformCount;
+        _uniformCount += n;
+        return offset;
+    }
+
+    private void CreateResources()
+    {
+        var header = GLNVGShaderSource.Header(GL.Profile);
+
+        _programs[UBER_SHADER] = CreateShader("shader", header, string.Empty, GLNVGShaderSource.FILL_VERT_SHADER, GLNVGShaderSource.FILL_FRAG_SHADER);
+        GetUniforms(ref _programs[UBER_SHADER]);
+
+        _vao = GL.GenVertexArray();
+        _vbo = GL.GenBuffer();
+
+        _dummyTex = CreateTexture(NVGtextureType.Alpha, 1, 1, 0, ReadOnlySpan<byte>.Empty);
+
+        CheckError("create done");
+    }
+
+    private static GLNVGShader CreateShader(string name, string header, string opts, string vshader, string fshader)
+    {
+        var program = GL.CreateProgram();
+        var vert = GL.CreateShader(ShaderType.VertexShader);
+        var frag = GL.CreateShader(ShaderType.FragmentShader);
+
+        string[] vertSrc = { header, opts, vshader };
+        string[] fragSrc = { header, opts, fshader };
+
+        GL.ShaderSource(vert, vertSrc.Length, vertSrc, null);
+        GL.ShaderSource(frag, fragSrc.Length, fragSrc, null);
+
+        GL.CompileShader(vert);
+        GL.GetShader(vert, ShaderParameter.CompileStatus, out var statusVert);
+        if (statusVert != (int)All.True)
+        {
+            throw new InvalidOperationException($"Failed to compile vertex shader: {GL.GetShaderInfoLog(vert)}");
+        }
+
+        GL.CompileShader(frag);
+        GL.GetShader(frag, ShaderParameter.CompileStatus, out var statusFrag);
+        if (statusFrag != (int)All.True)
+        {
+            throw new InvalidOperationException($"Failed to compile fragment shader: {GL.GetShaderInfoLog(frag)}");
+        }
+
+        GL.AttachShader(program, vert);
+        GL.AttachShader(program, frag);
+
+        GL.BindAttribLocation(program, 0, "vertex");
+        GL.BindAttribLocation(program, 1, "tcoord");
+
+        GL.LinkProgram(program);
+        GL.GetProgram(program, GetProgramParameterName.LinkStatus, out var statusProg);
+        if (statusProg != (int)All.True)
+        {
+            throw new InvalidOperationException($"Failed to link program: {GL.GetProgramInfoLog(program)}");
+        }
+
+        return new GLNVGShader
+        {
+            Program = program,
+            Vert = vert,
+            Frag = frag,
+        };
+    }
+
+    /// <summary>
+    /// Picks the program for a draw from its uniforms and the flush state: a variant when one draws
+    /// it exactly as the uber shader would, the uber shader otherwise.
+    /// </summary>
+    private int SelectProgram(float[] frag, bool clip, bool mask, bool clipEmpty)
+    {
+        // An empty clip is drawn by the uber shader (clipEnabled 2); the variants have no such state.
+        if (_uberShaderOnly || (clip && clipEmpty))
+        {
+            return UBER_SHADER;
+        }
+
+        // The variants leave out the discard, which only a non-negative stroke threshold can trigger.
+        if (frag[12 * 4 + 1] >= 0.0f)
+        {
+            return UBER_SHADER;
+        }
+
+        var paint = (GLNVGShaderType)(int)frag[12 * 4 + 3] switch
+        {
+            GLNVGShaderType.FillGrad => IsSolidPaint(frag) ? VARIANT_PAINT_SOLID : VARIANT_PAINT_BOX_GRADIENT,
+            GLNVGShaderType.FillImg => VARIANT_PAINT_IMAGE,
+            GLNVGShaderType.Img => VARIANT_PAINT_IMAGE_TRIANGLES,
+            GLNVGShaderType.GradientLinear => VARIANT_PAINT_LINEAR_GRADIENT,
+            GLNVGShaderType.GradientRadial => VARIANT_PAINT_RADIAL_GRADIENT,
+            GLNVGShaderType.Simple => VARIANT_PAINT_SIMPLE,
+            GLNVGShaderType.CoverageOutput => VARIANT_PAINT_COVERAGE_OUTPUT,
+            GLNVGShaderType.CoverageComposite => IsSolidPaint(frag) ? VARIANT_PAINT_COVERAGE_SOLID : VARIANT_PAINT_COVERAGE_COMPOSITE,
+            _ => 0,
+        };
+        if (paint == 0)
+        {
+            return UBER_SHADER;
+        }
+
+        var flags = (HasScissor(frag) ? VARIANT_FLAG_SCISSOR : 0) |
+                    (clip ? VARIANT_FLAG_CLIP : 0) |
+                    (mask ? VARIANT_FLAG_MASK : 0);
+        var index = paint * VARIANT_FLAG_COUNT + flags;
+        return _variantFailed[index] ? UBER_SHADER : index;
+    }
+
+    /// <summary>True when the box gradient's inner and outer colours match, so it is that colour everywhere.</summary>
+    private static bool IsSolidPaint(float[] frag)
+        => frag[24] == frag[28] && frag[25] == frag[29] && frag[26] == frag[30] && frag[27] == frag[31];
+
+    /// <summary>
+    /// False for the zero matrix and unit extent/scale ConvertPaint writes when no scissor is set, which
+    /// make scissorMask 1 everywhere.
+    /// </summary>
+    private static bool HasScissor(float[] frag)
+        => frag[0] != 0.0f || frag[1] != 0.0f || frag[2] != 0.0f ||
+           frag[4] != 0.0f || frag[5] != 0.0f || frag[6] != 0.0f ||
+           frag[8] != 0.0f || frag[9] != 0.0f || frag[10] != 0.0f ||
+           frag[32] != 1.0f || frag[33] != 1.0f || frag[34] != 1.0f || frag[35] != 1.0f;
+
+    /// <summary>Makes <paramref name="index"/> the current program, compiling it on first use.</summary>
+    private void UseProgram(int index)
+    {
+        if (index == _currentProgram)
+        {
+            return;
+        }
+
+        if (_programs[index].Program == 0 && !TryCreateVariant(index))
+        {
+            // A driver that rejects a variant draws that combination with the uber shader for good.
+            _variantFailed[index] = true;
+            index = UBER_SHADER;
+            if (index == _currentProgram)
+            {
+                return;
+            }
+        }
+
+        ref var shader = ref _programs[index];
+
+        GL.UseProgram(shader.Program);
+        _currentProgram = index;
+
+        // Sampler units and the view size are program state, set once per flush for each program used.
+        if (_programFlush[index] != _flushNumber)
+        {
+            _programFlush[index] = _flushNumber;
+            GL.Uniform1(shader.LocTex, 0);
+            GL.Uniform1(shader.LocClipTex, 1);
+            GL.Uniform1(shader.LocMaskTex, 2);
+            GL.Uniform1(shader.LocMaskEnabled, 0);
+            GL.Uniform2(shader.LocViewSize, 1, _view);
+        }
+    }
+
+    private bool TryCreateVariant(int index)
+    {
+        try
+        {
+            _programs[index] = CreateShader("variant", GLNVGShaderSource.Header(GL.Profile), VariantDefines(index),
+                GLNVGShaderSource.FILL_VERT_SHADER, GLNVGShaderSource.FILL_FRAG_SHADER);
+            GetUniforms(ref _programs[index]);
+            return true;
+        }
+        catch (InvalidOperationException)
+        {
+            _programs[index] = default;
+            return false;
+        }
+    }
+
+    private static string VariantDefines(int index)
+    {
+        var paint = (index / VARIANT_FLAG_COUNT) switch
+        {
+            VARIANT_PAINT_SOLID => "#define PAINT_SOLID\n",
+            VARIANT_PAINT_IMAGE => "#define PAINT_IMAGE\n",
+            VARIANT_PAINT_IMAGE_TRIANGLES => "#define PAINT_IMAGE_TRIANGLES\n",
+            VARIANT_PAINT_BOX_GRADIENT => "#define PAINT_BOX_GRADIENT\n",
+            VARIANT_PAINT_LINEAR_GRADIENT => "#define PAINT_LINEAR_GRADIENT\n",
+            VARIANT_PAINT_RADIAL_GRADIENT => "#define PAINT_RADIAL_GRADIENT\n",
+            VARIANT_PAINT_SIMPLE => "#define PAINT_SIMPLE\n",
+            VARIANT_PAINT_COVERAGE_OUTPUT => "#define PAINT_COVERAGE_OUTPUT\n",
+            VARIANT_PAINT_COVERAGE_COMPOSITE => "#define PAINT_COVERAGE_COMPOSITE\n",
+            _ => "#define PAINT_COVERAGE_SOLID\n",
+        };
+        var flags = index % VARIANT_FLAG_COUNT;
+        return "#define VARIANT\n" + paint +
+               ((flags & VARIANT_FLAG_SCISSOR) != 0 ? "#define SCISSOR\n" : string.Empty) +
+               ((flags & VARIANT_FLAG_CLIP) != 0 ? "#define CLIP\n" : string.Empty) +
+               ((flags & VARIANT_FLAG_MASK) != 0 ? "#define MASK\n" : string.Empty);
+    }
+
+    private static void GetUniforms(ref GLNVGShader shader)
+    {
+        shader.LocViewSize = GL.GetUniformLocation(shader.Program, "viewSize");
+        shader.LocTex = GL.GetUniformLocation(shader.Program, "tex");
+        shader.LocFrag = GL.GetUniformLocation(shader.Program, "frag");
+        shader.LocCoverageOrigin = GL.GetUniformLocation(shader.Program, "coverageOrigin");
+        shader.LocClipTex = GL.GetUniformLocation(shader.Program, "clipTex");
+        shader.LocClipEnabled = GL.GetUniformLocation(shader.Program, "clipEnabled");
+        shader.LocClipOrigin = GL.GetUniformLocation(shader.Program, "clipOrigin");
+        shader.LocClipSize = GL.GetUniformLocation(shader.Program, "clipSize");
+        shader.LocMaskTex = GL.GetUniformLocation(shader.Program, "maskTex");
+        shader.LocMaskEnabled = GL.GetUniformLocation(shader.Program, "maskEnabled");
+        shader.LocMaskOrigin = GL.GetUniformLocation(shader.Program, "maskOrigin");
+        shader.LocMaskSize = GL.GetUniformLocation(shader.Program, "maskSize");
+        shader.LocMaskScale = GL.GetUniformLocation(shader.Program, "maskScale");
+    }
+
+    public void Dispose()
+    {
+        if (_disposed)
+        {
+            return;
+        }
+
+        _disposed = true;
+
+        foreach (var shader in _programs)
+        {
+            if (shader.Program != 0)
+            {
+                GL.DeleteProgram(shader.Program);
+            }
+
+            if (shader.Vert != 0)
+            {
+                GL.DeleteShader(shader.Vert);
+            }
+
+            if (shader.Frag != 0)
+            {
+                GL.DeleteShader(shader.Frag);
+            }
+        }
+
+        if (_vao != 0)
+        {
+            GL.DeleteVertexArray(_vao);
+        }
+
+        if (_vbo != 0)
+        {
+            GL.DeleteBuffer(_vbo);
+        }
+
+
+        if (_coverageFbo != 0) GL.DeleteFramebuffer(_coverageFbo);
+        if (_coverageTex != 0) GL.DeleteTexture(_coverageTex);
+        for (var i = 0; i < 2; i++)
+        {
+            if (_clipMaskFbos[i] != 0) GL.DeleteFramebuffer(_clipMaskFbos[i]);
+            if (_clipMaskTextures[i] != 0) GL.DeleteTexture(_clipMaskTextures[i]);
+        }
+
+        // Mask images live in the texture table; releasing them first keeps the table loop below
+        // from deleting the same names again.
+        _maskImages.Dispose();
+
+        for (var i = 0; i < _textureCount; i++)
+        {
+            if (_textures[i].Tex != 0 && (_textures[i].Flags & MewVGImageFlags.NoDelete) == 0)
+            {
+                GL.DeleteTexture(_textures[i].Tex);
+            }
+        }
+    }
+}

@@ -1,0 +1,76 @@
+MewStage vendor patch allocation/0002 (third_party/NOTICE): the MewVG gradient LUT cache finds a brush's LUT by the
+reference of its (immutable) stop array before building a value key, whose fingerprint array was allocated on every
+gradient draw. Same cache, same eviction; no behavioural change.
+
+--- a/Shared/Rendering/MewVG/NvgStrokeHelper.cs
++++ b/Shared/Rendering/MewVG/NvgStrokeHelper.cs
+@@ -465,9 +465,18 @@
+     private static int GetOrCreateGradientLut(MewVGContext vg, IReadOnlyList<GradientStop> stops)
+     {
+         var cache = GradientLutCaches.GetOrCreateValue(vg);
++
++        // MewStage vendor patch allocation/0002: a brush's stops are its own immutable array, so the same brush drawn again finds
++        // its LUT by reference without building a key (a key allocates its fingerprint array, every draw).
++        if (cache.TryGetByIdentity(stops, out int byIdentity))
++        {
++            return byIdentity;
++        }
++
+         var key = new GradientLutKey(stops);
+         if (cache.TryGet(key, out int existingImage))
+         {
++            cache.RememberIdentity(stops, key);
+             return existingImage;
+         }
+ 
+@@ -476,6 +485,7 @@
+         if (imageId != 0)
+         {
+             cache.Add(key, imageId);
++            cache.RememberIdentity(stops, key);
+         }
+ 
+         return imageId;
+@@ -565,6 +575,42 @@
+         private readonly LinkedList<Entry> _lru = new();
+         private readonly Queue<int> _pendingDeletes = new();
+ 
++        // MewStage vendor patch allocation/0002: stop list -> its LRU node. A node evicted from the LRU has no list, so a stale
++        // entry here is a miss, never a deleted image.
++        private readonly ConditionalWeakTable<IReadOnlyList<GradientStop>, LinkedListNode<Entry>> _byIdentity = new();
++
++        public bool TryGetByIdentity(IReadOnlyList<GradientStop> stops, out int imageId)
++        {
++            lock (_syncRoot)
++            {
++                if (_byIdentity.TryGetValue(stops, out var node) && ReferenceEquals(node.List, _lru))
++                {
++                    if (!ReferenceEquals(_lru.First, node))
++                    {
++                        _lru.Remove(node);
++                        _lru.AddFirst(node);
++                    }
++
++                    imageId = node.Value.ImageId;
++                    return true;
++                }
++
++                imageId = 0;
++                return false;
++            }
++        }
++
++        public void RememberIdentity(IReadOnlyList<GradientStop> stops, GradientLutKey key)
++        {
++            lock (_syncRoot)
++            {
++                if (_map.TryGetValue(key, out var node))
++                {
++                    _byIdentity.AddOrUpdate(stops, node);
++                }
++            }
++        }
++
+         public bool TryGet(GradientLutKey key, out int imageId)
+         {
+             lock (_syncRoot)

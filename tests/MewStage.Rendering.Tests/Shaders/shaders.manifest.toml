@@ -1,0 +1,14 @@
+# Test fixtures for MewStage.Rendering.Tests, cooked with the repository cook script:
+#   python scripts/cook_shaders.py --dxc <dxc> --shaders tests/MewStage.Rendering.Tests/Shaders
+# The cooked blobs are committed and embedded in the test assembly.
+schema = 1
+
+[[shader]]
+file = "triangle.hlsl"
+entry = "VSMain"
+stage = "vert"
+
+[[shader]]
+file = "triangle.hlsl"
+entry = "PSMain"
+stage = "frag"

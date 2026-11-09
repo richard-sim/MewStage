@@ -1,0 +1,53 @@
+MewStage vendor patch core-bridge/0001 (third_party/NOTICE): a GPU-agnostic MEWUI_MEWVG_MEWSTAGE branch of the
+MewVG IGraphicsContext bridge. The MewStage backend's partial (MewStageMewVGGraphicsContext) supplies a MewVGContext
+subclass over the app's own GPU device; the branch also implements IGroupOpacityContext so Opacity < 1 composites
+inside the one UI pass. The GL-only clear / blit path is compiled out so Clear() takes the fill path.
+No behavioural change to the upstream branches.
+
+--- a/Shared/Rendering/MewVG/MewVGGraphicsContext.Common.cs
++++ b/Shared/Rendering/MewVG/MewVGGraphicsContext.Common.cs
+@@ -9,12 +9,17 @@
+ internal sealed partial class MewVGMacOSGraphicsContext : GraphicsContextBase, ITransparentDirtyRectContext, IOpaqueDirtyRectContext
+ #elif MEWUI_MEWVG_X11
+ internal sealed partial class MewVGX11GraphicsContext : GraphicsContextBase, ITransparentDirtyRectContext, IOpaqueDirtyRectContext, ISurfaceCopyContext
++#elif MEWUI_MEWVG_MEWSTAGE
++// MewStage vendor patch core-bridge/0001 (see third_party/NOTICE): a GPU-agnostic branch. No GL; Clear takes the fill path.
++internal sealed partial class MewStageMewVGGraphicsContext : GraphicsContextBase, ITransparentDirtyRectContext, IOpaqueDirtyRectContext, IGroupOpacityContext
+ #else
+ internal sealed partial class MewVGWin32GraphicsContext : GraphicsContextBase, ITransparentDirtyRectContext, IOpaqueDirtyRectContext, ISurfaceCopyContext
+ #endif
+ {
+ #if MEWUI_MEWVG_MACOS
+     private MewVGMetal _vg;
++#elif MEWUI_MEWVG_MEWSTAGE
++    private MewVGContext _vg = null!;
+ #else
+     private MewVGGL _vg;
+ #endif
+@@ -356,7 +361,7 @@
+ 
+     public override void Clear(Color color)
+     {
+-#if !MEWUI_MEWVG_MACOS
++#if !MEWUI_MEWVG_MACOS && !MEWUI_MEWVG_MEWSTAGE
+         ClearTargetPixels(new Rect(0, 0, _viewportWidthDip, _viewportHeightDip), ToNvgColor(color));
+ #else
+         _vg.Save();
+@@ -382,7 +387,7 @@
+ 
+     private void ClearRectangleCore(Rect rect, MewVGColor color)
+     {
+-#if !MEWUI_MEWVG_MACOS
++#if !MEWUI_MEWVG_MACOS && !MEWUI_MEWVG_MEWSTAGE
+         ClearTargetPixels(rect, color);
+ #else
+         _vg.Save();
+@@ -400,7 +405,7 @@
+ #endif
+     }
+ 
+-#if !MEWUI_MEWVG_MACOS
++#if !MEWUI_MEWVG_MACOS && !MEWUI_MEWVG_MEWSTAGE
+     /// <summary>Overwrites the pixels of <paramref name="rect"/> (target coordinates) with <paramref name="color"/>.</summary>
+     private void ClearTargetPixels(Rect rect, MewVGColor color)
+     {

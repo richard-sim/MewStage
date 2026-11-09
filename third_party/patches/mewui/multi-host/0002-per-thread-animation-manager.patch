@@ -1,0 +1,114 @@
+MewStage vendor patch multi-host/0002 (third_party/NOTICE): MewUI's AnimationManager was one process-wide instance,
+so every embedded host's per-frame pulse (EmbeddedUiHost -> AnimationManager.UpdateAt) ticked EVERY host's
+animation clocks, on its own thread: a host on another thread advanced (and raced on) this thread's colour
+transitions and paid their allocations. The manager is now per UI thread ([ThreadStatic] instance); a clock keeps
+the manager it registered with until it stops, so Stop / Pause / Resume / completion reach the right one. One UI
+thread per process (MewUI's own platform hosts) behaves exactly as before. Applies after multi-host/0001.
+
+--- a/Animation/AnimationManager.cs
++++ b/Animation/AnimationManager.cs
+@@ -12,7 +12,7 @@
+ /// </summary>
+ public sealed class AnimationManager
+ {
+-    private static AnimationManager? _instance;
++    [ThreadStatic] private static AnimationManager? _instance;
+ 
+     // Clocks start/stop from any UI thread (per-window render loops, tests), so every
+     // list mutation and the update sweep run under _sync. Same-thread reentrancy from
+@@ -41,22 +41,11 @@
+     internal AnimationManager() { }
+ 
+     /// <summary>
+-    /// Gets the singleton animation manager instance.
++    /// Gets this UI thread's animation manager (MewStage vendor patch multi-host/0002: one per thread, not one per process - an embedded
++    /// host pulses only the clocks its own UI started; with one shared manager a host on another thread ticked this
++    /// thread's transitions, and allocated and raced for them).
+     /// </summary>
+-    internal static AnimationManager Instance
+-    {
+-        get
+-        {
+-            var existing = Volatile.Read(ref _instance);
+-            if (existing != null)
+-            {
+-                return existing;
+-            }
+-
+-            var created = new AnimationManager();
+-            return Interlocked.CompareExchange(ref _instance, created, null) ?? created;
+-        }
+-    }
++    internal static AnimationManager Instance => _instance ??= new AnimationManager();
+ 
+     /// <summary>
+     /// Gets the number of currently active animations.
+@@ -307,7 +296,7 @@
+     }
+ 
+     /// <summary>
+-    /// Resets the singleton instance. For testing purposes only.
++    /// Resets this thread's instance. For testing purposes only.
+     /// </summary>
+     internal static void Reset()
+     {
+--- a/Animation/AnimationClock.cs
++++ b/Animation/AnimationClock.cs
+@@ -114,6 +114,10 @@
+         return owner.ResolveInputHostWindow();
+     }
+ 
++    // The manager this clock registered with (MewStage vendor patch multi-host/0002); the calling thread's until the first Start.
++    private AnimationManager? _manager;
++    private AnimationManager Manager => _manager ?? AnimationManager.Instance;
++
+     /// <summary>
+     /// Starts the animation from the beginning.
+     /// </summary>
+@@ -135,7 +139,9 @@
+         // the render loop in Continuous mode forever.
+         if (!wasRunning)
+         {
+-            AnimationManager.Instance.Register(this);
++            // The starting thread's manager owns the clock until it stops (MewStage vendor patch multi-host/0002: managers are per thread).
++            _manager = AnimationManager.Instance;
++            _manager.Register(this);
+         }
+     }
+ 
+@@ -151,7 +157,7 @@
+ 
+         _isRunning = false;
+         _isPaused = false;
+-        AnimationManager.Instance.Unregister(this);
++        Manager.Unregister(this);
+     }
+ 
+     /// <summary>
+@@ -166,7 +172,7 @@
+ 
+         _isPaused = true;
+         _pauseTimestamp = Stopwatch.GetTimestamp();
+-        AnimationManager.Instance.OnPauseStateChanged();
++        Manager.OnPauseStateChanged();
+     }
+ 
+     /// <summary>
+@@ -181,7 +187,7 @@
+ 
+         _isPaused = false;
+         _pauseAccumulated += Stopwatch.GetTimestamp() - _pauseTimestamp;
+-        AnimationManager.Instance.OnPauseStateChanged();
++        Manager.OnPauseStateChanged();
+     }
+ 
+     /// <summary>
+@@ -223,7 +229,7 @@
+                 _progress = EasingFunction(directed);
+ 
+                 _isRunning = false;
+-                AnimationManager.Instance.Unregister(this);
++                Manager.Unregister(this);
+ 
+                 TickCallback?.Invoke(_progress);
+                 CompletedCallback?.Invoke();

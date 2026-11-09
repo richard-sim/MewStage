@@ -1,0 +1,1016 @@
+using System.Diagnostics;
+
+using Aprillz.MewUI.Animation;
+
+namespace Aprillz.MewUI.Platform.MacOS;
+
+public sealed class MacOSPlatformHost : IPlatformHost
+{
+    public const string PlatformIdentifier = "MacOS";
+
+    private readonly Dictionary<nint, MacOSWindowBackend> _windows = new();
+    private readonly List<MacOSWindowBackend> _renderBackends = new();
+    private long _nextInputRoutingOrder;
+    private MacOSDispatcher? _dispatcher;
+    private Application? _app;
+    private bool _running;
+    // Refresh rate in Hz, 0 before it is read and -1 when the display reports no usable rate.
+    private int _displayRefreshHz;
+    private ThemeVariant _lastSystemTheme = ThemeVariant.Light;
+    private nint _lastInputWindow;
+    private int _themeUpdateRequested;
+    // 0 = the pump loop is active/running, 1 = it is blocked in WaitForNextEventDequeue.
+    private int _parked;
+
+    public MacOSPlatformHost()
+    {
+        MacOSInterop.EnsureApplicationInitialized();
+    }
+
+    internal const string SystemFontFamily = ".AppleSystemUIFont";
+
+    public string DefaultFontFamily => SystemFontFamily;
+
+    public IReadOnlyList<string> DefaultFontFallbacks { get; } = BuildDefaultFontFallbacks();
+
+    private static string[] BuildDefaultFontFallbacks()
+    {
+        var locale = Rendering.FontFallback.ResolvedLocale;
+        var cjk = Rendering.FontFallback.OrderCjkByLocale(locale,
+            kr: "Apple SD Gothic Neo", jp: "Hiragino Sans",
+            sc: "PingFang SC", tc: "PingFang TC");
+
+        var chain = new List<string>(12) { "Apple Color Emoji" };
+        chain.AddRange(cjk);
+        chain.AddRange([
+            "Geeza Pro", "Devanagari Sangam MN", "Thonburi",
+            "Helvetica Neue", "Arial Unicode MS",
+        ]);
+        return [.. chain];
+    }
+
+    public IMessageBoxService MessageBox
+    {
+        get;
+    } = new MacOSMessageBoxService();
+
+    public IFileDialogService FileDialog
+    {
+        get;
+    } = new MacOSFileDialogService();
+
+    public IShellIconProvider ShellIconProvider { get; } = new MacShellIconProvider();
+
+    public IMountedVolumeProvider MountedVolumeProvider { get; } = new MacMountedVolumeProvider();
+
+    public IPlacesProvider PlacesProvider { get; } = new MacPlacesProvider();
+
+    public IClipboardService Clipboard
+    {
+        get;
+    } = new MacOSClipboardService();
+
+    public IWindowBackend CreateWindowBackend(Window window)
+    {
+        ArgumentNullException.ThrowIfNull(window);
+        return new MacOSWindowBackend(this, window);
+    }
+
+    public IDispatcher CreateDispatcher(nint windowHandle)
+        => _dispatcher ??= new MacOSDispatcher();
+
+    public uint GetSystemDpi()
+    {
+        // macOS reports a backing scale factor (1.0, 2.0, ...) rather than a DPI number.
+        // MewUI uses 96 DPI as the DIP baseline, so scale * 96 is treated as effective DPI.
+        var scale = MacOSInterop.GetMainScreenScaleFactor();
+        return (uint)Math.Max(1, (int)Math.Round(96.0 * scale));
+    }
+
+    public ThemeVariant GetSystemThemeVariant()
+    {
+        // Most reliable, low-level signal without relying on AppKit notifications:
+        // NSUserDefaults "AppleInterfaceStyle" is set to "Dark" when dark mode is enabled.
+        // It is absent (null) for light mode.
+        var style = MacOSInterop.GetUserDefaultString("AppleInterfaceStyle");
+        return style != null && style.StartsWith("Dark", StringComparison.OrdinalIgnoreCase)
+            ? ThemeVariant.Dark
+            : ThemeVariant.Light;
+    }
+
+    public uint GetDpiForWindow(nint hwnd)
+    {
+        // hwnd is the NSView pointer (MacOSWindowBackend.Handle).
+        var scale = MacOSInterop.GetBackingScaleFactorForView(hwnd);
+        return (uint)Math.Max(1, (int)Math.Round(96.0 * scale));
+    }
+
+    public bool EnablePerMonitorDpiAwareness() => false;
+
+    public int GetSystemMetricsForDpi(int nIndex, uint dpi) => 0;
+
+    internal void RegisterWindow(nint handle, MacOSWindowBackend backend)
+    {
+        backend.InputRoutingOrder = ++_nextInputRoutingOrder;
+        _windows[handle] = backend;
+    }
+
+    internal MacOSWindowBackend ResolveMouseInputTarget(
+        MacOSWindowBackend eventTarget,
+        Point screenPositionPx)
+    {
+        MacOSWindowBackend? capturedTarget = null;
+        MacOSWindowBackend? popupTarget = null;
+
+        foreach (var candidate in _windows.Values)
+        {
+            if (candidate.Window.HasMouseCapture
+                && (capturedTarget == null
+                    || candidate.InputRoutingOrder > capturedTarget.InputRoutingOrder))
+            {
+                capturedTarget = candidate;
+            }
+
+            if (candidate.IsInteractivePopupAt(eventTarget, screenPositionPx)
+                && (popupTarget == null
+                    || candidate.InputRoutingOrder > popupTarget.InputRoutingOrder))
+            {
+                popupTarget = candidate;
+            }
+        }
+
+        // AppKit has no SetCapture equivalent. Preserve MewUI capture first so a scrollbar receives
+        // its drag/up even when NSEvent.window changes to the key owner. Once managed capture ends,
+        // prefer the frontmost MewUI popup under the pointer: non-key borderless popups can otherwise
+        // leave subsequent mouseMoved events associated with their key owner.
+        return capturedTarget ?? popupTarget ?? eventTarget;
+    }
+
+    internal void UnregisterWindow(nint handle)
+    {
+        // Shutdown is decided by Application.UnregisterWindow (ShutdownMode-aware); the host only
+        // drops its routing entry here.
+        _windows.Remove(handle);
+        if (_windows.Count == 0)
+        {
+            // Stop theme notifications as early as possible to avoid callbacks during teardown.
+            MacOSInterop.TrySetThemeChangedCallback(null);
+        }
+    }
+
+    internal void RequestRender()
+    {
+        WakeIfParked();
+    }
+
+    // Post an OS wake only when the loop is actually parked. A request made while the loop is active is
+    // caught by the pre-park recheck (HasPendingWork / AnyWindowNeedsRender), so no wake is needed here;
+    // posting one anyway would linger in the event queue and cause a spurious extra wakeup on the next park.
+    private void WakeIfParked()
+    {
+        if (Volatile.Read(ref _parked) != 0)
+        {
+            MacOSInterop.PostWakeEvent();
+        }
+    }
+
+    private bool AnyWindowNeedsRender()
+    {
+        foreach (var backend in _windows.Values)
+        {
+            if (backend.NeedsRender)
+            {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    private void RenderInvalidatedWindows()
+    {
+        if (_windows.Count == 0)
+        {
+            return;
+        }
+
+        _renderBackends.Clear();
+        foreach (var backend in _windows.Values)
+        {
+            if (backend.NeedsRender)
+            {
+                _renderBackends.Add(backend);
+            }
+        }
+
+        for (int i = 0; i < _renderBackends.Count; i++)
+        {
+            _renderBackends[i].RenderIfNeeded();
+        }
+    }
+
+    // All window, cursor and work-area coordinates share the reference-screen pixel space.
+    public Point GetCursorScreenPosition()
+        => MacOSInterop.CocoaToScreenPixels(MacOSInterop.GetMouseScreenLocation());
+
+    public uint GetDpiForPoint(Point screenPositionPx)
+        => (uint)Math.Round(96 * MacOSWindowInterop.GetScreenScaleForCocoaPoint(
+            MacOSInterop.ScreenPixelsToCocoa(screenPositionPx)));
+
+    public Rect GetWorkAreaForPoint(Point screenPositionPx)
+    {
+        var visible = MacOSWindowInterop.GetScreenVisibleFrameForCocoaPoint(
+            MacOSInterop.ScreenPixelsToCocoa(screenPositionPx));
+        if (visible.size.width <= 0 || visible.size.height <= 0)
+            return default;
+        var topLeft = MacOSInterop.CocoaToScreenPixels(
+            new NSPoint(visible.origin.x, visible.origin.y + visible.size.height));
+        double scale = MacOSInterop.GetScreenCoordinateScale();
+        return new Rect(topLeft.X, topLeft.Y, visible.size.width * scale, visible.size.height * scale);
+    }
+
+    // setIgnoresMouseEvents (click-through) + orderFront-without-makeKey (no-activate) + high window level give
+    // a non-activating, click-through, transparent overlay.
+    public bool SupportsTransparentOverlay => true;
+
+    private void RenderAllWindows()
+    {
+        if (_windows.Count == 0)
+        {
+            return;
+        }
+
+        _renderBackends.Clear();
+        foreach (var backend in _windows.Values)
+        {
+            _renderBackends.Add(backend);
+        }
+
+        for (int i = 0; i < _renderBackends.Count; i++)
+        {
+            _renderBackends[i].RenderNow();
+        }
+    }
+
+    private void RenderContinuousWindows(RenderLoopSettings settings)
+    {
+        using var pulse = AnimationManager.Instance.BeginPulse(settings);
+
+        _renderBackends.Clear();
+        foreach (var backend in _windows.Values)
+        {
+            if (pulse.ShouldRender(backend.Window, backend.NeedsRender))
+            {
+                _renderBackends.Add(backend);
+            }
+        }
+
+        for (int i = 0; i < _renderBackends.Count; i++)
+        {
+            _renderBackends[i].RenderNow();
+        }
+    }
+
+    public void Run(Application app, Window? mainWindow)
+    {
+        ArgumentNullException.ThrowIfNull(app);
+
+        _app = app;
+        var previousContext = SynchronizationContext.Current;
+        try
+        {
+            _dispatcher = new MacOSDispatcher();
+
+            // Ensure dispatcher wake can break the event wait.
+            _dispatcher.SetWake(() =>
+            {
+                // Only interrupt the OS wait when the loop is actually parked. A UI-thread post while the loop
+                // is active is picked up by the pre-park recheck below, so no wake event is needed (and posting
+                // one would linger in the event queue and cause a spurious extra wakeup).
+                if (Volatile.Read(ref _parked) != 0)
+                {
+                    MacOSInterop.PostWakeEvent();
+                }
+            });
+
+            MacOSInterop.EnsureApplicationInitialized();
+            _lastSystemTheme = GetSystemThemeVariant();
+            if (app.ThemeMode == ThemeVariant.System)
+            {
+                MacOSInterop.TrySetThemeChangedCallback(OnSystemThemeChanged);
+            }
+            else
+            {
+                MacOSInterop.TrySetThemeChangedCallback(null);
+            }
+
+            _running = true;
+            app.Dispatcher = _dispatcher;
+            // Install the dispatcher as the SynchronizationContext so await continuations return to the UI thread.
+            SynchronizationContext.SetSynchronizationContext(_dispatcher);
+
+            // Note: Window backend will create NSWindow on Show().
+            app.OnHostLoopStarting(mainWindow);
+
+            // Basic manual event loop (NSApplication without calling [NSApp run]).
+            PumpLoop(null);
+        }
+        finally
+        {
+            app.Dispatcher = null;
+            _dispatcher = null;
+            _app = null;
+            MacOSInterop.TrySetThemeChangedCallback(null);
+            SynchronizationContext.SetSynchronizationContext(previousContext);
+        }
+    }
+
+    /// <summary>
+    /// Returns the main screen's refresh rate in Hz, or 0 when it reports none. Read once: a mode change
+    /// mid-run leaves the loop one stale cap, which is cheaper than a display query per frame.
+    /// </summary>
+    private int GetDisplayRefreshHz()
+    {
+        if (_displayRefreshHz == 0)
+        {
+            int refresh = CoreGraphicsDisplayInterop.GetMainDisplayRefreshHz();
+            _displayRefreshHz = refresh > 0 ? refresh : -1;
+        }
+
+        return Math.Max(0, _displayRefreshHz);
+    }
+
+    /// <summary>
+    /// Runs the event/render loop until the app quits and, when <paramref name="keepRunning"/> is supplied,
+    /// until it returns false. Shared by <see cref="Run"/> and <see cref="RunNestedLoop"/>.
+    /// </summary>
+    private void PumpLoop(Func<bool>? keepRunning)
+    {
+        var app = _app!;
+        long lastFrameTicks = Stopwatch.GetTimestamp();
+        bool lastContinuous = app.RenderLoopSettings.IsContinuous;
+
+        while (_running && (keepRunning == null || keepRunning()))
+        {
+            // Dispatcher work and rendering below run outside the event pools; without this, what they
+            // autorelease (a closed window, its view and layer) is never freed.
+            using var iterationPool = new MacOSInterop.AutoReleasePool();
+            try
+            {
+                ProcessEventsAndDispatcher();
+            }
+            catch (Exception ex)
+            {
+                if (!HandleLoopException(app, ex))
+                {
+                    break;
+                }
+            }
+
+            var scheduler = app.RenderLoopSettings;
+            if (lastContinuous && !scheduler.IsContinuous)
+            {
+                foreach (var backend in _windows.Values)
+                {
+                    backend.Invalidate(erase: true);
+                }
+
+                RequestRender();
+                try
+                {
+                    RenderAllWindows();
+                }
+                catch (Exception ex)
+                {
+                    if (!HandleLoopException(app, ex))
+                    {
+                        break;
+                    }
+                }
+            }
+            int frameCap = scheduler.EffectiveFrameCap(GetDisplayRefreshHz());
+            long frameTicks = frameCap > 0 ? Stopwatch.Frequency / frameCap : 0;
+
+            // A cap only holds if it gates the render itself. Dispatcher work and render requests both
+            // cut the wait below short, and an animation produces them every frame.
+            bool frameDue = frameTicks == 0 || Stopwatch.GetTimestamp() - lastFrameTicks >= frameTicks;
+            if (scheduler.IsContinuous)
+            {
+                if (frameDue)
+                {
+                    try
+                    {
+                        RenderContinuousWindows(scheduler);
+                    }
+                    catch (Exception ex)
+                    {
+                        if (!HandleLoopException(app, ex))
+                        {
+                            break;
+                        }
+                    }
+
+                    if (frameTicks > 0)
+                    {
+                        // Advance the deadline instead of restarting from now, so a frame that overran is
+                        // not paid for twice, and abandon a deadline more than one frame behind rather
+                        // than chasing it with a burst.
+                        lastFrameTicks += frameTicks;
+                        if (Stopwatch.GetTimestamp() - lastFrameTicks > frameTicks)
+                        {
+                            lastFrameTicks = Stopwatch.GetTimestamp();
+                        }
+                    }
+
+                    if (frameCap <= 0)
+                    {
+                        MacOSInterop.WaitForNextEvent(0, updateWindows: true);
+                        try
+                        {
+                            DrainEventsAndDispatcher();
+                        }
+                        catch (Exception ex)
+                        {
+                            if (!HandleLoopException(app, ex))
+                            {
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+            else
+            {
+                // Drain dispatcher work that cascaded during this iteration (e.g. a layout pass posting a
+                // render request at a priority already passed this Process() pass) so one update settles in a
+                // single render instead of spilling a second render into the next iteration.
+                int cascadeDrainGuard = 0;
+                while (_dispatcher!.HasPendingWork && cascadeDrainGuard < 8)
+                {
+                    _dispatcher.ProcessWorkItems();
+                    cascadeDrainGuard++;
+                }
+                try
+                {
+                    RenderInvalidatedWindows();
+                }
+                catch (Exception ex)
+                {
+                    if (!HandleLoopException(app, ex))
+                    {
+                        break;
+                    }
+                }
+                if (AnyWindowNeedsRender())
+                {
+                    RequestRender();
+                }
+            }
+            lastContinuous = scheduler.IsContinuous;
+
+            if (!_running)
+            {
+                break;
+            }
+
+            if (scheduler.IsContinuous && frameCap <= 0)
+            {
+                // No cap means VSync was turned off, which asks for every frame the machine can produce.
+                // Every window renders on every pass in that mode, so this does not idle.
+                Thread.Yield();
+                _dispatcher!.ClearWakeRequest();
+                continue;
+            }
+
+            int timeoutMs;
+            bool waitingOutFrameBudget =
+                scheduler.IsContinuous && frameTicks > 0 && Stopwatch.GetTimestamp() - lastFrameTicks < frameTicks;
+
+            if (waitingOutFrameBudget)
+            {
+                // Work posted during the frame must not turn the budget into a spin: run it now, then park
+                // for whatever is left. An animation posts a dispatcher wake every frame.
+                int drainGuard = 0;
+                while (_dispatcher!.HasPendingWork && drainGuard < 8)
+                {
+                    _dispatcher.ProcessWorkItems();
+                    drainGuard++;
+                }
+
+                long remaining = frameTicks - (Stopwatch.GetTimestamp() - lastFrameTicks);
+                int frameWaitMs = remaining > 0 ? (int)(remaining * 1000 / Stopwatch.Frequency) : 0;
+                int timerWaitMs = _dispatcher.GetPollTimeoutMs(maxMs: frameWaitMs <= 0 ? 1 : frameWaitMs);
+                timeoutMs = Math.Max(1, timerWaitMs < 0 ? frameWaitMs : Math.Min(frameWaitMs, timerWaitMs));
+            }
+            else if (_dispatcher!.HasPendingWork)
+            {
+                timeoutMs = 0;
+            }
+            else
+            {
+                if (scheduler.IsContinuous)
+                {
+                    timeoutMs = 0;
+                }
+                else
+                {
+                    timeoutMs = _dispatcher.GetPollTimeoutMs(maxMs: 1000);
+                }
+            }
+
+            // Never park while any window needs render, because drains can invalidate after the render
+            // section already ran. An animation sets that flag every frame, so the frame budget has to
+            // win here or the cap would never hold.
+            if (timeoutMs != 0 && !waitingOutFrameBudget && AnyWindowNeedsRender())
+            {
+                timeoutMs = 0;
+            }
+
+            bool updateWindows = timeoutMs == 0;
+            if (timeoutMs == 0)
+            {
+                MacOSInterop.WaitForNextEvent(timeoutMs, updateWindows: updateWindows);
+            }
+            else
+            {
+                // Publish parked=1 BEFORE the final work check. Pair with the wake gate: a post that enqueued
+                // work and then read _parked==0 must have happened before we set _parked=1, so our recheck here
+                // sees that work and we do not block. A post that reads _parked==1 will post a wake that unblocks us.
+                // Interlocked.Exchange provides the full StoreLoad fence the double-checked park needs on ARM64.
+                Interlocked.Exchange(ref _parked, 1);
+
+                // A window that needs render does not justify skipping the park while the frame budget
+                // still has time left: the render cannot happen before the deadline anyway.
+                if (_dispatcher!.HasPendingWork || (!waitingOutFrameBudget && AnyWindowNeedsRender()))
+                {
+                    Volatile.Write(ref _parked, 0);
+                }
+                else
+                {
+                    using var pool = new MacOSInterop.AutoReleasePool();
+                    try
+                    {
+                        bool gotEvent = MacOSInterop.WaitForNextEventDequeue(timeoutMs, updateWindows: false, out var ev);
+                        Volatile.Write(ref _parked, 0);
+                        if (gotEvent)
+                        {
+                            ProcessSingleEvent(ev);
+                        }
+
+                        DrainEventsAndDispatcher();
+                    }
+                    catch (Exception ex)
+                    {
+                        Volatile.Write(ref _parked, 0);
+                        if (!HandleLoopException(app, ex))
+                        {
+                            break;
+                        }
+                    }
+                }
+            }
+            _dispatcher.ClearWakeRequest();
+        }
+    }
+
+    public void RunNestedLoop(Func<bool> keepRunning)
+    {
+        ArgumentNullException.ThrowIfNull(keepRunning);
+        if (_running)
+        {
+            PumpLoop(keepRunning);
+        }
+    }
+
+    private void CleanupClosedWindows()
+    {
+        if (_windows.Count == 0)
+        {
+            return;
+        }
+
+        List<nint>? closed = null;
+        foreach (var kvp in _windows)
+        {
+            if (!MacOSInterop.IsWindowVisible(kvp.Key) && !MacOSInterop.IsWindowMiniaturized(kvp.Key))
+            {
+                (closed ??= new List<nint>()).Add(kvp.Key);
+            }
+        }
+
+        if (closed == null)
+        {
+            return;
+        }
+
+        for (int i = 0; i < closed.Count; i++)
+        {
+            if (_windows.TryGetValue(closed[i], out var backend))
+            {
+                backend.Dispose();
+            }
+        }
+    }
+
+    private void TryUpdateSystemTheme()
+    {
+        var app = _app;
+        if (app == null)
+        {
+            return;
+        }
+
+        if (app.ThemeMode != ThemeVariant.System)
+        {
+            return;
+        }
+
+        var current = GetSystemThemeVariant();
+        if (current == _lastSystemTheme)
+        {
+            return;
+        }
+
+        _lastSystemTheme = current;
+        app.NotifySystemThemeChanged();
+    }
+
+    private void ProcessEventsAndDispatcher()
+    {
+        DrainEvents();
+        _dispatcher!.ProcessWorkItems();
+        CleanupClosedWindows();
+        if (Interlocked.Exchange(ref _themeUpdateRequested, 0) != 0)
+        {
+            TryUpdateSystemTheme();
+        }
+    }
+
+    private void DrainEventsAndDispatcher()
+    {
+        DrainEvents();
+        _dispatcher!.ProcessWorkItems();
+    }
+
+    private bool HandleLoopException(Application app, Exception ex)
+    {
+        if (app.TryHandleDispatcherException(ex))
+        {
+            return true;
+        }
+
+        app.NotifyFatalDispatcherException(ex);
+        _running = false;
+        return false;
+    }
+
+    public void Quit(Application app)
+    {
+        var dispatcher = _dispatcher;
+        if (dispatcher != null && !dispatcher.IsOnUIThread)
+        {
+            // NSApplication must be touched from the main thread, so the request is marshalled there.
+            dispatcher.BeginInvoke(() => Quit(app));
+            return;
+        }
+
+        _running = false;
+        MacOSInterop.TrySetThemeChangedCallback(null);
+        MacOSInterop.RequestTerminate();
+    }
+
+    public void DoEvents()
+    {
+        using var pool = new MacOSInterop.AutoReleasePool();
+        while (MacOSInterop.TryDequeueEvent(out var ev))
+        {
+            try
+            {
+                if (ev == 0)
+                {
+                    continue;
+                }
+
+                int type = MacOSInterop.GetEventType(ev);
+                var nsWindow = MacOSInterop.GetEventWindow(ev);
+
+                var windowKey = nsWindow;
+                if (windowKey == 0)
+                {
+                    var keyWindow = MacOSInterop.GetKeyWindow();
+                    if (keyWindow != 0)
+                    {
+                        windowKey = keyWindow;
+                    }
+                    else if (_lastInputWindow != 0)
+                    {
+                        windowKey = _lastInputWindow;
+                    }
+                    else if (_windows.Count == 1)
+                    {
+                        windowKey = _windows.Keys.FirstOrDefault();
+                    }
+                }
+
+                _windows.TryGetValue(windowKey, out var backend);
+                var topModalBackend = GetTopModalBackend();
+                if (topModalBackend != null && IsMouseEvent(type) &&
+                    (backend == null || !backend.Window.IsInModalScope(topModalBackend.Window)))
+                {
+                    topModalBackend.Activate();
+                    continue;
+                }
+
+                if (TryHandleSystemKeyEvent(type, ev, windowKey))
+                {
+                    continue;
+                }
+
+                bool forwardToCocoa = type != 10 && type != 11;
+                if (forwardToCocoa && backend != null && !backend.IsEnabled && IsMouseEvent(type))
+                {
+                    forwardToCocoa = false;
+                }
+
+                if (forwardToCocoa)
+                {
+                    MacOSInterop.SendEvent(ev);
+                }
+
+                if (backend != null)
+                {
+                    backend.ProcessNSEvent(ev);
+                }
+                else if (_windows.Count == 1)
+                {
+                    _windows.Values.FirstOrDefault()?.ProcessNSEvent(ev);
+                }
+            }
+            catch (Exception ex)
+            {
+                if (!Application.IsRunning || !Application.Current.TryHandleDispatcherException(ex))
+                {
+                    if (Application.IsRunning)
+                    {
+                        Application.Current.NotifyFatalDispatcherException(ex);
+                    }
+
+                    _running = false;
+                    break;
+                }
+            }
+        }
+    }
+
+    public void Dispose()
+    {
+        _running = false;
+        _windows.Clear();
+        _dispatcher = null;
+        _app = null;
+        MacOSInterop.TrySetThemeChangedCallback(null);
+    }
+
+    private void DrainEvents()
+    {
+        // Drain pending events without blocking.
+        //
+        // IMPORTANT: Do not drain unbounded. During window live-resize and other tracking scenarios,
+        // events can arrive continuously; draining forever would starve rendering and dispatcher work,
+        // making FPS counters "freeze" until mouse-up.
+        const int MaxEventsPerTick = 256;
+        using var pool = new MacOSInterop.AutoReleasePool();
+        int processed = 0;
+        while (processed < MaxEventsPerTick && MacOSInterop.TryDequeueEvent(out var ev))
+        {
+            if (ev == 0)
+            {
+                continue;
+            }
+
+            processed++;
+
+            int type = MacOSInterop.GetEventType(ev);
+            var nsWindow = MacOSInterop.GetEventWindow(ev);
+
+            // Avoid AppKit "beep" on key events when there's no responder chain handling them.
+            // MewUI handles keyboard input itself, so forwarding key events to Cocoa is unnecessary here.
+            // NSEventTypeKeyDown = 10, NSEventTypeKeyUp = 11
+            // Route input to the corresponding window backend (if any).
+            //
+            // NOTE: In some AppKit configurations (notably when driving rendering via CALayer display callbacks),
+            // certain event instances can report a null window even though the app has a visible key window.
+            // Fall back to keyWindow / lastInputWindow to keep input working.
+            var windowKey = nsWindow;
+            if (windowKey == 0)
+            {
+                var keyWindow = MacOSInterop.GetKeyWindow();
+                if (keyWindow != 0)
+                {
+                    windowKey = keyWindow;
+                }
+                else if (_lastInputWindow != 0)
+                {
+                    windowKey = _lastInputWindow;
+                }
+                else if (_windows.Count == 1)
+                {
+                    windowKey = _windows.Keys.FirstOrDefault();
+                }
+            }
+
+            _windows.TryGetValue(windowKey, out var backend);
+            var topModalBackend = GetTopModalBackend();
+            if (topModalBackend != null && IsMouseEvent(type) &&
+                (backend == null || !backend.Window.IsInModalScope(topModalBackend.Window)))
+            {
+                topModalBackend.Activate();
+                continue;
+            }
+
+            if (TryHandleSystemKeyEvent(type, ev, windowKey))
+            {
+                continue;
+            }
+
+            bool forwardToCocoa = type != 10 && type != 11;
+            if (forwardToCocoa && backend != null && !backend.IsEnabled && IsMouseEvent(type))
+            {
+                forwardToCocoa = false;
+            }
+
+            // For live-resize, AppKit updates view/window geometry while processing the event.
+            // Forward first, then compute bounds/route to MewUI (otherwise content can look "stretched"
+            // until mouse-up because we observe 1-frame-late sizes).
+            if (forwardToCocoa)
+            {
+                MacOSInterop.SendEvent(ev);
+            }
+
+            if (backend != null)
+            {
+                _lastInputWindow = windowKey;
+                backend.ProcessNSEvent(ev);
+            }
+            else if ((type == 10 || type == 11) && _windows.Count > 0)
+            {
+                // Some AppKit configurations can yield key events with a null window while we're running
+                // a manual event loop. Route them to the last known input window (or the single window).
+                var target = _lastInputWindow != 0 && _windows.TryGetValue(_lastInputWindow, out var lastBackend)
+                    ? lastBackend
+                    : _windows.Values.FirstOrDefault();
+
+                target?.ProcessNSEvent(ev);
+            }
+            else if (_windows.Count == 1)
+            {
+                // Last-resort: if AppKit reports no window (or a window we didn't register) but there's only one
+                // top-level window, route the event there so basic input continues to work.
+                _windows.Values.FirstOrDefault()?.ProcessNSEvent(ev);
+            }
+        }
+    }
+
+    private void OnSystemThemeChanged()
+    {
+        if (!_running || _app == null)
+        {
+            return;
+        }
+
+        Interlocked.Exchange(ref _themeUpdateRequested, 1);
+        // Intentionally ungated: the pre-park recheck does not observe _themeUpdateRequested, so gating this
+        // wake on _parked (like WakeIfParked does) could delay a theme change until the next unrelated wake.
+        MacOSInterop.PostWakeEvent();
+    }
+
+    private void ProcessSingleEvent(nint ev)
+    {
+        if (ev == 0)
+        {
+            return;
+        }
+
+        int type = MacOSInterop.GetEventType(ev);
+        var nsWindow = MacOSInterop.GetEventWindow(ev);
+
+        // Avoid AppKit "beep" on key events when there's no responder chain handling them.
+        // MewUI handles keyboard input itself, so forwarding key events to Cocoa is unnecessary here.
+        var windowKey = nsWindow;
+        if (windowKey == 0)
+        {
+            var keyWindow = MacOSInterop.GetKeyWindow();
+            if (keyWindow != 0)
+            {
+                windowKey = keyWindow;
+            }
+            else if (_lastInputWindow != 0)
+            {
+                windowKey = _lastInputWindow;
+            }
+            else if (_windows.Count == 1)
+            {
+                windowKey = _windows.Keys.FirstOrDefault();
+            }
+        }
+
+        _windows.TryGetValue(windowKey, out var backend);
+        var topModalBackend = GetTopModalBackend();
+        if (topModalBackend != null && IsMouseEvent(type) &&
+            (backend == null || !backend.Window.IsInModalScope(topModalBackend.Window)))
+        {
+            topModalBackend.Activate();
+            return;
+        }
+
+        if (TryHandleSystemKeyEvent(type, ev, windowKey))
+        {
+            return;
+        }
+
+        bool forwardToCocoa = type != 10 && type != 11;
+        if (forwardToCocoa && backend != null && !backend.IsEnabled && IsMouseEvent(type))
+        {
+            forwardToCocoa = false;
+        }
+
+        if (forwardToCocoa)
+        {
+            MacOSInterop.SendEvent(ev);
+        }
+
+        if (backend != null)
+        {
+            _lastInputWindow = windowKey;
+            backend.ProcessNSEvent(ev);
+        }
+        else if ((type == 10 || type == 11) && _windows.Count > 0)
+        {
+            var target = _lastInputWindow != 0 && _windows.TryGetValue(_lastInputWindow, out var lastBackend)
+                ? lastBackend
+                : _windows.Values.FirstOrDefault();
+
+            target?.ProcessNSEvent(ev);
+        }
+        else if (_windows.Count == 1)
+        {
+            _windows.Values.FirstOrDefault()?.ProcessNSEvent(ev);
+        }
+    }
+
+    private bool TryHandleSystemKeyEvent(int type, nint ev, nint windowKey)
+    {
+        // NSEventTypeKeyDown = 10. Keep keyUp and text input in MewUI, but let AppKit handle
+        // selected system shortcuts such as "Move focus to next window" (Cmd+`).
+        if (type != 10)
+        {
+            return false;
+        }
+
+        if (!MacOSInterop.TryHandleSystemKeyEvent(ev))
+        {
+            return false;
+        }
+
+        if (windowKey != 0)
+        {
+            _lastInputWindow = windowKey;
+        }
+
+        return true;
+    }
+
+    private static bool IsMouseEvent(int type)
+    {
+        return type is 1 or 2 or 3 or 4 or 5 or 6 or 7 or 8 or 9 or 22 or 25 or 26 or 27;
+    }
+
+    private MacOSWindowBackend? GetTopModalBackend()
+    {
+        Window? topModal = null;
+        foreach (var backend in _windows.Values)
+        {
+            var candidate = backend.Window.GetTopModalChild();
+            if (candidate != null)
+            {
+                topModal = candidate;
+                break;
+            }
+        }
+
+        if (topModal == null)
+        {
+            return null;
+        }
+
+        foreach (var backend in _windows.Values)
+        {
+            if (ReferenceEquals(backend.Window, topModal))
+            {
+                return backend;
+            }
+        }
+
+        return null;
+    }
+}

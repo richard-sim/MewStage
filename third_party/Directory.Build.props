@@ -1,0 +1,20 @@
+<Project>
+  <!-- Import the repository-root Directory.Build.props FIRST (MSBuild only auto-imports the NEAREST one walking up,
+       so without this explicit import the third_party tree would lose the net10 / AOT / lock-file settings). -->
+  <Import Project="$([MSBuild]::GetPathOfFileAbove('Directory.Build.props', '$(MSBuildThisFileDirectory)../'))" />
+
+  <!-- Vendored upstream code is built as upstream wrote it. MewStage's strict standard (warnings as errors, every
+       analyzer, code style in the build, documentation on every public member) applies to src/ and tests/ only;
+       the vendored trees opt out here. AOT / trim analysis from the root props is KEPT (the vendored code targets
+       NativeAOT). Upstream assumes ImplicitUsings=enable; the root disables it, so re-enable it here. -->
+  <PropertyGroup>
+    <TreatWarningsAsErrors>false</TreatWarningsAsErrors>
+    <RunAnalyzers>false</RunAnalyzers>
+    <EnforceCodeStyleInBuild>false</EnforceCodeStyleInBuild>
+    <GenerateDocumentationFile>false</GenerateDocumentationFile>
+    <IsPackable>false</IsPackable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <WarningLevel>0</WarningLevel>
+    <NoWarn>$(NoWarn);CS1591;CS8618;CS8625;CS0618;IL2026;IL2070;IL2075;IL3050</NoWarn>
+  </PropertyGroup>
+</Project>

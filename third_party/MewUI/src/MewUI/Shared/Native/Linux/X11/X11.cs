@@ -1,0 +1,688 @@
+using System.Runtime.InteropServices;
+
+namespace Aprillz.MewUI.Native;
+
+// Minimal Xlib surface for future Linux/X11 host.
+internal static partial class X11
+{
+    private const string LibraryName = "libX11.so.6";
+
+    [LibraryImport(LibraryName)]
+    public static partial nint XFree(nint data);
+
+    [LibraryImport(LibraryName)]
+    public static partial nint XGetVisualInfo(nint display, long vinfoMask, ref XVisualInfo vinfoTemplate, out int nitems);
+
+    // Must be the first Xlib call in the process to make the shared Display safe for multi-thread access.
+    [LibraryImport(LibraryName)]
+    public static partial int XInitThreads();
+
+    [LibraryImport(LibraryName)]
+    public static partial nint XOpenDisplay(nint displayName);
+
+    [LibraryImport(LibraryName)]
+    public static partial int XCloseDisplay(nint display);
+
+    // Installs a process-wide async error handler (returns the previous one). The handler is a native
+    // function pointer: int handler(Display*, XErrorEvent*). Used to log/swallow Xlib's async protocol
+    // errors instead of the default handler's print-and-exit.
+    [LibraryImport(LibraryName)]
+    public static partial nint XSetErrorHandler(nint handler);
+
+    [LibraryImport(LibraryName)]
+    public static partial int XDefaultScreen(nint display);
+
+    [LibraryImport(LibraryName)]
+    public static partial nint XRootWindow(nint display, int screenNumber);
+
+    [LibraryImport(LibraryName)]
+    public static partial nint XCreateColormap(nint display, nint window, nint visual, int alloc);
+
+    [LibraryImport(LibraryName)]
+    public static partial nint XCreateWindow(
+        nint display,
+        nint parent,
+        int x,
+        int y,
+        uint width,
+        uint height,
+        uint borderWidth,
+        int depth,
+        uint @class,
+        nint visual,
+        ulong valuemask,
+        ref XSetWindowAttributes attributes);
+
+    [LibraryImport(LibraryName)]
+    public static partial void XDestroyWindow(nint display, nint window);
+
+    [LibraryImport(LibraryName)]
+    public static partial int XFreeColormap(nint display, nint colormap);
+
+    [LibraryImport(LibraryName)]
+    public static partial void XMapWindow(nint display, nint window);
+
+    [LibraryImport(LibraryName)]
+    public static partial void XUnmapWindow(nint display, nint window);
+
+    [LibraryImport(LibraryName)]
+    public static partial int XIconifyWindow(nint display, nint window, int screenNumber);
+
+    [LibraryImport(LibraryName)]
+    public static partial int XRaiseWindow(nint display, nint window);
+
+    [LibraryImport(LibraryName)]
+    public static partial int XGrabPointer(
+        nint display,
+        nint grabWindow,
+        [MarshalAs(UnmanagedType.Bool)] bool ownerEvents,
+        uint eventMask,
+        int pointerMode,
+        int keyboardMode,
+        nint confineTo,
+        nint cursor,
+        nint time);
+
+    [LibraryImport(LibraryName)]
+    public static partial int XUngrabPointer(nint display, nint time);
+
+    [LibraryImport(LibraryName)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    public static partial bool XQueryPointer(nint display, nint window,
+        out nint rootReturn, out nint childReturn,
+        out int rootX, out int rootY,
+        out int winX, out int winY,
+        out uint mask);
+
+    [LibraryImport(LibraryName)]
+    public static partial int XMoveWindow(nint display, nint window, int x, int y);
+
+    [LibraryImport(LibraryName)]
+    public static partial int XResizeWindow(nint display, nint window, uint width, uint height);
+
+    [LibraryImport(LibraryName)]
+    public static partial int XSetInputFocus(nint display, nint focus, int revert_to, nint time);
+
+    [LibraryImport(LibraryName)]
+    public static partial int XSetTransientForHint(nint display, nint w, nint prop_window);
+
+    [LibraryImport(LibraryName, StringMarshalling = StringMarshalling.Utf8)]
+    public static partial int XStoreName(nint display, nint window, string windowName);
+
+    // Sets WM_NAME and WM_ICON_NAME from UTF-8, encoded as STRING when Latin-1 holds the text and as COMPOUND_TEXT
+    // otherwise; null hint and argv arguments leave those properties alone.
+    [LibraryImport(LibraryName, StringMarshalling = StringMarshalling.Utf8)]
+    public static partial void Xutf8SetWMProperties(
+        nint display,
+        nint window,
+        string? windowName,
+        string? iconName,
+        nint argv,
+        int argc,
+        nint normalHints,
+        nint wmHints,
+        nint classHints);
+
+    [LibraryImport(LibraryName)]
+    public static partial int XPending(nint display);
+
+    [LibraryImport(LibraryName)]
+    public static partial int XNextEvent(nint display, out XEvent ev);
+
+    // NOTE: In Xlib headers this is a macro (ConnectionNumber), but on most libX11 builds
+    // there's also an exported symbol XConnectionNumber that bindings can P/Invoke.
+    [LibraryImport(LibraryName)]
+    public static partial int XConnectionNumber(nint display);
+
+    [LibraryImport(LibraryName)]
+    public static partial int XSelectInput(nint display, nint window, nint eventMask);
+
+    [LibraryImport(LibraryName, StringMarshalling = StringMarshalling.Utf8)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    public static partial bool XQueryExtension(
+        nint display,
+        string name,
+        out int majorOpcodeReturn,
+        out int firstEventReturn,
+        out int firstErrorReturn);
+
+    // GenericEvent (XEvent.type == 35) cookies - used by XInput2 and other modern extensions.
+    // These belong to core libX11; the extension-specific payload referenced through
+    // XGenericEventCookie.data is interpreted by the receiving extension.
+    [LibraryImport(LibraryName)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    public static partial bool XGetEventData(nint display, ref XGenericEventCookie cookie);
+
+    [LibraryImport(LibraryName)]
+    public static partial void XFreeEventData(nint display, ref XGenericEventCookie cookie);
+
+    [LibraryImport(LibraryName)]
+    public static partial void XFlush(nint display);
+
+    [LibraryImport(LibraryName)]
+    public static partial int XGetWindowAttributes(nint display, nint window, out XWindowAttributes attributes);
+
+    [LibraryImport(LibraryName)]
+    public static partial int XClearArea(nint display, nint window, int x, int y, uint width, uint height, [MarshalAs(UnmanagedType.Bool)] bool exposures);
+
+    [LibraryImport(LibraryName)]
+    public static partial nint XGetSelectionOwner(nint display, nint selection);
+
+    [LibraryImport(LibraryName)]
+    public static partial int XGetWindowProperty(
+        nint display,
+        nint window,
+        nint property,
+        nint long_offset,
+        nint long_length,
+        [MarshalAs(UnmanagedType.Bool)] bool delete,
+        nint req_type,
+        out nint actual_type_return,
+        out int actual_format_return,
+        out nuint nitems_return,
+        out nuint bytes_after_return,
+        out nint prop_return);
+
+    [LibraryImport(LibraryName)]
+    public static partial int XConvertSelection(
+        nint display,
+        nint selection,
+        nint target,
+        nint property,
+        nint requestor,
+        nint time);
+
+    [LibraryImport(LibraryName)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    public static partial bool XCheckTypedWindowEvent(nint display, nint window, int event_type, out XEvent event_return);
+
+    // Returns the atom's name, which the caller releases with XFree.
+    [LibraryImport(LibraryName)]
+    public static partial nint XGetAtomName(nint display, nint atom);
+
+    [LibraryImport(LibraryName)]
+    public static partial int XSendEvent(
+        nint display,
+        nint window,
+        [MarshalAs(UnmanagedType.Bool)] bool propagate,
+        nint event_mask,
+        ref XEvent send_event);
+
+    [LibraryImport(LibraryName)]
+    public static partial void XrmInitialize();
+
+    [LibraryImport(LibraryName)]
+    public static partial nint XrmGetStringDatabase(nint data);
+
+    [LibraryImport(LibraryName, StringMarshalling = StringMarshalling.Utf8)]
+    public static partial int XrmGetResource(nint database, string name, string className, out nint type, out XrmValue value);
+
+    [LibraryImport(LibraryName)]
+    public static partial void XrmDestroyDatabase(nint database);
+
+    [LibraryImport(LibraryName, StringMarshalling = StringMarshalling.Utf8)]
+    public static partial nint XInternAtom(nint display, string atomName, [MarshalAs(UnmanagedType.Bool)] bool onlyIfExists);
+
+    [LibraryImport(LibraryName)]
+    public static partial int XSetWMProtocols(nint display, nint window, ref nint protocols, int count);
+
+    [LibraryImport(LibraryName)]
+    public static partial nint XLookupKeysym(ref XKeyEvent key_event, int index);
+
+    // The keysym a keycode has in one layout group at one shift level, or 0 when it has none.
+    [LibraryImport(LibraryName)]
+    public static partial nint XkbKeycodeToKeysym(nint display, byte keycode, int group, int level);
+
+    [LibraryImport(LibraryName)]
+    public static unsafe partial int XLookupString(
+        ref XKeyEvent event_struct,
+        byte* buffer_return,
+        int bytes_buffer,
+        out nint keysym_return,
+        XComposeStatus* status_in_out);
+
+    // XIM / UTF-8 input (minimal; XCreateIC is varargs and is bound via dynamic delegates in platform code).
+    [LibraryImport(LibraryName, StringMarshalling = StringMarshalling.Utf8)]
+    public static partial nint XSetLocaleModifiers(string modifiers);
+
+    [LibraryImport(LibraryName)]
+    public static partial nint XOpenIM(nint display, nint rdb, nint res_name, nint res_class);
+
+    [LibraryImport(LibraryName)]
+    public static partial int XCloseIM(nint im);
+
+    [LibraryImport(LibraryName)]
+    public static partial void XDestroyIC(nint ic);
+
+    [LibraryImport(LibraryName)]
+    public static partial void XSetICFocus(nint ic);
+
+    [LibraryImport(LibraryName)]
+    public static partial void XUnsetICFocus(nint ic);
+
+    [LibraryImport(LibraryName)]
+    public static partial int XFilterEvent(ref XEvent ev, nint window);
+
+    [LibraryImport(LibraryName)]
+    public static unsafe partial int Xutf8LookupString(nint ic, ref XKeyEvent event_struct, byte* buffer_return, int bytes_buffer, out nint keysym_return, out int status_return);
+
+    [LibraryImport(LibraryName)]
+    public static partial int XSetWMNormalHints(nint display, nint window, ref XSizeHints hints);
+
+    [LibraryImport(LibraryName)]
+    public static partial int XChangeProperty(
+        nint display,
+        nint window,
+        nint property,
+        nint type,
+        int format,
+        int mode,
+        nint data,
+        int nelements);
+
+    [LibraryImport(LibraryName)]
+    public static partial int XDeleteProperty(nint display, nint window, nint property);
+
+    [LibraryImport(LibraryName)]
+    public static partial nint XCreateFontCursor(nint display, uint shape);
+
+    [LibraryImport(LibraryName)]
+    public static partial int XDefineCursor(nint display, nint window, nint cursor);
+
+    [LibraryImport(LibraryName)]
+    public static partial int XFreeCursor(nint display, nint cursor);
+
+    [LibraryImport(LibraryName)]
+    public static partial nint XCreateBitmapFromData(nint display, nint drawable, ReadOnlySpan<byte> data, uint width, uint height);
+
+    [LibraryImport(LibraryName)]
+    public static partial nint XCreatePixmapCursor(nint display, nint source, nint mask, ref XColor foreground, ref XColor background, uint x, uint y);
+
+    [LibraryImport(LibraryName)]
+    public static partial int XFreePixmap(nint display, nint pixmap);
+
+    [LibraryImport(LibraryName)]
+    public static partial int XTranslateCoordinates(
+        nint display,
+        nint src_w,
+        nint dest_w,
+        int src_x,
+        int src_y,
+        out int dest_x_return,
+        out int dest_y_return,
+        out nint child_return);
+}
+
+[StructLayout(LayoutKind.Sequential)]
+internal struct XrmValue
+{
+    public uint size;
+    public nint addr;
+}
+
+[StructLayout(LayoutKind.Sequential)]
+internal struct XVisualInfo
+{
+    public nint visual;
+    public nint visualid;
+    public int screen;
+    public int depth;
+    public int @class;
+    public ulong red_mask;
+    public ulong green_mask;
+    public ulong blue_mask;
+    public int colormap_size;
+    public int bits_per_rgb;
+}
+
+[StructLayout(LayoutKind.Sequential)]
+internal struct XComposeStatus
+{
+    public nint compose_ptr;
+    public int chars_matched;
+}
+
+[StructLayout(LayoutKind.Sequential)]
+internal struct XSetWindowAttributes
+{
+    public nint background_pixmap;
+    public ulong background_pixel;
+    public nint border_pixmap;
+    public ulong border_pixel;
+    public int bit_gravity;
+    public int win_gravity;
+    public int backing_store;
+    public ulong backing_planes;
+    public ulong backing_pixel;
+    public int save_under;
+    public nint event_mask;
+    public nint do_not_propagate_mask;
+    public int override_redirect;
+    public nint colormap;
+    public nint cursor;
+}
+
+[StructLayout(LayoutKind.Sequential)]
+internal struct XKeyEvent
+{
+    public int type;
+    public ulong serial;
+    public int send_event;
+    public nint display;
+    public nint window;
+    public nint root;
+    public nint subwindow;
+    public ulong time;
+    public int x, y;
+    public int x_root, y_root;
+    public uint state;
+    public uint keycode;
+    public int same_screen;
+}
+
+/// <summary>
+/// X11 mouse button codes as delivered in <see cref="XButtonEvent.button"/>.
+/// X11 reports wheel rotation as press/release of synthetic buttons 4–7.
+/// </summary>
+internal static class X11MouseButton
+{
+    public const uint Left = 1;
+    public const uint Middle = 2;
+    public const uint Right = 3;
+    public const uint WheelUp = 4;
+    public const uint WheelDown = 5;
+    public const uint WheelLeft = 6;
+    public const uint WheelRight = 7;
+}
+
+/// <summary>
+/// X11 modifier bits as carried in <see cref="XButtonEvent.state"/> / <see cref="XMotionEvent.state"/>.
+/// </summary>
+internal static class X11ModifierMask
+{
+    public const uint Button1 = 1u << 8;    // Left button held
+    public const uint Button2 = 1u << 9;    // Middle button held
+    public const uint Button3 = 1u << 10;   // Right button held
+}
+
+[StructLayout(LayoutKind.Sequential)]
+internal struct XButtonEvent
+{
+    public int type;
+    public ulong serial;
+    public int send_event;
+    public nint display;
+    public nint window;
+    public nint root;
+    public nint subwindow;
+    public ulong time;
+    public int x, y;
+    public int x_root, y_root;
+    public uint state;
+    public uint button;
+    public int same_screen;
+}
+
+[StructLayout(LayoutKind.Sequential)]
+internal struct XMotionEvent
+{
+    public int type;
+    public ulong serial;
+    public int send_event;
+    public nint display;
+    public nint window;
+    public nint root;
+    public nint subwindow;
+    public ulong time;
+    public int x, y;
+    public int x_root, y_root;
+    public uint state;
+    public byte is_hint;
+    public int same_screen;
+}
+
+[StructLayout(LayoutKind.Sequential)]
+internal struct XCrossingEvent
+{
+    public int type;
+    public ulong serial;
+    public int send_event;
+    public nint display;
+    public nint window;
+    public nint root;
+    public nint subwindow;
+    public ulong time;
+    public int x, y;
+    public int x_root, y_root;
+    public int mode;
+    public int detail;
+    public int same_screen;
+    public int focus;
+    public uint state;
+}
+
+[StructLayout(LayoutKind.Sequential)]
+internal struct XColor
+{
+    public ulong pixel;
+    public ushort red;
+    public ushort green;
+    public ushort blue;
+    public byte flags;
+    public byte pad;
+}
+
+[StructLayout(LayoutKind.Explicit, Size = 192)]
+internal struct XEvent
+{
+    [FieldOffset(0)]
+    public int type;
+
+    [FieldOffset(0)]
+    public XConfigureEvent xconfigure;
+
+    [FieldOffset(0)]
+    public XExposeEvent xexpose;
+
+    [FieldOffset(0)]
+    public XClientMessageEvent xclient;
+
+    [FieldOffset(0)]
+    public XDestroyWindowEvent xdestroywindow;
+
+    [FieldOffset(0)]
+    public XKeyEvent xkey;
+
+    [FieldOffset(0)]
+    public XButtonEvent xbutton;
+
+    [FieldOffset(0)]
+    public XMotionEvent xmotion;
+
+    [FieldOffset(0)]
+    public XCrossingEvent xcrossing;
+
+    [FieldOffset(0)]
+    public XPropertyEvent xproperty;
+
+    [FieldOffset(0)]
+    public XFocusChangeEvent xfocus;
+
+    [FieldOffset(0)]
+    public XSelectionEvent xselection;
+
+    [FieldOffset(0)]
+    public XGenericEventCookie xcookie;
+}
+
+internal static class X11EventType
+{
+    public const int GenericEvent = 35;
+}
+
+/// <summary>
+/// Generic event cookie variant of <see cref="XEvent"/>. When <see cref="XEvent.type"/>
+/// equals <see cref="X11EventType.GenericEvent"/> (35), the union member is this cookie
+/// referencing extension-specific payload at <see cref="data"/>.
+/// </summary>
+[StructLayout(LayoutKind.Sequential)]
+internal struct XGenericEventCookie
+{
+    public int type;
+    public nuint serial;
+    public int send_event;
+    public nint display;
+    public int extension;
+    public int evtype;
+    public uint cookie;
+    public nint data;       // pointer to extension event payload (e.g. XIDeviceEvent*)
+}
+
+[StructLayout(LayoutKind.Sequential)]
+internal struct XFocusChangeEvent
+{
+    public int type;
+    public ulong serial;
+    public int send_event;
+    public nint display;
+    public nint window;
+    public int mode;
+    public int detail;
+}
+
+[StructLayout(LayoutKind.Sequential)]
+internal struct XPropertyEvent
+{
+    public int type;
+    public ulong serial;
+    public int send_event;
+    public nint display;
+    public nint window;
+    public nint atom;
+    public ulong time;
+    public int state;
+}
+
+[StructLayout(LayoutKind.Sequential)]
+internal struct XExposeEvent
+{
+    public int type;
+    public ulong serial;
+    public int send_event;
+    public nint display;
+    public nint window;
+    public int x;
+    public int y;
+    public int width;
+    public int height;
+    public int count;
+}
+
+[StructLayout(LayoutKind.Sequential)]
+internal struct XConfigureEvent
+{
+    public int type;
+    public ulong serial;
+    public int send_event;
+    public nint display;
+    public nint @event;
+    public nint window;
+    public int x;
+    public int y;
+    public int width;
+    public int height;
+    public int border_width;
+    public nint above;
+    public int override_redirect;
+}
+
+[StructLayout(LayoutKind.Sequential)]
+internal struct XSizeHints
+{
+    public XSizeHintsFlags flags;
+    public int x, y;
+    public int width, height;
+    public int min_width, min_height;
+    public int max_width, max_height;
+    public int width_inc, height_inc;
+    public int min_aspect_x, min_aspect_y;
+    public int max_aspect_x, max_aspect_y;
+    public int base_width, base_height;
+    public int win_gravity;
+}
+
+[Flags]
+internal enum XSizeHintsFlags : long
+{
+    None = 0L,
+    USPosition = 1L << 0,
+    USSize = 1L << 1,
+    PPosition = 1L << 2,
+    PSize = 1L << 3,
+    PMinSize = 1L << 4,
+    PMaxSize = 1L << 5,
+}
+
+[StructLayout(LayoutKind.Sequential)]
+internal unsafe struct XClientMessageEvent
+{
+    public int type;
+    public ulong serial;
+    public int send_event;
+    public nint display;
+    public nint window;
+    public nint message_type;
+    public int format;
+    public fixed long data[5];
+}
+
+[StructLayout(LayoutKind.Sequential)]
+internal struct XSelectionEvent
+{
+    public int type;
+    public ulong serial;
+    public int send_event;
+    public nint display;
+    public nint requestor;
+    public nint selection;
+    public nint target;
+    public nint property;
+    public nint time;
+}
+
+[StructLayout(LayoutKind.Sequential)]
+internal struct XDestroyWindowEvent
+{
+    public int type;
+    public ulong serial;
+    public int send_event;
+    public nint display;
+    public nint @event;
+    public nint window;
+}
+
+[StructLayout(LayoutKind.Sequential)]
+internal struct XWindowAttributes
+{
+    public int x, y;
+    public int width, height;
+    public int border_width;
+    public int depth;
+    public nint visual;
+    public nint root;
+    public int @class;
+    public int bit_gravity;
+    public int win_gravity;
+    public int backing_store;
+    public ulong backing_planes;
+    public ulong backing_pixel;
+    public int save_under;
+    public nint colormap;
+    public int map_installed;
+    public int map_state;
+    public long all_event_masks;
+    public long your_event_mask;
+    public long do_not_propagate_mask;
+    public int override_redirect;
+    public nint screen;
+}

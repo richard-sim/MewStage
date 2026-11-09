@@ -1,0 +1,11 @@
+<Project>
+  <!--
+    Imported after every project body, so the project's own TargetFramework is known here. Libraries are AOT-compatible
+    so the trim and AOT analyzers run on every build; the executable decides at publish time (docs/architecture.md,
+    "AOT"). Test projects opt out (xUnit relies on reflection and is never published), and so do the netstandard2.0
+    build-time components (analyzers, source generators), which the SDK cannot analyze for AOT.
+  -->
+  <PropertyGroup Condition="!$(MSBuildProjectName.EndsWith('.Tests')) and '$(TargetFramework)' == 'net10.0' and '$(IsAotCompatible)' == ''">
+    <IsAotCompatible>true</IsAotCompatible>
+  </PropertyGroup>
+</Project>

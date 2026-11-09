@@ -1,0 +1,128 @@
+MewStage vendor patch allocation/0004 (third_party/NOTICE): the retained scene pass no longer allocates on every
+frame. Window keeps its scene-pass RenderDataRecorder for the context it wraps; SceneUpdate stages the scene's own
+layer-root array when the layers did not change; RenderDirtyRegistry drops unreachable visuals by scene
+(RemoveVisualsNotIn) instead of through a capturing lambda; and its Queued view is typed as the dictionary, so a
+foreach over it does not box an enumerator. No behavioural change.
+
+--- a/Controls/Window.Retained.cs
++++ b/Controls/Window.Retained.cs
+@@ -10,6 +10,9 @@
+     private RenderScene? _renderScene;
+     private SceneCapture? _sceneCapture;
+     private RenderDirtyRegistry? _renderDirty;
++    // MewStage vendor patch allocation/0004: the scene pass's recorder, kept for the context it wraps (a recorder holds no state
++    // between passes), so a frame does not allocate one.
++    private RenderDataRecorder? _sceneRecorder;
+     private bool _retainedSceneReady;
+     // Target whose BeginFrame was asked to keep the previous frame; only then may this one repaint part of it.
+     private object? _preservingTarget;
+@@ -346,7 +349,9 @@
+         // The dirty region of the frame being drawn now, not of every frame since the scene was built.
+         _renderScene.ResetDirtyRegion();
+ 
+-        var recorder = new RenderDataRecorder(context) { SuppressDrawing = true };
++        var recorder = _sceneRecorder is { } kept && ReferenceEquals(kept.Inner, context)
++            ? kept
++            : _sceneRecorder = new RenderDataRecorder(context) { SuppressDrawing = true };
+ 
+         try
+         {
+@@ -935,6 +940,7 @@
+         _presentSurfaceContext?.Dispose();
+         _presentSurfaceContext = null;
+         _presentSurface = null;
++        _sceneRecorder = null;
+     }
+ 
+     private void ReleaseRetainedFrameSurface()
+@@ -942,6 +948,7 @@
+         // The context draws into the surface, so it goes first.
+         _retainedFrameContext?.Dispose();
+         _retainedFrameContext = null;
++        _sceneRecorder = null;
+         _retainedFrameSurface?.Dispose();
+         _retainedFrameSurface = null;
+         _preservingTarget = null;
+--- a/Rendering/Retained/RenderDirtyRegistry.cs
++++ b/Rendering/Retained/RenderDirtyRegistry.cs
+@@ -66,19 +66,22 @@
+         }
+     }
+ 
+-    /// <summary>What is queued for the pass that reads next, for diagnostics and tests.</summary>
+-    internal IReadOnlyDictionary<UIElement, RenderDirtyKind> Queued => _current;
++    /// <summary>What is queued for the pass that reads next. Read-only by convention; typed as the dictionary
++    /// itself (MewStage vendor patch allocation/0004) so the scene pass's foreach over it does not box an enumerator per frame.</summary>
++    internal Dictionary<UIElement, RenderDirtyKind> Queued => _current;
+ 
+     /// <summary>
+     /// Drops what is queued for visuals the surface no longer draws. Their change needs no pass, and a
+     /// queue that kept them would keep the visuals themselves alive.
+     /// </summary>
+-    internal void RemoveWhere(Func<UIElement, bool> isGone)
++    // MewStage vendor patch allocation/0004: takes the scene rather than a predicate. The one caller passed a lambda capturing
++    // the scene, which allocated a closure and a delegate on every pass.
++    internal void RemoveVisualsNotIn(RenderScene scene)
+     {
+         List<UIElement>? gone = null;
+         foreach (var element in _current.Keys)
+         {
+-            if (isGone(element))
++            if (scene.FindNode(element) == null)
+             {
+                 gone ??= [];
+                 gone.Add(element);
+--- a/Rendering/Retained/SceneCapture.cs
++++ b/Rendering/Retained/SceneCapture.cs
+@@ -174,7 +174,7 @@
+             scene.PruneUnreachable();
+         }
+ 
+-        dirty.Registry?.RemoveWhere(element => scene.FindNode(element) == null);
++        dirty.Registry?.RemoveVisualsNotIn(scene);
+     }
+ 
+     /// <summary>Records or replays one visual and returns its surface-space subtree extent.</summary>
+--- a/Rendering/Retained/SceneUpdate.cs
++++ b/Rendering/Retained/SceneUpdate.cs
+@@ -41,13 +41,39 @@
+     /// <summary>The layer roots the scene takes, in drawing order, when this update lands.</summary>
+     internal void StageLayerRoots(IReadOnlyList<UIElement> layerRoots)
+     {
+-        _layerRoots = new UIElement[layerRoots.Count];
++        // MewStage vendor patch allocation/0004: the layers are the same as the scene's in nearly every pass; stage the scene's own
++        // array then (the commit finds no change either way) instead of allocating a copy every pass.
++        if (_scene.LayerRoots is UIElement[] current && SameRoots(current, layerRoots))
++        {
++            _layerRoots = current;
++            return;
++        }
++
++        _layerRoots = layerRoots.Count == 0 ? [] : new UIElement[layerRoots.Count];
+         for (int index = 0; index < layerRoots.Count; index++)
+         {
+             _layerRoots[index] = layerRoots[index];
+         }
+     }
+ 
++    private static bool SameRoots(UIElement[] current, IReadOnlyList<UIElement> staged)
++    {
++        if (current.Length != staged.Count)
++        {
++            return false;
++        }
++
++        for (int index = 0; index < current.Length; index++)
++        {
++            if (!ReferenceEquals(current[index], staged[index]))
++            {
++                return false;
++            }
++        }
++
++        return true;
++    }
++
+     /// <summary>
+     /// The node of a visual, created for this update when the scene has none. A created node is not in
+     /// the scene until the update lands, so a failed update leaves no trace of it.

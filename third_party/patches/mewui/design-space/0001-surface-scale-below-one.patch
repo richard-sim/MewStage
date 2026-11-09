@@ -1,0 +1,37 @@
+MewStage vendor patch design-space/0001 (third_party/NOTICE): a window frame drawn to a surface whose scale is below
+1 derives its client DIPs from the surface's own scale (pixels / scale), not pixels / max(1, scale). The clamp made
+an embedded host at 1280x720 showing a 1920x1080 design-space layout clip and cull a third of it. The whole-frame
+area heuristic in Window.Retained uses the same unclamped scale. Applies after allocation/0004 when that category is
+present; the hunks also apply to the unpatched file.
+
+--- a/Controls/Window.cs
++++ b/Controls/Window.cs
+@@ -3010,9 +3010,13 @@
+             throw new ArgumentNullException(nameof(surface));
+         }
+ 
++        // MewStage vendor patch design-space/0001: divide by the surface's own scale. Clamping it to at least 1 made a surface drawn
++        // at a scale below 1 (an embedded host fitting a 1920x1080 layout into 1280x720, scale 2/3) report only
++        // pixels-many DIPs, so the frame's clip and cull viewport covered two thirds of the layout.
++        double surfaceScale = surface.DpiScale > 0 ? surface.DpiScale : 1.0;
+         var clientSizeDip = new Size(
+-            surface.PixelWidth / Math.Max(1.0, surface.DpiScale),
+-            surface.PixelHeight / Math.Max(1.0, surface.DpiScale));
++            surface.PixelWidth / surfaceScale,
++            surface.PixelHeight / surfaceScale);
+ 
+         if (!TryRenderFrameWithOverlay(surface, clientSizeDip))
+         {
+--- a/Controls/Window.Retained.cs
++++ b/Controls/Window.Retained.cs
+@@ -407,7 +407,9 @@
+ 
+         // Past this share of the surface a frame that repaints areas costs as much as one that repaints
+         // everything, which has no erasing and no clipping to do (agent/retained-redesign/dirty-region-cost.md).
+-        double surfaceArea = (target.PixelWidth / Math.Max(1.0, target.DpiScale)) * (target.PixelHeight / Math.Max(1.0, target.DpiScale));
++        // MewStage vendor patch design-space/0001: the target's own scale, as in RenderFrameToSurface (not clamped to at least 1).
++        double targetScale = target.DpiScale > 0 ? target.DpiScale : 1.0;
++        double surfaceArea = (target.PixelWidth / targetScale) * (target.PixelHeight / targetScale);
+         if (_renderScene.DirtyRegion.TotalArea >= surfaceArea * WHOLE_FRAME_DIRTY_RATIO)
+         {
+             LastWholeFrameReason = $"the dirty region {_renderScene.DirtyBounds} covers most of the surface";
