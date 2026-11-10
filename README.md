@@ -13,32 +13,35 @@ game and tool codebase and cleaned up to stand on its own. Everything here is MI
 
 ## Why this exists
 
-A UI framework that runs embedded gives up a few things it normally owns. The window belongs to someone else
-now, so the host has to tell it how big it is and when the mouse moved. Its drawing has to go through the
-application's GPU device, in the application's frame, with the application's synchronization. And there's no message
-loop anymore. The host has to pump the dispatcher and tick the animations itself, once per frame.
+A UI framework that runs embedded gives up a few things it normally owns. Since the window belongs to someone else now,
+the host has to tell it how big it is and when the mouse moved. Its drawing has to go through the application's GPU
+device, in the application's frame, with the application's synchronization. And there's no message loop anymore. The
+host has to pump the dispatcher and tick the animations itself, once per frame.
 
-MewUI's internals turn out to be built around a handful of contracts that make this possible (a window backend, a graphics
-factory, a render surface, a text contract, a per-frame animation pulse and a dispatcher). None of them is public API for a
-third-party backend, and MewStage implements all of them over a real GPU device.
+MewUI's internals turn out to be built around a handful of contracts that make this possible. A window backend and a
+render surface stand in for the OS window and its swapchain, a graphics factory and a text contract put drawing and
+text on the application's device, and a per-frame animation pulse and a dispatcher take over from the message loop.
+None of them is public API for a third-party backend, and MewStage implements all of them over a real GPU device.
 
 Everything the UI draws ends up in one `ui` render-graph pass per frame, which composites every visible MewUI window
 from bottom to top. A game points that pass at the backbuffer after the world is drawn, and the HUD, pause menu and
-dialog all land in that one pass over the game. An editor points it at a cleared target and puts 3D viewports inside
-the UI. Each viewport is an offscreen render target that MewUI samples as an image, with no copy. The vendored UI
-framework never sees which GPU API is underneath. The same code runs on DX12 and Vulkan, and publishes with NativeAOT.
+dialog all land in that one pass over the game. An editor points it at a cleared target instead and puts 3D viewports
+inside the UI, where each viewport is an offscreen render target that MewUI samples directly as an image without copying
+a single pixel. The vendored UI framework never sees which GPU API is underneath. The same code runs on DX12 and Vulkan,
+and publishes with NativeAOT.
 
 MewUI and MewVG have needed some patching, since an embedded host asks for things MewUI's own platform host doesn't
-need, like several hosts living in one process, supporting window layout below scale 1 (so a 1920 x 1080
-HUD scales down to a 1280 x 720 backbuffer), and a steady-state frame should allocate nothing on the managed heap. Each patch is
-small and marked as mandatory or optional, and docs/vendoring.md explains every one.
+need, like several hosts living in one process, supporting window layout below scale 1 (so a 1920 x 1080 HUD scales down
+to a 1280 x 720 backbuffer), and a steady-state frame that allocates nothing on the managed heap. Each patch is small
+and marked as mandatory or optional, and docs/vendoring.md explains every one.
 
 ## What is here and what is not
 
 Treat this as a working demonstration. It can be the base an app is built on, or a reference while parts of it are
 swapped for existing libraries. Only `MewStage.Host` depends on SDL3, and another windowing layer can take its place.
-The UI backend compiles only against `IGraphicsDevice`, and an engine with its own renderer can implement that
-interface over it and keep the rest. The headless device in the tests is a small example of one.
+The UI backend compiles only against `IGraphicsDevice`, which means an engine with its own renderer can implement
+that one interface over it and keep everything else here, the same way the headless device in the tests stands in for
+a real GPU.
 
 MewUI and MewVG are vendored at pinned commits with a recorded patch set, instead of coming from NuGet, because the
 backend compiles against their internals.
@@ -55,10 +58,10 @@ the Windows AOT publish are checked by hand (docs/hand-test.md).
 
 ### Overlay
 
-A rotating lit cube fills the window and MewUI draws over it. The HUD is transparent and laid out in a fixed
-1920 x 1080 design space. Escape opens a pause menu with a ComboBox, a slider, a switch and a text box, and Quit opens
-a dialog that fades in over it. All three windows composite in one pass, and the keyboard, mouse and gamepad drive the
-same commands.
+A rotating lit cube fills the window, and MewUI draws a transparent HUD over it that is laid out in a fixed 1920 x 1080
+design space and scaled to fit whatever size the window happens to be. Escape opens a pause menu with a ComboBox, a
+slider, a switch and a text box, and Quit opens a dialog that fades in over it. All three windows composite in one pass,
+and the keyboard, mouse and gamepad drive the same commands.
 
 ![The pause menu and the quit dialog over the HUD](docs/images/overlay-pause-dialog.png)
 
@@ -66,8 +69,8 @@ same commands.
 
 The Workbench is a desktop tool window with a menu bar and an SVG icon toolbar. Docked panels hold an outliner, an
 inspector and a frame-time chart around one or two 3D viewports, which render offscreen and show as images inside the
-UI. The dock layout is saved between runs. The chart can detach into a second OS window, and an edit in the inspector
-shows in both viewports on the next frame.
+UI, and the whole dock layout is saved when you leave the Workbench and restored the next time it opens. The chart can
+detach into a second OS window, and an edit in the inspector shows in both viewports on the next frame.
 
 ![The Workbench with two viewports on the same scene](docs/images/workbench-two-viewports.png)
 
@@ -138,16 +141,16 @@ rebuilt every frame.
 MewUI sees a fake window backend that reports a size, counts invalidations, and has a non-zero handle so layout runs.
 Its graphics factory sits on top of the application's device, and its render surface is a color texture with a
 stencil. Fonts go through FontStashSharp using each face's real metrics, which lets text measure exactly as it draws
-without touching the GPU. Each frame the host pulses MewUI's animation clocks, pumps the dispatcher that runs MewUI's
-timers and deferred work (a blinking caret, a repeat button, a merged layout pass), lays out any dirty windows, and
-adds one pass to the graph.
+without touching the GPU. Each frame the host pulses MewUI's animation clocks and pumps the dispatcher, which runs
+MewUI's timers and deferred work such as a blinking caret, a repeat button or a merged layout pass. Then it lays out
+any dirty windows and adds one pass to the graph.
 
-The pass writes its target, either clearing it or loading what the world drew. It also reads every viewport texture
-the application declared and creates one transient stencil, and the graph compiler adds the barriers. Inside the
-pass, every window renders into a single MewVG frame through the application's NanoVG-style renderer and one HLSL
-shader, and that frame is flushed once. A viewport is a MewUI control whose `OnRender` draws an image. The image is a
-registry key that resolves to the offscreen target's shader-resource view, and a stale key resolves to nothing instead
-of to freed memory.
+The pass writes its target, either clearing it or loading what the world drew. It also reads every viewport texture the
+application declared and creates one transient stencil, and the graph compiler adds the barriers. Inside the pass, every
+window renders into a single MewVG frame through the application's NanoVG-style renderer and one HLSL shader, and that
+frame is flushed once. A viewport is a MewUI control whose `OnRender` draws an image, and that image is a registry key
+that resolves to the offscreen target's shader-resource view when the frame is drawn, which means a key left over from a
+viewport that was resized or detached since then resolves to nothing instead of to freed GPU memory.
 
 docs/mewui-embedding.md has the longer version, with each host contract and the rules the renderer follows.
 docs/architecture.md covers the project layering, the frame and the AOT settings.
